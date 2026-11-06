@@ -1,0 +1,6 @@
+{
+  "name": "Advanced Backend Development Skill",
+  "description": "Comprehensive, zero-loss backend engineering skill specification covering security, field logic, ID/OTP/token generation, polyglot databases, APIs, payments, resilience, observability, async queues, file upload defense, malware scanning, testing, and DevOps.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
