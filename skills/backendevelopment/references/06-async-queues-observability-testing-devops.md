@@ -177,7 +177,6 @@ export async function executeQueueWorkerJob<TPayload>(
       fencingToken,
     });
 
-    clearInterval(heartbeatTimer);
     const durationMs = Number((process.hrtime.bigint() - startNs) / 1_000_000n);
 
     const committed = await deps.leaseManager.markJobCompleted(
@@ -202,7 +201,6 @@ export async function executeQueueWorkerJob<TPayload>(
 
     return 'COMPLETED';
   } catch (err) {
-    clearInterval(heartbeatTimer);
     const errorReason = err instanceof Error ? err.message : String(err);
 
     // Full jitter exponential backoff: random(0, min(300_000, 1000 * 2^attempt))
@@ -232,6 +230,8 @@ export async function executeQueueWorkerJob<TPayload>(
     });
 
     throw err;
+  } finally {
+    clearInterval(heartbeatTimer);
   }
 }
 ```

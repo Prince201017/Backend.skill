@@ -101,33 +101,63 @@ Never use blocking Two-Phase Commit (2PC/XA) across microservices or external AP
 ```typescript
 export interface SagaStep<TContext> {
   stepName: string;
-  executeForward: (ctx: TContext) => Promise<void>;
-  compensateBackward?: (ctx: TContext) => Promise<void>;
+  executeForward: (ctx: TContext, idempotencyKey: string) => Promise<void>;
+  compensateBackward?: (ctx: TContext, idempotencyKey: string) => Promise<void>;
 }
 
 export async function runOrchestratedSaga<TContext>(
   sagaId: string,
   ctx: TContext,
   steps: SagaStep<TContext>[],
-  recordStepState: (sagaId: string, stepName: string, state: 'STARTED' | 'COMPLETED' | 'COMPENSATING' | 'COMPENSATED' | 'FAILED') => Promise<void>
+  recordStepState: (
+    sagaId: string,
+    stepName: string,
+    state:
+      | 'STARTED'
+      | 'COMPLETED'
+      | 'COMPENSATING'
+      | 'COMPENSATED'
+      | 'COMPENSATION_FAILED_REQUIRES_INTERVENTION'
+  ) => Promise<void>
 ): Promise<void> {
   const completedSteps: SagaStep<TContext>[] = [];
 
   try {
     for (const step of steps) {
       await recordStepState(sagaId, step.stepName, 'STARTED');
-      await step.executeForward(ctx);
+      await step.executeForward(ctx, `${sagaId}:${step.stepName}:forward`);
       await recordStepState(sagaId, step.stepName, 'COMPLETED');
       completedSteps.push(step);
     }
   } catch (forwardError) {
-    // Execute compensating transactions in reverse order for all completed steps
+    // Execute compensating transactions in reverse order with bounded retries so a transient failure
+    // on step K does not skip compensating steps K-1..0 ("Saga Zombie" prevention).
     for (let i = completedSteps.length - 1; i >= 0; i--) {
       const step = completedSteps[i];
       if (!step.compensateBackward) continue;
       await recordStepState(sagaId, step.stepName, 'COMPENSATING');
-      await step.compensateBackward(ctx);
-      await recordStepState(sagaId, step.stepName, 'COMPENSATED');
+
+      let compensated = false;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          await step.compensateBackward(ctx, `${sagaId}:${step.stepName}:compensate`);
+          await recordStepState(sagaId, step.stepName, 'COMPENSATED');
+          compensated = true;
+          break;
+        } catch {
+          if (attempt < 3) {
+            await new Promise((r) => setTimeout(r, 200 * 2 ** attempt));
+          }
+        }
+      }
+
+      if (!compensated) {
+        await recordStepState(
+          sagaId,
+          step.stepName,
+          'COMPENSATION_FAILED_REQUIRES_INTERVENTION'
+        );
+      }
     }
     throw forwardError;
   }
@@ -199,18 +229,23 @@ Never run destructive or table-locking DDL (`ALTER TABLE RENAME COLUMN`, `DROP C
 
 | Model | Isolation Mechanism | Best For | Mandatory Safeguards |
 | :--- | :--- | :--- | :--- |
-| **1. Pool Model (Shared Schema + RLS)** | `tenant_id UUID NOT NULL` on every table + PostgreSQL Row-Level Security (`FORCE ROW LEVEL SECURITY`) | High-scale B2B SaaS (`100` to `1,000,000+` tenants) | Set transaction-scoped context (`SET LOCAL app.current_tenant_id = '...';`) at the start of every DB transaction so leaked pooled connections never retain another tenant's context. |
+| **1. Pool Model (Shared Schema + RLS)** | `tenant_id UUID NOT NULL` on every table + PostgreSQL Row-Level Security (`FORCE ROW LEVEL SECURITY`) | High-scale B2B SaaS (`100` to `1,000,000+` tenants) | Connect with a `NOSUPERUSER NOBYPASSRLS` DB role and set transaction-scoped context (`SET LOCAL app.current_tenant_id = '...';`) at the start of every transaction. |
 | **2. Bridge Model (Schema-per-Tenant)** | Separate PostgreSQL schema (`tenant_abc.orders`) inside shared cluster | Moderate tenant counts (`50–500`) needing custom extensions | Automate parallel schema migration runners and cap total table count per cluster to avoid catalog bloat. |
 | **3. Silo Model (Database-per-Tenant)** | Dedicated DB instance/database per enterprise tenant | Regulated healthcare/financial enterprises requiring CMEK & data residency | Tenant routing lookup registry cached in Redis + per-tenant connection pool manager. |
 
 ```sql
--- PostgreSQL Row-Level Security (RLS) Enforcement Template
-ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
-ALTER TABLE orders FORCE ROW LEVEL SECURITY; -- Applies even to table owner!
+-- 1. Application DB role MUST NOT have SUPERUSER or BYPASSRLS privileges
+CREATE ROLE app_runtime LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
 
+-- 2. PostgreSQL Row-Level Security (RLS) Fail-Closed Enforcement Template
+ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+ALTER TABLE orders FORCE ROW LEVEL SECURITY;
+
+-- Use NULLIF(..., '') before casting to UUID so an unset/reset GUC returns NULL (evaluating to false)
+-- instead of throwing "invalid input syntax for type uuid: """
 CREATE POLICY tenant_isolation_policy ON orders
-    USING (tenant_id = current_setting('app.current_tenant_id', true)::uuid)
-    WITH CHECK (tenant_id = current_setting('app.current_tenant_id', true)::uuid);
+    USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)
+    WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
 ```
 
 ---

@@ -254,3 +254,157 @@ export function authorizeAction(
   return { allowed: true };
 }
 ```
+
+---
+
+## 4. Penetration-Hardened Credential & JWT Verification (Anti-Enumeration & Anti-Forgery)
+
+### A. Timing-Safe Login Verification (Defeating Account Enumeration Oracles)
+During penetration testing, attackers measure response latency on `POST /api/v1/auth/login` to distinguish valid emails (`~120ms` Argon2id/scrypt CPU work) from non-existent emails (`~1ms` early return).
+- **Mandatory Rule**: Always execute a real KDF verification against a precomputed `DUMMY_PASSWORD_HASH` when `user === null` so both code paths perform identical CPU work and return the exact same generic error message.
+
+```typescript
+import crypto from 'node:crypto';
+import { promisify } from 'node:util';
+
+const scryptAsync = promisify(crypto.scrypt);
+
+export interface PasswordHashRecord {
+  saltHex: string;
+  derivedKeyHex: string;
+}
+
+// Precomputed at server boot so non-existent user lookups consume identical CPU cycles
+const DUMMY_SALT_HEX = crypto.randomBytes(16).toString('hex');
+const DUMMY_DERIVED_HEX = crypto.scryptSync('dummy-penetration-defense-secret', Buffer.from(DUMMY_SALT_HEX, 'hex'), 64).toString('hex');
+
+export async function verifyPasswordTimingSafe(
+  candidatePassword: string,
+  userHashRecord: PasswordHashRecord | null
+): Promise<boolean> {
+  // Always normalize Unicode (NFKC) and cap password byte length (<= 1024 bytes) to prevent DoS
+  const normalizedPassword = candidatePassword.normalize('NFKC');
+  if (Buffer.byteLength(normalizedPassword, 'utf8') > 1024) {
+    return false;
+  }
+
+  const targetSaltHex = userHashRecord ? userHashRecord.saltHex : DUMMY_SALT_HEX;
+  const targetKeyHex = userHashRecord ? userHashRecord.derivedKeyHex : DUMMY_DERIVED_HEX;
+
+  const derivedBuffer = (await scryptAsync(
+    normalizedPassword,
+    Buffer.from(targetSaltHex, 'hex'),
+    64
+  )) as Buffer;
+
+  const expectedBuffer = Buffer.from(targetKeyHex, 'hex');
+  if (derivedBuffer.length !== expectedBuffer.length) {
+    return false;
+  }
+
+  const hashesMatch = crypto.timingSafeEqual(derivedBuffer, expectedBuffer);
+  // Only return true if the user actually existed AND the hash matched
+  return userHashRecord !== null && hashesMatch;
+}
+```
+
+### B. Penetration-Hardened JWT Verifier (Defeating `alg: none`, Algorithm Confusion & `kid` Injection)
+Penetration testers routinely exploit JWT implementations via:
+1. **`alg: "none"`**: Stripping the signature and setting `"alg": "none"`.
+2. **Algorithm Confusion (`RS256` -> `HS256`)**: Signing a forged token using the server's public RSA/ECDSA key as a symmetric HMAC secret.
+3. **`kid` Path Traversal / SQLi & `jku`/`x5u` SSRF**: Injecting `"kid": "../../../../dev/null"` or `"jku": "https://attacker.com/jwks.json"`.
+
+```typescript
+export interface HardenedJwtVerifyOptions {
+  token: string;
+  allowedAlgorithm: 'EdDSA' | 'RS256';
+  publicKeyRing: Readonly<Record<string, crypto.KeyObject>>; // Keyed by strict kid
+  expectedIssuer: string;
+  expectedAudience: string;
+  clockToleranceSeconds?: number;
+}
+
+export interface VerifiedJwtClaims {
+  sub: string;
+  iss: string;
+  aud: string | string[];
+  exp: number;
+  nbf?: number;
+  iat: number;
+  jti: string;
+  tenantId: string;
+  cnf?: { 'x5t#S256'?: string; jkt?: string; sidHash?: string };
+}
+
+export function verifyJwtPenetrationSafe(opts: HardenedJwtVerifyOptions): VerifiedJwtClaims {
+  const parts = opts.token.split('.');
+  if (parts.length !== 3) {
+    throw new Error('JWT_REJECTED: Token must have exactly 3 segments');
+  }
+
+  const [headerB64, payloadB64, signatureB64] = parts;
+  if (!signatureB64 || signatureB64.length === 0) {
+    throw new Error('JWT_REJECTED: Empty signature (alg:none attack blocked)');
+  }
+
+  const headerJson = Buffer.from(headerB64, 'base64url').toString('utf8');
+  const header = JSON.parse(headerJson) as Record<string, unknown>;
+
+  // 1. Strict Algorithm Pinning (blocks alg:none and RS256->HS256 confusion)
+  if (header.alg !== opts.allowedAlgorithm) {
+    throw new Error(`JWT_REJECTED: Disallowed algorithm "${String(header.alg)}"`);
+  }
+
+  // 2. Forbid external key-fetching headers (blocks jku/x5u SSRF and embedded jwk forgery)
+  if ('jku' in header || 'x5u' in header || 'jwk' in header || 'x5c' in header) {
+    throw new Error('JWT_REJECTED: Dynamic key headers (jku/x5u/jwk/x5c) are forbidden');
+  }
+
+  // 3. Validate 'kid' against strict alphanumeric allowlist before key-ring lookup
+  const kid = header.kid;
+  if (typeof kid !== 'string' || !/^[a-zA-Z0-9_-]{1,64}$/.test(kid)) {
+    throw new Error('JWT_REJECTED: Invalid or missing kid header');
+  }
+  const publicKey = Object.prototype.hasOwnProperty.call(opts.publicKeyRing, kid)
+    ? opts.publicKeyRing[kid]
+    : undefined;
+  if (!publicKey || publicKey.type !== 'public') {
+    throw new Error('JWT_REJECTED: Unknown or non-asymmetric verification key');
+  }
+
+  // 4. Verify cryptographic signature before inspecting payload claims
+  const signedInput = Buffer.from(`${headerB64}.${payloadB64}`, 'utf8');
+  const signatureBytes = Buffer.from(signatureB64, 'base64url');
+  const verifyAlgo = opts.allowedAlgorithm === 'EdDSA' ? null : 'RSA-SHA256';
+  const signatureValid = crypto.verify(verifyAlgo, signedInput, publicKey, signatureBytes);
+  if (!signatureValid) {
+    throw new Error('JWT_REJECTED: Cryptographic signature verification failed');
+  }
+
+  // 5. Parse and validate standard temporal & identity claims
+  const claims = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8')) as VerifiedJwtClaims;
+  const nowSec = Math.floor(Date.now() / 1000);
+  const leeway = opts.clockToleranceSeconds ?? 15;
+
+  if (claims.iss !== opts.expectedIssuer) {
+    throw new Error('JWT_REJECTED: Issuer mismatch');
+  }
+  const audMatch = Array.isArray(claims.aud)
+    ? claims.aud.includes(opts.expectedAudience)
+    : claims.aud === opts.expectedAudience;
+  if (!audMatch) {
+    throw new Error('JWT_REJECTED: Audience mismatch');
+  }
+  if (typeof claims.exp !== 'number' || nowSec >= claims.exp + leeway) {
+    throw new Error('JWT_REJECTED: Token has expired');
+  }
+  if (claims.nbf !== undefined && (typeof claims.nbf !== 'number' || nowSec + leeway < claims.nbf)) {
+    throw new Error('JWT_REJECTED: Token is not yet valid (nbf)');
+  }
+  if (!claims.sub || !claims.jti || !claims.tenantId) {
+    throw new Error('JWT_REJECTED: Missing required sub, jti, or tenantId claim');
+  }
+
+  return claims;
+}
+```

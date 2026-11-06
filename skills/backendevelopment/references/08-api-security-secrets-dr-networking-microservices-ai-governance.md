@@ -14,47 +14,113 @@ Whenever the backend fetches a user-supplied URL (webhooks, avatar URL import, l
 
 ```typescript
 import dns from 'node:dns/promises';
+import https from 'node:https';
 import net from 'node:net';
+
+function isReservedIpv4Octets(a: number, b: number, c: number, _d: number): boolean {
+  if (a === 0 || a === 10 || a === 127) return true;                     // 0.0.0.0/8, 10.0.0.0/8, 127.0.0.0/8
+  if (a === 169 && b === 254) return true;                               // 169.254.0.0/16 (Cloud IMDS!)
+  if (a === 172 && b >= 16 && b <= 31) return true;                      // 172.16.0.0/12
+  if (a === 192 && b === 168) return true;                               // 192.168.0.0/16
+  if (a === 100 && b >= 64 && b <= 127) return true;                     // 100.64.0.0/10 (CGNAT)
+  if (a === 192 && b === 0 && (c === 0 || c === 2)) return true;         // 192.0.0.0/24, 192.0.2.0/24 (TEST-NET-1)
+  if (a === 198 && (b === 18 || b === 19)) return true;                  // 198.18.0.0/15 (Benchmarking)
+  if (a === 198 && b === 51 && c === 100) return true;                   // 198.51.100.0/24 (TEST-NET-2)
+  if (a === 203 && b === 0 && c === 113) return true;                    // 203.0.113.0/24 (TEST-NET-3)
+  if (a >= 224) return true;                                             // Multicast (224/4) & Reserved (240/4)
+  return false;
+}
+
+/**
+ * Expands any valid IPv6 string (including '::' and dotted-quad suffixes) into 8 16-bit numbers.
+ */
+function parseIpv6Hextets(ip: string): number[] | null {
+  let normalized = ip.toLowerCase();
+  if (normalized.includes('.')) {
+    const lastColon = normalized.lastIndexOf(':');
+    const v4Part = normalized.slice(lastColon + 1);
+    if (net.isIP(v4Part) !== 4) return null;
+    const [o0, o1, o2, o3] = v4Part.split('.').map(Number);
+    const hHigh = ((o0 << 8) | o1).toString(16);
+    const hLow = ((o2 << 8) | o3).toString(16);
+    normalized = `${normalized.slice(0, lastColon)}:${hHigh}:${hLow}`;
+  }
+  const halves = normalized.split('::');
+  if (halves.length > 2) return null;
+  const left = halves[0] ? halves[0].split(':') : [];
+  const right = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
+  const missing = 8 - (left.length + right.length);
+  if (missing < 0) return null;
+  const full = [...left, ...Array(missing).fill('0'), ...right];
+  if (full.length !== 8) return null;
+  return full.map((h) => parseInt(h, 16));
+}
 
 /**
  * Checks whether an IPv4 or IPv6 address belongs to loopback, link-local,
- * cloud metadata (169.254.169.254), RFC 1918 private, CGNAT, or ULA ranges.
+ * cloud metadata (169.254.169.254), RFC 1918, CGNAT, ULA, NAT64, 6to4, or hex IPv4-mapped ranges.
  */
 export function isPrivateOrReservedIp(ip: string): boolean {
   const version = net.isIP(ip);
   if (version === 4) {
-    const [a, b] = ip.split('.').map(Number);
-    if (a === 0 || a === 10 || a === 127) return true;                     // 0.0.0.0/8, 10.0.0.0/8, 127.0.0.0/8
-    if (a === 169 && b === 254) return true;                               // 169.254.0.0/16 (AWS/GCP/Azure IMDS!)
-    if (a === 172 && b >= 16 && b <= 31) return true;                      // 172.16.0.0/12
-    if (a === 192 && b === 168) return true;                               // 192.168.0.0/16
-    if (a === 100 && b >= 64 && b <= 127) return true;                     // 100.64.0.0/10 (CGNAT)
-    if (a >= 224) return true;                                             // Multicast & reserved
-    return false;
+    const [a, b, c, d] = ip.split('.').map(Number);
+    return isReservedIpv4Octets(a, b, c, d);
   }
   if (version === 6) {
-    const lower = ip.toLowerCase();
-    if (lower === '::1' || lower === '::') return true;                    // Loopback & unspecified
-    if (lower.startsWith('fe80:')) return true;                            // Link-local
-    if (lower.startsWith('fc') || lower.startsWith('fd')) return true;     // Unique Local (fc00::/7)
-    if (lower.startsWith('::ffff:')) {
-      const v4 = lower.slice(7);
-      if (net.isIP(v4) === 4) return isPrivateOrReservedIp(v4);
+    const h = parseIpv6Hextets(ip);
+    if (!h) return true;
+
+    const isAllZeroPrefix = h[0] === 0 && h[1] === 0 && h[2] === 0 && h[3] === 0 && h[4] === 0;
+    // :: (Unspecified) or ::1 (Loopback)
+    if (isAllZeroPrefix && h[5] === 0 && h[6] === 0 && (h[7] === 0 || h[7] === 1)) return true;
+
+    // IPv4-mapped (::ffff:0:0/96) or IPv4-compatible (::0:0/96) — handles both dotted-quad and hex (::ffff:7f00:1)
+    if (isAllZeroPrefix && (h[5] === 0xffff || h[5] === 0)) {
+      return isReservedIpv4Octets(h[6] >> 8, h[6] & 0xff, h[7] >> 8, h[7] & 0xff);
     }
+
+    // NAT64 Well-Known Prefix (64:ff9b::/96) embedding IPv4 in h[6..7]
+    if (h[0] === 0x0064 && h[1] === 0xff9b && h[2] === 0 && h[3] === 0 && h[4] === 0 && h[5] === 0) {
+      return isReservedIpv4Octets(h[6] >> 8, h[6] & 0xff, h[7] >> 8, h[7] & 0xff);
+    }
+
+    // 6to4 Prefix (2002::/16) embedding IPv4 in h[1..2]
+    if (h[0] === 0x2002) {
+      return isReservedIpv4Octets(h[1] >> 8, h[1] & 0xff, h[2] >> 8, h[2] & 0xff);
+    }
+
+    if ((h[0] & 0xffc0) === 0xfe80) return true; // Link-local fe80::/10
+    if ((h[0] & 0xfe00) === 0xfc00) return true; // Unique Local fc00::/7
+    if (h[0] === 0x2001 && h[1] === 0x0db8) return true; // Documentation 2001:db8::/32
+    if ((h[0] & 0xff00) === 0xff00) return true; // Multicast ff00::/8
     return false;
   }
   return true;
 }
 
-export async function assertSafeOutboundUrl(rawUrl: string): Promise<URL> {
-  const parsed = new URL(rawUrl);
-  if (parsed.protocol !== 'https:') {
+/**
+ * Resolves DNS ONCE, validates all returned IPs against the SSRF blocklist,
+ * and returns a pinned https.Agent that connects directly to the verified IP
+ * to completely defeat DNS Rebinding (TTL=0 TOCTOU) attacks.
+ */
+export async function createPinnedSafeHttpsAgent(rawUrl: string): Promise<{
+  parsedUrl: URL;
+  pinnedIp: string;
+  pinnedFamily: 4 | 6;
+  agent: https.Agent;
+}> {
+  const parsedUrl = new URL(rawUrl);
+  if (parsedUrl.protocol !== 'https:') {
     throw new Error('SSRF_BLOCKED: Only https:// URLs are permitted');
   }
-  if (parsed.username || parsed.password) {
+  if (parsedUrl.username || parsedUrl.password) {
     throw new Error('SSRF_BLOCKED: URL credentials are forbidden');
   }
-  const records = await dns.lookup(parsed.hostname, { all: true });
+  if (parsedUrl.port && parsedUrl.port !== '443') {
+    throw new Error(`SSRF_BLOCKED: Non-standard outbound port ${parsedUrl.port} is forbidden`);
+  }
+
+  const records = await dns.lookup(parsedUrl.hostname, { all: true, verbatim: true });
   if (records.length === 0) {
     throw new Error('SSRF_BLOCKED: Hostname did not resolve');
   }
@@ -63,14 +129,122 @@ export async function assertSafeOutboundUrl(rawUrl: string): Promise<URL> {
       throw new Error(`SSRF_BLOCKED: Hostname resolved to restricted IP ${rec.address}`);
     }
   }
-  return parsed;
+
+  const pinnedIp = records[0].address;
+  const pinnedFamily = records[0].family as 4 | 6;
+
+  // Pin socket lookup to the already-validated IP so a second DNS lookup never occurs!
+  const agent = new https.Agent({
+    keepAlive: false,
+    lookup: (_hostname, _options, callback) => {
+      callback(null, pinnedIp, pinnedFamily);
+    },
+  });
+
+  return { parsedUrl, pinnedIp, pinnedFamily, agent };
 }
 ```
 
-### CSRF, CORS, XSS, SQLi & BOPLA Defense Matrix
-- **CSRF**: For cookie-authenticated endpoints, enforce `SameSite=Strict` (or `Lax`), verify `Origin` / `Sec-Fetch-Site` headers on all `POST`/`PUT`/`PATCH`/`DELETE` requests, and require a cryptographic anti-CSRF header (`X-CSRF-Token` via the Double-Submit Cookie or Synchronizer Token pattern).
+### CSRF, CORS, XSS, SQLi, NoSQLi, Prototype Pollution, Host Poisoning & GraphQL Amplification Defenses
+
+```typescript
+/**
+ * 1. Anti-Prototype-Pollution & JSON Bomb / Depth Sanitizer:
+ * Blocks "__proto__", "constructor", "prototype", deeply nested JSON bombs, and MongoDB "$" operator injection.
+ */
+const FORBIDDEN_OBJECT_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+export function sanitizeUntrustedJsonInput(
+  input: unknown,
+  options: { maxDepth?: number; maxKeysPerObject?: number; forbidDollarKeys?: boolean } = {},
+  currentDepth = 0
+): unknown {
+  const maxDepth = options.maxDepth ?? 12;
+  const maxKeys = options.maxKeysPerObject ?? 250;
+  const forbidDollar = options.forbidDollarKeys ?? true;
+
+  if (currentDepth > maxDepth) {
+    throw new Error(`PAYLOAD_REJECTED: JSON nesting depth exceeds maximum of ${maxDepth}`);
+  }
+
+  if (input === null || input === undefined) return input;
+  if (typeof input === 'string') {
+    // Normalize Unicode (NFKC) BEFORE downstream validation to defeat fullwidth/homoglyph bypasses
+    if (input.includes('\0')) throw new Error('PAYLOAD_REJECTED: Null byte in string');
+    return input.normalize('NFKC');
+  }
+  if (typeof input !== 'object') return input;
+
+  if (Array.isArray(input)) {
+    if (input.length > 1000) {
+      throw new Error('PAYLOAD_REJECTED: Array length exceeds maximum bound');
+    }
+    return input.map((item) => sanitizeUntrustedJsonInput(item, options, currentDepth + 1));
+  }
+
+  const entries = Object.entries(input as Record<string, unknown>);
+  if (entries.length > maxKeys) {
+    throw new Error(`PAYLOAD_REJECTED: Object key count exceeds maximum of ${maxKeys}`);
+  }
+
+  const cleanObj: Record<string, unknown> = Object.create(null);
+  for (const [rawKey, value] of entries) {
+    const key = rawKey.normalize('NFKC');
+    if (FORBIDDEN_OBJECT_KEYS.has(key)) {
+      throw new Error(`PAYLOAD_REJECTED: Prototype pollution key "${key}" is forbidden`);
+    }
+    if (forbidDollar && (key.startsWith('$') || key.includes('.'))) {
+      throw new Error(`PAYLOAD_REJECTED: NoSQL operator or dotted key "${key}" is forbidden`);
+    }
+    cleanObj[key] = sanitizeUntrustedJsonInput(value, options, currentDepth + 1);
+  }
+  return { ...cleanObj };
+}
+
+/**
+ * 2. SQL LIKE Wildcard Escaper:
+ * Prevents attackers from injecting "%" or "_" wildcards into search strings to cause pathological table scans.
+ */
+export function escapeSqlLikePattern(rawSearch: string, escapeChar = '\\'): string {
+  return rawSearch
+    .normalize('NFKC')
+    .replace(new RegExp(`[\\${escapeChar}%_]`, 'g'), (match) => `${escapeChar}${match}`);
+}
+
+/**
+ * 3. Trusted Reverse-Proxy Client IP Extractor (Defeats X-Forwarded-For Spoofing):
+ * Never read the leftmost IP in X-Forwarded-For (which is attacker-controlled!).
+ * Walk right-to-left skipping exactly `trustedProxyCount` hops added by your own ingress load balancers.
+ */
+export function extractTrustedClientIp(params: {
+  socketRemoteAddress: string;
+  xForwardedForHeader?: string;
+  trustedProxyHopCount: number;
+}): string {
+  if (params.trustedProxyHopCount <= 0 || !params.xForwardedForHeader) {
+    return params.socketRemoteAddress;
+  }
+  const chain = params.xForwardedForHeader
+    .split(',')
+    .map((ip) => ip.trim())
+    .filter((ip) => net.isIP(ip) !== 0);
+
+  if (chain.length === 0) {
+    return params.socketRemoteAddress;
+  }
+
+  // Select the hop immediately preceding our trusted proxies
+  const targetIndex = Math.max(0, chain.length - params.trustedProxyHopCount);
+  return chain[targetIndex];
+}
+```
+
+### Additional Mandatory Penetration Defenses
+- **Host Header & Password Reset Poisoning Defense**: Never construct password-reset, magic-link, or OAuth redirect URLs using `req.headers.host` or `X-Forwarded-Host`. Always read the canonical origin from an immutable server environment variable (`process.env.APP_URL`).
+- **HTTP Request Smuggling (`CL.TE` / `TE.CL`) Defense**: Configure the edge load balancer and HTTP server to reject any request containing both `Content-Length` and `Transfer-Encoding`, normalize HTTP/2 -> HTTP/1.1 downgrade headers, and reject malformed whitespace in header names.
+- **GraphQL Batching & Alias Amplification Defense**: Enforce max query depth ($\le 8$), max aliases per query ($\le 15$ to block `login1: login(...) ... login500: login(...)` brute-force amplification), max batch array size ($\le 1$ for mutations), and disable introspection in production.
+- **CSRF**: For cookie-authenticated endpoints, enforce `SameSite=Strict` (or `Lax`), verify `Origin` / `Sec-Fetch-Site` headers on all `POST`/`PUT`/`PATCH`/`DELETE` requests, and require a cryptographic anti-CSRF header (`X-CSRF-Token`).
 - **CORS**: Never reflect arbitrary `Origin` headers with `Access-Control-Allow-Credentials: true`. Match `Origin` against an explicit exact-match allowlist.
-- **SQL Injection (SQLi)**: Use 100% parameterized queries (`$1, $2`). For dynamic `ORDER BY` or column names (which cannot use bind parameters), map user input against a frozen compile-time dictionary (`const SORT_COLUMN_MAP = { createdAt: 'created_at', amount: 'amount_minor' } as const`).
 - **BOLA & BOPLA (Broken Object / Property-Level Authorization)**:
   - **BOLA**: Always filter by `tenant_id` and `owner_id` in the `WHERE` clause.
   - **BOPLA / Mass Assignment**: Never pass `req.body` directly into ORM `.create()` or `.update()`. Explicitly pick allowed DTO fields via Zod `.strict()` so attackers cannot inject `role: "admin"` or `is_verified: true`.

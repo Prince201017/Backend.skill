@@ -392,13 +392,17 @@ export function calculatePartialRefundCreditNote(
   // If refunding the final remaining units on the line, refund the exact remaining net & tax to prevent penny drift
   const isFinalLineRefund = requestedQuantityToRefund === remainingQty;
 
-  const refundNetMinor = isFinalLineRefund
+  const rawRefundNet = isFinalLineRefund
     ? remainingNet
     : divRoundHalfEven(lineState.capturedNetMinor * requestedQuantityToRefund, lineState.capturedQuantity);
 
-  const refundTaxMinor = isFinalLineRefund
+  const rawRefundTax = isFinalLineRefund
     ? remainingTax
     : divRoundHalfEven(lineState.capturedTaxMinor * requestedQuantityToRefund, lineState.capturedQuantity);
+
+  // Clamp to remaining refundable balance so cumulative partial refunds can never exceed captured amount
+  const refundNetMinor = rawRefundNet > remainingNet ? remainingNet : rawRefundNet < 0n ? 0n : rawRefundNet;
+  const refundTaxMinor = rawRefundTax > remainingTax ? remainingTax : rawRefundTax < 0n ? 0n : rawRefundTax;
 
   return {
     lineId: lineState.lineId,

@@ -71,18 +71,28 @@ import crypto from 'node:crypto';
 
 export function verifyWebhookSignature(params: {
   rawBodyBuffer: Buffer;
-  signatureHeader: string; // e.g., "t=1762388805,v1=5257a869e7ecebeda32affa62cdca3fa51cad7e77a0e56ff536d0ce8e108d8bd"
-  webhookSecret: string;
+  signatureHeader: string; // Supports multiple v1 signatures during secret rotation: "t=1762388805,v1=sig1,v1=sig2"
+  webhookSecrets: string[]; // Supports active + retiring webhook secrets
   toleranceSeconds?: number;
 }): { valid: boolean; reason?: string } {
   const tolerance = params.toleranceSeconds ?? 300; // 5 minutes max replay window
-  const parts = Object.fromEntries(
-    params.signatureHeader.split(',').map((kv) => kv.split('=') as [string, string])
-  );
+  if (!params.signatureHeader || params.webhookSecrets.length === 0) {
+    return { valid: false, reason: 'MISSING_SIGNATURE_OR_SECRET' };
+  }
 
-  const timestampSec = Number(parts.t);
-  const signatureHex = parts.v1;
-  if (!Number.isInteger(timestampSec) || !signatureHex) {
+  let timestampStr: string | undefined;
+  const v1Signatures: string[] = [];
+
+  for (const token of params.signatureHeader.split(',')) {
+    const [k, v] = token.trim().split('=');
+    if (k === 't' && v) timestampStr = v;
+    if (k === 'v1' && v && /^[0-9a-fA-F]{64}$/.test(v)) {
+      v1Signatures.push(v);
+    }
+  }
+
+  const timestampSec = Number(timestampStr);
+  if (!Number.isInteger(timestampSec) || v1Signatures.length === 0) {
     return { valid: false, reason: 'MALFORMED_SIGNATURE_HEADER' };
   }
 
@@ -96,17 +106,25 @@ export function verifyWebhookSignature(params: {
     params.rawBodyBuffer,
   ]);
 
-  const expectedSig = crypto
-    .createHmac('sha256', params.webhookSecret)
-    .update(signedPayload)
-    .digest();
+  let matchedAny = false;
+  for (const secret of params.webhookSecrets) {
+    const expectedSig = crypto
+      .createHmac('sha256', secret)
+      .update(signedPayload)
+      .digest();
 
-  const providedSig = Buffer.from(signatureHex, 'hex');
-  if (expectedSig.length !== providedSig.length) {
-    return { valid: false, reason: 'INVALID_SIGNATURE_LENGTH' };
+    for (const sigHex of v1Signatures) {
+      const providedSig = Buffer.from(sigHex, 'hex');
+      if (
+        expectedSig.length === providedSig.length &&
+        crypto.timingSafeEqual(expectedSig, providedSig)
+      ) {
+        matchedAny = true;
+      }
+    }
   }
 
-  if (!crypto.timingSafeEqual(expectedSig, providedSig)) {
+  if (!matchedAny) {
     return { valid: false, reason: 'SIGNATURE_MISMATCH' };
   }
 
