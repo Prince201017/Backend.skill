@@ -1,34 +1,46 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-const SKILL_FILES = [
-  'SKILL.md',
-  'references/01-domain-modeling-fields-timestamps-ids.md',
-  'references/02-auth-authorization-fingerprinting-security.md',
-  'references/03-databases-polyglot-storage-transactions.md',
-  'references/04-apis-payments-webhooks-resilience.md',
-  'references/05-file-uploads-multi-storage-malware-scanning.md',
-  'references/06-async-queues-observability-testing-devops.md',
-];
+async function collectMarkdownFiles(dirPath: string, relativePrefix = ''): Promise<{ path: string; content: string }[]> {
+  try {
+    const entries = await fs.readdir(dirPath, { withFileTypes: true });
+    const sorted = [...entries].sort((a, b) => {
+      if (a.name === 'SKILL.md') return -1;
+      if (b.name === 'SKILL.md') return 1;
+      return a.name.localeCompare(b.name);
+    });
+
+    const results: { path: string; content: string }[] = [];
+    for (const entry of sorted) {
+      const fullPath = path.join(dirPath, entry.name);
+      const relPath = `${relativePrefix}/${entry.name}`;
+      if (entry.isDirectory()) {
+        const nested = await collectMarkdownFiles(fullPath, relPath);
+        results.push(...nested);
+      } else if (entry.isFile() && entry.name.endsWith('.md')) {
+        const content = await fs.readFile(fullPath, 'utf8');
+        results.push({ path: relPath, content });
+      }
+    }
+    return results;
+  } catch {
+    return [];
+  }
+}
 
 export default async function SkillSpecPage() {
-  const baseDir = path.join(process.cwd(), 'skills', 'backend-development');
-  const loadedFiles = await Promise.all(
-    SKILL_FILES.map(async (relPath) => {
-      const content = await fs.readFile(path.join(baseDir, relPath), 'utf8');
-      return { path: `/skills/backend-development/${relPath}`, content };
-    })
-  );
+  const skillsRoot = path.join(process.cwd(), 'skills');
+  const loadedFiles = await collectMarkdownFiles(skillsRoot, '/skills');
 
   return (
     <main className="min-h-screen bg-neutral-950 text-neutral-100 p-6 md:p-10 font-mono text-sm">
       <div className="max-w-5xl mx-auto space-y-8">
         <header className="border-b border-neutral-800 pb-4">
           <h1 className="text-lg font-bold text-white">
-            /skills/backend-development/SKILL.md (+ 6 Reference Modules)
+            /skills/backendevelopment/SKILL.md (+ {Math.max(0, loadedFiles.length - 1)} Reference Modules)
           </h1>
           <p className="text-neutral-400 text-xs mt-1">
-            Zero-loss Advanced Backend Development Skill specification files generated in repository.
+            Zero-loss Advanced Backend Development Skill specification files in repository.
           </p>
         </header>
 
