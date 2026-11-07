@@ -1,67 +1,27 @@
-# Module 07: Event-Driven Architecture, WebSockets, SSE, Sagas, Zero-Downtime Migrations, Advanced SQL, Multi-Tenancy & Search
+# Module 07: Event-Driven Architecture, WebSockets, SSE, Durable Sagas, Zero-Downtime Migrations & Multi-Tenancy
 
-This reference covers the 8 core data-intensive and real-time backend engineering domains required for scalable distributed applications.
-
----
-
-## 1. Event-Driven Architecture (Kafka, RabbitMQ, NATS & Event Schemas)
-
-### Broker Topology & Partition Ordering
-- **Apache Kafka**: Partitioned append-only commit log. Always set the message **Partition Key** to the `aggregate_id` (e.g., `order_id` or `account_id`) so all events for a single domain entity (`OrderCreated -> OrderPaid -> OrderShipped`) land on the exact same partition and are consumed strictly in order.
-- **RabbitMQ**: Use Topic or Direct exchanges with durable queues (`durable: true`, `deliveryMode: 2` persistent messages), publisher confirms (`confirmChannel`), and explicit consumer `ack`/`nack` with `prefetch(N)` backpressure.
-- **NATS JetStream**: Use subject hierarchies (`orders.{tenantId}.{eventType}`), stream deduplication headers (`Nats-Msg-Id: {eventId}`), and explicit consumer ack policies.
-
-### Canonical CloudEvents 1.0 Envelope & Schema Compatibility
-Enforce backward/forward schema compatibility (Avro / Protobuf / JSON Schema Registry): never rename or change the type of existing event fields; add new optional fields with defaults or publish a new versioned event type (`order.created.v2`).
-
-```json
-{
-  "specversion": "1.0",
-  "id": "019300e8-8a10-7000-9c11-4f8a2b1c9d0e",
-  "source": "urn:service:billing-service",
-  "type": "com.example.billing.invoice.paid.v1",
-  "subject": "inv_019300e8",
-  "time": "2026-11-05T20:05:00.000Z",
-  "datacontenttype": "application/json",
-  "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
-  "data": {
-    "tenantId": "019300a0-0000-7000-8000-000000000001",
-    "invoiceId": "inv_019300e8",
-    "amountPaidMinor": "15000",
-    "currency": "USD"
-  }
-}
-```
+This module covers event streaming, WebSocket/SSE framing, **crash-recoverable durable Saga orchestration** (replacing volatile in-memory `completedSteps` arrays with persistent step state), **Expand-and-Contract zero-downtime migrations** with compatibility checks, batched backfills, and rollback plans, plus PostgreSQL Row-Level Security (`FORCE ROW LEVEL SECURITY`).
 
 ---
 
-## 2. WebSocket Engineering (Lifecycle, Rooms, Presence & Heartbeats)
+## 1. Threat Model, Trust Boundaries & Failure Behavior
 
-1. **Authentication at Upgrade**: Authenticate during the HTTP `Upgrade` handshake (`Sec-WebSocket-Protocol` or short-lived single-use ticket exchanged over HTTPS) and re-validate token expiration periodically on active sockets.
-2. **Ping/Pong Heartbeats & Dead-Peer Detection**:
-   - Server sends a protocol-level `ping` (or application-level `{"type":"ping"}`) every `25s`.
-   - If no `pong` arrives within `10s`, terminate the socket and clean up room/presence memberships to prevent zombie file-descriptor leaks.
-3. **Horizontal Scaling via Redis / NATS PubSub Backplane**:
-   - Because User A may connect to Pod 1 and User B to Pod 2, room broadcasts (`room:{tenantId}:{roomId}`) publish to a Redis/NATS channel so every pod forwards the frame to its locally connected room subscribers.
-4. **Presence with Expiring Leases**:
-   - Store presence in Redis (`ZADD presence:{roomId} <nowMs> <userId>`), refresh on each heartbeat, and prune stale members (`ZREMRANGEBYSCORE presence:{roomId} -inf <nowMs - 45000>`).
-5. **Backpressure Protection**: Check `ws.bufferedAmount` before writing high-frequency frames; drop non-critical ephemeral frames (like cursor coordinates) or disconnect slow consumers if `bufferedAmount > maxBufferBytes` (e.g., 4MB).
+| Component | Threat / Failure Vector | Enforcement Location | Failure Behavior |
+| :--- | :--- | :--- | :--- |
+| **Saga Orchestrator (`runOrResumeDurableSaga`)** | Tracking `completedSteps` only in a local JavaScript array loses all progress if the orchestrator pod crashes after Step 1 completes, leaving reserved funds/inventory stranded forever. | Persistent `saga_instances` & `saga_step_logs` tables (`DurableSagaStateStore`). | On restart/resume, loads persisted step history, skips already-completed forward steps, and compensates all completed steps in reverse order with idempotency keys. |
+| **SSE Stream Formatter (`formatSseFrame`)** | Injecting `\r` or `\n` into `id` or `event` forges arbitrary SSE frames (`event: admin_override`). | Outbound SSE serializer. | Rejects `\r`, `\n`, and `\0` in `id`/`event` and splits `data` across all WHATWG line endings (`\r\n`, `\r`, `\n`). |
+| **Zero-Downtime Migrations** | Running `ALTER TABLE ADD COLUMN ... NOT NULL` without a default or running `CREATE INDEX` without `CONCURRENTLY` acquires an `ACCESS EXCLUSIVE` / `SHARE` lock that blocks all production traffic. | CI migration linter & `SET lock_timeout = '2s'`. | Aborts DDL immediately after `2s` if lock cannot be acquired; enforces 4-phase Expand-and-Contract with batched backfill. |
 
 ---
 
-## 3. Server-Sent Events (SSE) Streaming & `Last-Event-ID` Resume
-
-SSE is the preferred protocol for unidirectional server-to-client streams (live notifications, job progress, financial tickers, streaming AI responses).
+## 2. Event-Driven Architecture & SSE Frame Injection Defense
 
 ```typescript
-/**
- * Production SSE Frame Formatter with Event ID, Retry Hint, and Proxy Anti-Buffering Headers
- */
 export const SSE_RESPONSE_HEADERS: Record<string, string> = {
   'Content-Type': 'text/event-stream; charset=utf-8',
   'Cache-Control': 'no-cache, no-transform',
   Connection: 'keep-alive',
-  'X-Accel-Buffering': 'no', // Prevents Nginx from buffering SSE chunks!
+  'X-Accel-Buffering': 'no',
 };
 
 export function formatSseFrame(params: {
@@ -70,8 +30,6 @@ export function formatSseFrame(params: {
   data: unknown;
   retryMs?: number;
 }): string {
-  // CRITICAL: WHATWG EventSource treats CR (\r), LF (\n), and CRLF (\r\n) as line terminators.
-  // Reject any CR/LF/Null in id or event to prevent SSE Frame Injection!
   if (/[\r\n\0]/.test(params.id) || /[\r\n\0]/.test(params.event)) {
     throw new Error('SSE_FRAME_INJECTION_BLOCKED: CR, LF, and Null characters are forbidden in id/event');
   }
@@ -85,173 +43,286 @@ export function formatSseFrame(params: {
     lines.push(`retry: ${params.retryMs}`);
   }
   const serialized = JSON.stringify(params.data) ?? 'null';
-  // Split on all WHATWG line endings (\r\n, \r, \n) so bare \r cannot inject forged SSE fields
   for (const line of serialized.split(/\r\n|\r|\n/)) {
     lines.push(`data: ${line}`);
   }
   return lines.join('\n') + '\n\n';
 }
 ```
-- **Reconnection Resume (`Last-Event-ID`)**: When a browser reconnects after a network drop, it automatically sends the `Last-Event-ID` HTTP header. Query the event store/Redis stream (`XRANGE stream:{channelId} (${lastEventId} +`) to replay missed events seamlessly before switching to live push.
-- **Keep-Alive Comments**: Emit `: heartbeat\n\n` every `15s` so load balancers and NAT gateways do not close idle connections.
 
 ---
 
-## 4. Distributed Transactions: Sagas & Compensating Actions
+## 3. Remediated Durable Saga Orchestrator (Crash Recovery, Resumability & Idempotent Compensation)
 
-Never use blocking Two-Phase Commit (2PC/XA) across microservices or external APIs. Use an **Orchestrated Saga** with persistent step state and idempotent **Compensating Transactions**:
+### Why In-Memory `completedSteps` Is Not Durable Saga State
+If a saga executes Step 1 (`reserve_inventory`), commits it, and the Node.js process crashes while calling Step 2 (`charge_card`), an in-memory `completedSteps` array vanishes. When a recovery worker picks up the saga, it must read the durable step log from PostgreSQL to know which steps already succeeded and whether the saga is moving forward or compensating backward.
 
-| Saga StepPhase | Forward Action | Compensating Action (Backward Recovery) |
-| :--- | :--- | :--- |
-| **1. Reserve Inventory (Compensatable)** | `POST /inventory/reservations` (`status = RESERVED`) | `DELETE /inventory/reservations/{reservationId}` (`status = RELEASED`) |
-| **2. Charge Payment (Pivot Transaction)** | `POST /payments/charges` (with `Idempotency-Key`) | `POST /payments/refunds` (if post-pivot step fails) |
-| **3. Issue Entitlement / Shipment (Retryable)** | `POST /fulfillment/shipments` (retried until success) | N/A (Retried forward via durable queue until completion) |
+```sql
+CREATE TABLE saga_instances (
+    saga_id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    saga_type VARCHAR(64) NOT NULL,
+    status VARCHAR(40) NOT NULL CHECK (status IN (
+        'RUNNING_FORWARD',
+        'COMPENSATING_BACKWARD',
+        'COMPLETED',
+        'COMPENSATED_ROLLED_BACK',
+        'RECONCILIATION_REQUIRED'
+    )),
+    context_json JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE TABLE saga_step_logs (
+    saga_id UUID NOT NULL REFERENCES saga_instances(saga_id) ON DELETE CASCADE,
+    step_index INT NOT NULL,
+    step_name VARCHAR(64) NOT NULL,
+    status VARCHAR(40) NOT NULL CHECK (status IN (
+        'FORWARD_STARTED',
+        'FORWARD_COMPLETED',
+        'FORWARD_FAILED',
+        'FORWARD_AMBIGUOUS_TIMEOUT',
+        'COMPENSATING',
+        'COMPENSATED',
+        'COMPENSATION_FAILED_INTERVENTION_REQUIRED'
+    )),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (saga_id, step_index)
+);
+```
 
 ```typescript
-export interface SagaStep<TContext> {
+export type DurableSagaStatus =
+  | 'RUNNING_FORWARD'
+  | 'COMPENSATING_BACKWARD'
+  | 'COMPLETED'
+  | 'COMPENSATED_ROLLED_BACK'
+  | 'RECONCILIATION_REQUIRED';
+
+export type DurableStepStatus =
+  | 'FORWARD_STARTED'
+  | 'FORWARD_COMPLETED'
+  | 'FORWARD_FAILED'
+  | 'FORWARD_AMBIGUOUS_TIMEOUT'
+  | 'COMPENSATING'
+  | 'COMPENSATED'
+  | 'COMPENSATION_FAILED_INTERVENTION_REQUIRED';
+
+export interface SagaStepDefinition<TContext> {
   stepName: string;
-  executeForward: (ctx: TContext, idempotencyKey: string) => Promise<void>;
-  compensateBackward?: (ctx: TContext, idempotencyKey: string) => Promise<void>;
+  stepTimeoutMs?: number;
+  executeForward: (ctx: TContext, idempotencyKey: string, signal: AbortSignal) => Promise<void>;
+  compensateBackward?: (ctx: TContext, idempotencyKey: string, signal: AbortSignal) => Promise<void>;
 }
 
-export async function runOrchestratedSaga<TContext>(
-  sagaId: string,
-  ctx: TContext,
-  steps: SagaStep<TContext>[],
-  recordStepState: (
+export interface PersistedSagaStepRecord {
+  stepIndex: number;
+  stepName: string;
+  status: DurableStepStatus;
+}
+
+export interface DurableSagaStateStore<TContext> {
+  loadOrCreateSagaInstance(params: {
+    sagaId: string;
+    tenantId: string;
+    sagaType: string;
+    initialContext: TContext;
+  }): Promise<{
+    sagaStatus: DurableSagaStatus;
+    context: TContext;
+    steps: ReadonlyArray<PersistedSagaStepRecord>;
+  }>;
+
+  recordStepStatus(
     sagaId: string,
+    stepIndex: number,
     stepName: string,
-    state:
-      | 'STARTED'
-      | 'COMPLETED'
-      | 'COMPENSATING'
-      | 'COMPENSATED'
-      | 'COMPENSATION_FAILED_REQUIRES_INTERVENTION'
-  ) => Promise<void>
-): Promise<void> {
-  const completedSteps: SagaStep<TContext>[] = [];
+    status: DurableStepStatus
+  ): Promise<void>;
 
-  try {
-    for (const step of steps) {
-      await recordStepState(sagaId, step.stepName, 'STARTED');
-      await step.executeForward(ctx, `${sagaId}:${step.stepName}:forward`);
-      await recordStepState(sagaId, step.stepName, 'COMPLETED');
-      completedSteps.push(step);
-    }
-  } catch (forwardError) {
-    // Execute compensating transactions in reverse order with bounded retries so a transient failure
-    // on step K does not skip compensating steps K-1..0 ("Saga Zombie" prevention).
-    for (let i = completedSteps.length - 1; i >= 0; i--) {
-      const step = completedSteps[i];
-      if (!step.compensateBackward) continue;
-      await recordStepState(sagaId, step.stepName, 'COMPENSATING');
+  updateSagaStatus(sagaId: string, status: DurableSagaStatus): Promise<void>;
+}
 
-      let compensated = false;
-      for (let attempt = 1; attempt <= 3; attempt++) {
-        try {
-          await step.compensateBackward(ctx, `${sagaId}:${step.stepName}:compensate`);
-          await recordStepState(sagaId, step.stepName, 'COMPENSATED');
-          compensated = true;
-          break;
-        } catch {
-          if (attempt < 3) {
-            await new Promise((r) => setTimeout(r, 200 * 2 ** attempt));
-          }
-        }
-      }
-
-      if (!compensated) {
-        await recordStepState(
-          sagaId,
-          step.stepName,
-          'COMPENSATION_FAILED_REQUIRES_INTERVENTION'
-        );
-      }
-    }
-    throw forwardError;
+export class SagaAmbiguousStepTimeoutError extends Error {
+  public readonly isAmbiguousTimeout = true;
+  constructor(message: string) {
+    super(message);
   }
+}
+
+/**
+ * Durable, Crash-Recoverable Saga Orchestrator:
+ * - Persists every step state transition before and after execution.
+ * - On crash recovery, loads persisted steps from DurableSagaStateStore, skips already FORWARD_COMPLETED steps,
+ *   or resumes backward compensation for all FORWARD_COMPLETED / COMPENSATING steps in reverse order.
+ */
+export async function runOrResumeDurableSaga<TContext>(params: {
+  sagaId: string;
+  tenantId: string;
+  sagaType: string;
+  initialContext: TContext;
+  steps: readonly SagaStepDefinition<TContext>[];
+  store: DurableSagaStateStore<TContext>;
+  maxCompensationAttempts?: number;
+}): Promise<{ finalStatus: DurableSagaStatus }> {
+  const maxCompAttempts = params.maxCompensationAttempts ?? 3;
+  const loaded = await params.store.loadOrCreateSagaInstance({
+    sagaId: params.sagaId,
+    tenantId: params.tenantId,
+    sagaType: params.sagaType,
+    initialContext: params.initialContext,
+  });
+
+  if (loaded.sagaStatus === 'COMPLETED' || loaded.sagaStatus === 'COMPENSATED_ROLLED_BACK') {
+    return { finalStatus: loaded.sagaStatus };
+  }
+  if (loaded.sagaStatus === 'RECONCILIATION_REQUIRED') {
+    return { finalStatus: 'RECONCILIATION_REQUIRED' };
+  }
+
+  const stepMap = new Map<number, PersistedSagaStepRecord>();
+  for (const s of loaded.steps) {
+    stepMap.set(s.stepIndex, s);
+  }
+
+  let shouldCompensate = loaded.sagaStatus === 'COMPENSATING_BACKWARD';
+
+  // Phase 1: Forward execution (resumes from the first non-completed step)
+  if (!shouldCompensate) {
+    for (let i = 0; i < params.steps.length; i++) {
+      const step = params.steps[i];
+      const existing = stepMap.get(i);
+
+      if (existing?.status === 'FORWARD_COMPLETED') {
+        continue; // Already completed before crash; skip!
+      }
+
+      await params.store.recordStepStatus(params.sagaId, i, step.stepName, 'FORWARD_STARTED');
+      const timeoutMs = step.stepTimeoutMs ?? 10_000;
+      const controller = new AbortController();
+      const timer = setTimeout(
+        () => controller.abort(new SagaAmbiguousStepTimeoutError(`Step ${step.stepName} timed out`)),
+        timeoutMs
+      );
+
+      try {
+        await step.executeForward(
+          loaded.context,
+          `${params.sagaId}:step:${i}:${step.stepName}:forward`,
+          controller.signal
+        );
+        clearTimeout(timer);
+        await params.store.recordStepStatus(params.sagaId, i, step.stepName, 'FORWARD_COMPLETED');
+        stepMap.set(i, { stepIndex: i, stepName: step.stepName, status: 'FORWARD_COMPLETED' });
+      } catch (err) {
+        clearTimeout(timer);
+        if (err instanceof SagaAmbiguousStepTimeoutError || (err instanceof Error && 'isAmbiguousTimeout' in err)) {
+          // Ambiguous pivot timeout: halt and mark for reconciliation rather than blind compensation/retry
+          await params.store.recordStepStatus(params.sagaId, i, step.stepName, 'FORWARD_AMBIGUOUS_TIMEOUT');
+          await params.store.updateSagaStatus(params.sagaId, 'RECONCILIATION_REQUIRED');
+          return { finalStatus: 'RECONCILIATION_REQUIRED' };
+        }
+        await params.store.recordStepStatus(params.sagaId, i, step.stepName, 'FORWARD_FAILED');
+        stepMap.set(i, { stepIndex: i, stepName: step.stepName, status: 'FORWARD_FAILED' });
+        shouldCompensate = true;
+        await params.store.updateSagaStatus(params.sagaId, 'COMPENSATING_BACKWARD');
+        break;
+      }
+    }
+  }
+
+  if (!shouldCompensate) {
+    await params.store.updateSagaStatus(params.sagaId, 'COMPLETED');
+    return { finalStatus: 'COMPLETED' };
+  }
+
+  // Phase 2: Backward compensation in reverse order across all durable steps that started/completed forward
+  let anyCompensationFailed = false;
+  for (let i = params.steps.length - 1; i >= 0; i--) {
+    const step = params.steps[i];
+    const recorded = stepMap.get(i);
+    if (!recorded) continue;
+    if (recorded.status === 'COMPENSATED') continue;
+    if (
+      recorded.status !== 'FORWARD_COMPLETED' &&
+      recorded.status !== 'FORWARD_STARTED' &&
+      recorded.status !== 'COMPENSATING'
+    ) {
+      continue;
+    }
+    if (!step.compensateBackward) {
+      await params.store.recordStepStatus(params.sagaId, i, step.stepName, 'COMPENSATED');
+      continue;
+    }
+
+    await params.store.recordStepStatus(params.sagaId, i, step.stepName, 'COMPENSATING');
+    let compensated = false;
+
+    for (let attempt = 1; attempt <= maxCompAttempts; attempt++) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), step.stepTimeoutMs ?? 10_000);
+      try {
+        await step.compensateBackward(
+          loaded.context,
+          `${params.sagaId}:step:${i}:${step.stepName}:compensate`,
+          controller.signal
+        );
+        clearTimeout(timer);
+        await params.store.recordStepStatus(params.sagaId, i, step.stepName, 'COMPENSATED');
+        compensated = true;
+        break;
+      } catch {
+        clearTimeout(timer);
+      }
+    }
+
+    if (!compensated) {
+      anyCompensationFailed = true;
+      await params.store.recordStepStatus(
+        params.sagaId,
+        i,
+        step.stepName,
+        'COMPENSATION_FAILED_INTERVENTION_REQUIRED'
+      );
+    }
+  }
+
+  const finalStatus: DurableSagaStatus = anyCompensationFailed
+    ? 'RECONCILIATION_REQUIRED'
+    : 'COMPENSATED_ROLLED_BACK';
+  await params.store.updateSagaStatus(params.sagaId, finalStatus);
+  return { finalStatus };
 }
 ```
 
 ---
 
-## 5. Zero-Downtime Database Migrations (Expand-and-Contract Pattern)
+## 4. Zero-Downtime Database Migrations (Compatibility Checks, Batched Backfill & Rollback)
 
-Never run destructive or table-locking DDL (`ALTER TABLE RENAME COLUMN`, `DROP COLUMN`, or non-concurrent index builds) directly during a live deployment while old application pods are still running.
-
-### The 4-Phase Expand-and-Contract Protocol
-1. **Phase 1 — Expand (Additive DDL)**:
-   - Add the new nullable column (`ALTER TABLE users ADD COLUMN full_name TEXT NULL;`).
-   - Always set `SET lock_timeout = '2s';` and `SET statement_timeout = '60s';` at the start of every migration script so a migration waiting on a lock fails fast instead of queueing all production traffic behind an `ACCESS EXCLUSIVE` lock.
-   - Build indexes without blocking writes: `CREATE INDEX CONCURRENTLY idx_users_full_name ON users(full_name);`
-   - To add a `NOT NULL` or `CHECK` constraint without a full-table lock:
-     ```sql
-     ALTER TABLE users ADD CONSTRAINT chk_full_name_nonempty CHECK (full_name <> '') NOT VALID;
-     ALTER TABLE users VALIDATE CONSTRAINT chk_full_name_nonempty; -- Uses SHARE UPDATE EXCLUSIVE (does not block reads/writes!)
-     ```
-2. **Phase 2 — Dual-Write & Backfill**:
-   - Deploy application code that writes to **both** the old column and the new column, while still reading from the old column.
-   - Backfill historical rows in small batched transactions (`LIMIT 5000` with `pg_sleep(0.05)` between batches) to avoid replication lag and WAL bloat.
-3. **Phase 3 — Switch Reads**:
-   - Verify 100% backfill completion, then deploy code that reads from the new column.
-4. **Phase 4 — Contract (Cleanup)**:
-   - Stop writing to the old column in code, then drop the obsolete column in a subsequent migration release.
-
----
-
-## 6. Advanced SQL Engineering (Query Planning, Partitioning, CTEs & Window Functions)
-
-1. **Query Planning (`EXPLAIN (ANALYZE, BUFFERS)`)**:
-   - Inspect `Buffers: shared hit=... read=...` and verify index usage (`Index Scan` / `Index Only Scan` vs. unintended `Seq Scan` on large tables).
-   - Design composite indexes following the **ESR Rule**: **E**quality predicates first, **S**ort columns second, **R**ange predicates last, plus `INCLUDE (...)` covering columns for Index-Only Scans.
-2. **Declarative Table Partitioning**:
-   - Partition high-growth time-series/audit/ledger tables by range (`PARTITION BY RANGE (created_at)`) or multi-tenant tables by hash (`PARTITION BY HASH (tenant_id)`) so partition pruning skips irrelevant partitions and old partitions can be detached/archived (`ALTER TABLE ... DETACH PARTITION ... CONCURRENTLY`) without `DELETE` vacuum overhead.
-3. **CTEs & Window Functions**:
+### Pre-Migration Compatibility & Rollback Protocol
+1. **N-1 Application Compatibility Rule**: Every schema migration deployed before a rolling code rollout MUST be 100% compatible with the currently running `N-1` application version (never drop or rename a column still referenced by running pods).
+2. **Lock & Statement Timeouts**:
    ```sql
-   -- Running account balance & per-tenant top-N query using Window Functions and CTEs
-   WITH ranked_transactions AS (
-       SELECT
-           id,
-           tenant_id,
-           account_id,
-           amount_minor,
-           created_at,
-           SUM(amount_minor) OVER (
-               PARTITION BY account_id
-               ORDER BY created_at ASC, id ASC
-               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-           ) AS running_balance_minor,
-           ROW_NUMBER() OVER (
-               PARTITION BY tenant_id
-               ORDER BY amount_minor DESC
-           ) AS rank_in_tenant
-       FROM ledger_entries
-       WHERE tenant_id = $1
-         AND created_at >= $2
-   )
-   SELECT * FROM ranked_transactions WHERE rank_in_tenant <= 10;
+   SET lock_timeout = '2s';
+   SET statement_timeout = '60s';
    ```
+3. **4-Phase Expand-and-Contract with Explicit Rollback Plans**:
+   - **Phase 1 (Expand)**: Add nullable column (`ALTER TABLE orders ADD COLUMN tax_jurisdiction VARCHAR(32) NULL;`) + `CREATE INDEX CONCURRENTLY`. *Rollback*: `DROP INDEX CONCURRENTLY` and `ALTER TABLE DROP COLUMN` (safe because no code writes to it yet).
+   - **Phase 2 (Dual-Write & Checkpointed Batch Backfill)**: Deploy app code that writes to both old and new columns. Run batched backfill (`UPDATE orders SET tax_jurisdiction = 'US' WHERE id > $lastCursor AND tax_jurisdiction IS NULL ORDER BY id ASC LIMIT 2000`). *Rollback*: Revert app deployment to read old column; dual-written data remains intact.
+   - **Phase 3 (Validate Constraint & Switch Reads)**: Add `NOT VALID` constraint (`ALTER TABLE orders ADD CONSTRAINT chk_tax_jur_not_null CHECK (tax_jurisdiction IS NOT NULL) NOT VALID; ALTER TABLE orders VALIDATE CONSTRAINT chk_tax_jur_not_null;`) and switch reads. *Rollback*: Revert app to read old column and drop constraint if needed.
+   - **Phase 4 (Contract)**: Remove dual-write from code, verify zero queries reference old column, and drop old column in the next release.
 
 ---
 
-## 7. Multi-Tenancy Architecture (RLS Pool, Schema-per-Tenant, DB-per-Tenant)
-
-| Model | Isolation Mechanism | Best For | Mandatory Safeguards |
-| :--- | :--- | :--- | :--- |
-| **1. Pool Model (Shared Schema + RLS)** | `tenant_id UUID NOT NULL` on every table + PostgreSQL Row-Level Security (`FORCE ROW LEVEL SECURITY`) | High-scale B2B SaaS (`100` to `1,000,000+` tenants) | Connect with a `NOSUPERUSER NOBYPASSRLS` DB role and set transaction-scoped context (`SET LOCAL app.current_tenant_id = '...';`) at the start of every transaction. |
-| **2. Bridge Model (Schema-per-Tenant)** | Separate PostgreSQL schema (`tenant_abc.orders`) inside shared cluster | Moderate tenant counts (`50–500`) needing custom extensions | Automate parallel schema migration runners and cap total table count per cluster to avoid catalog bloat. |
-| **3. Silo Model (Database-per-Tenant)** | Dedicated DB instance/database per enterprise tenant | Regulated healthcare/financial enterprises requiring CMEK & data residency | Tenant routing lookup registry cached in Redis + per-tenant connection pool manager. |
+## 5. Multi-Tenancy PostgreSQL RLS Template
 
 ```sql
--- 1. Application DB role MUST NOT have SUPERUSER or BYPASSRLS privileges
 CREATE ROLE app_runtime LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
 
--- 2. PostgreSQL Row-Level Security (RLS) Fail-Closed Enforcement Template
 ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
 ALTER TABLE orders FORCE ROW LEVEL SECURITY;
 
--- Use NULLIF(..., '') before casting to UUID so an unset/reset GUC returns NULL (evaluating to false)
--- instead of throwing "invalid input syntax for type uuid: """
 CREATE POLICY tenant_isolation_policy ON orders
     USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)
     WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
@@ -259,12 +330,13 @@ CREATE POLICY tenant_isolation_policy ON orders
 
 ---
 
-## 8. Search Infrastructure (Elasticsearch / OpenSearch / Meilisearch & Hybrid Vector Search)
+## 6. Verification & Test Requirements
 
-- **Index Sync via Committed Outbox**: Never update Elasticsearch/Meilisearch synchronously inside user HTTP requests. Consume committed `outbox_events` and bulk-index (`_bulk` API) with explicit document `_id` and `_version_type: external` (`version` column from PostgreSQL) so out-of-order events can never overwrite newer documents.
-- **Zero-Downtime Reindexing via Index Aliases**:
-  - Application queries always target an alias (`products_read`) rather than a physical index name.
-  - When changing analyzer/mapping settings: create `products_v2`, backfill from PostgreSQL, then atomically swap the alias (`remove products_v1`, `add products_v2`).
-- **Hybrid Lexical + Semantic Search (Reciprocal Rank Fusion — RRF)**:
-  Combine BM25 keyword scores with vector cosine similarity (`pgvector` HNSW index) using RRF:
-  $$\text{RRF\_Score}(d) = \frac{1}{k + \text{rank}_{\text{BM25}}(d)} + \frac{1}{k + \text{rank}_{\text{vector}}(d)} \quad (k = 60)$$
+1. **Saga Crash Recovery & Resumability Test (`TEST-24`)**:
+   - Run a 3-step saga where Step 1 (`reserve_inventory`) completes and persists `'FORWARD_COMPLETED'`, then simulate an orchestrator crash before Step 2. Resume the saga using `runOrResumeDurableSaga` where Step 2 fails: assert Step 1 is **not** re-executed forward, and Step 1's `compensateBackward` is executed and marked `'COMPENSATED'`.
+2. **SSE CRLF/CR Frame Injection Test**:
+   - Assert `formatSseFrame({ id: '1\r\nevent: pwned', event: 'msg', data: {} })` throws `SSE_FRAME_INJECTION_BLOCKED`.
+
+### Authoritative References
+- **Chris Richardson — Saga Pattern & Countermeasures**: https://microservices.io/patterns/data/saga.html
+- **PostgreSQL 16 Row Security Policies (`FORCE ROW LEVEL SECURITY`)**: https://www.postgresql.org/docs/current/ddl-rowsecurity.html

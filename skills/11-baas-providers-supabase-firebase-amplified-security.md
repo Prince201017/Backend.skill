@@ -1,214 +1,120 @@
-# Module 11: BaaS (Backend-as-a-Service) Providers — Supabase, Firebase, Convex, Appwrite, Amplify & Anti-Lock-In Architecture
+# Module 11: BaaS Providers (Supabase, Firebase, Appwrite, Convex, Amplify) & Amplified Security
 
-This reference provides the complete, penetration-hardened implementation guide for building with or integrating **Backend-as-a-Service (BaaS)** providers (**Supabase, Firebase, Convex, Appwrite, AWS Amplify, PocketBase**) while maintaining enterprise zero-trust security, preventing client-side privilege escalation, and preserving architectural portability.
+## 1. Scope & Threat Model
 
----
+Backend-as-a-Service (BaaS) platforms expose database query engines (PostgREST, Firestore client SDKs) directly to browser and mobile clients. Any missing Row-Level Security (RLS) policy, unverified JWT claim, or overly permissive document rule allows immediate cross-tenant data exfiltration or unauthorized business state manipulation.
 
-## 1. BaaS Selection & Trust-Boundary Matrix
-
-| BaaS Platform | Core Storage Engine | Auth & Security Enforcement | When to Choose | Critical Penetration Pitfall to Prevent |
-| :--- | :--- | :--- | :--- | :--- |
-| **Supabase** | PostgreSQL + PostgREST + GoTrue + Realtime + Storage | PostgreSQL Row-Level Security (`RLS`) + JWT claims | Relational schemas, SQL joins, `pgvector`, full ACID transactions, instant REST/GraphQL APIs. | Checking `auth.jwt() -> 'user_metadata'` in RLS (clients can self-edit `user_metadata`!), exposing `service_role` key to browser, or leaving tables in `public` without `ENABLE ROW LEVEL SECURITY`. |
-| **Firebase** | Cloud Firestore (Document NoSQL) + Firebase Auth + Cloud Storage | `firestore.rules` (`rules_version = '2'`) + App Check + Admin SDK | Real-time mobile/web sync, offline-first client caches, rapid document prototyping. | Writing `allow read: if request.auth != null;` on PII collections, omitting `affectedKeys().hasOnly()` on updates, or trusting `request.auth.token.email` without `email_verified == true`. |
-| **Convex** | Reactive Relational-Document Transactional Store | Server-only TypeScript `query`, `mutation`, `action` functions + Zod | End-to-end TypeScript reactivity where clients never write raw DB queries directly. | Exposing internal admin mutations as public `mutation` instead of `internalMutation`. |
-| **Appwrite / PocketBase** | MariaDB / SQLite + Collection Permissions + Storage | Document/Collection permission strings + Server API keys | Self-hosted or single-binary BaaS deployments. | Granting collection-level `read("any")` or `update("users")` instead of document-specific owner permissions. |
-| **AWS Amplify** | DynamoDB + AppSync GraphQL + Cognito + S3 | `@auth` GraphQL directives + IAM roles + Cognito Groups | Deep AWS ecosystem integration with managed GraphQL subscriptions. | Overly permissive `@auth(rules: [{ allow: private }])` allowing any signed-in Cognito user to mutate another tenant's records. |
-
----
-
-## 2. Supabase Security Hardening (PostgreSQL RLS, `app_metadata`, PostgREST & Edge Functions)
-
-### The 5 Non-Negotiable Supabase Security Laws
-1. **`anon` Key vs. `service_role` Key**:
-   - `NEXT_PUBLIC_SUPABASE_ANON_KEY` is safe for browsers **ONLY** if every single table in exposed schemas has `ENABLE ROW LEVEL SECURITY` enabled.
-   - `SUPABASE_SERVICE_ROLE_KEY` bypasses all RLS completely and MUST only exist in backend server environments (never prefixed with `NEXT_PUBLIC_` or `VITE_`).
-2. **Never Trust `user_metadata` in RLS Policies (Privilege Escalation Vector)**:
-   - Any authenticated user can call `supabase.auth.updateUser({ data: { role: 'admin', tenant_id: 'victim-tenant' } })` from the browser devtools, which mutates `raw_user_meta_data` (`auth.jwt() -> 'user_metadata'`).
-   - **Mandatory Rule**: Store authorization roles and `tenant_id` in **`raw_app_meta_data` (`auth.jwt() -> 'app_metadata'`)** (which can only be modified by `service_role` on the backend) or look them up in a protected `organization_members` table!
-3. **`SECURITY DEFINER` Function Hardening**:
-   - Any PostgreSQL function marked `SECURITY DEFINER` executes with the privileges of the function creator. Always explicitly pin `SET search_path = public, pg_temp;` to prevent schema-shadowing privilege escalation, and revoke `EXECUTE` from `PUBLIC` / `anon` if the function is internal.
-4. **Performance Optimization in Supabase RLS**:
-   - Wrap `auth.uid()` and `auth.jwt()` in an `(SELECT auth.uid())` scalar subquery (`user_id = (SELECT auth.uid())`) so PostgreSQL caches the result as an `InitPlan` once per query rather than re-evaluating the function on every single row scan!
-
-```sql
--- Hardened Supabase Multi-Tenant Schema & RLS Policy Blueprint
-CREATE TABLE public.projects (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    tenant_id UUID NOT NULL,
-    owner_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
-    name VARCHAR(120) NOT NULL CHECK (char_length(trim(name)) >= 2),
-    budget_minor BIGINT NOT NULL DEFAULT 0 CHECK (budget_minor >= 0),
-    is_locked BOOLEAN NOT NULL DEFAULT FALSE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
-);
-
--- Enable and force Row-Level Security
-ALTER TABLE public.projects ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.projects FORCE ROW LEVEL SECURITY;
-
--- Helper function reading ONLY server-controlled app_metadata (NEVER user_metadata!)
-CREATE OR REPLACE FUNCTION public.current_jwt_tenant_id()
-RETURNS UUID
-LANGUAGE sql
-STABLE
-SET search_path = public, pg_temp
-AS $$
-  SELECT NULLIF(
-    ((SELECT auth.jwt()) -> 'app_metadata' ->> 'tenant_id'),
-    ''
-  )::uuid;
-$$;
-
--- SELECT Policy: Cached InitPlan evaluation of auth.uid() and app_metadata.tenant_id
-CREATE POLICY projects_select_policy ON public.projects
-    FOR SELECT
-    TO authenticated
-    USING (
-        tenant_id = (SELECT public.current_jwt_tenant_id())
-    );
-
--- INSERT Policy: Prevent cross-tenant or cross-owner spoofing on creation
-CREATE POLICY projects_insert_policy ON public.projects
-    FOR INSERT
-    TO authenticated
-    WITH CHECK (
-        tenant_id = (SELECT public.current_jwt_tenant_id())
-        AND owner_id = (SELECT auth.uid())
-        AND is_locked = FALSE
-    );
-
--- UPDATE Policy: Prevent changing immutable owner_id or tenant_id, and block updates when locked
-CREATE POLICY projects_update_policy ON public.projects
-    FOR UPDATE
-    TO authenticated
-    USING (
-        tenant_id = (SELECT public.current_jwt_tenant_id())
-        AND owner_id = (SELECT auth.uid())
-        AND is_locked = FALSE
-    )
-    WITH CHECK (
-        tenant_id = (SELECT public.current_jwt_tenant_id())
-        AND owner_id = (SELECT auth.uid())
-    );
-
--- DELETE Policy: Explicitly restrict deletion to unlocked rows owned by the caller in the active tenant
-CREATE POLICY projects_delete_policy ON public.projects
-    FOR DELETE
-    TO authenticated
-    USING (
-        tenant_id = (SELECT public.current_jwt_tenant_id())
-        AND owner_id = (SELECT auth.uid())
-        AND is_locked = FALSE
-    );
-```
+### Trust Boundaries & Failure Modes
+1. **Firebase Firestore Rules Cross-Tenant & State-Machine Bypass**:
+   - *Vulnerability*: A rule on `/projects/{projectId}` that checks `resource.data.ownerId == request.auth.uid` without verifying active tenant membership (`/tenants/$(tenantId)/members/$(request.auth.uid)`) allows a user removed from a tenant (or operating across tenants) to read/mutate tenant resources. Furthermore, allowing `request.resource.data.status in ['DRAFT', 'ACTIVE', 'COMPLETED']` on client updates lets a browser client directly mark a billing/compliance project as `'COMPLETED'`, bypassing server-side verification and invoicing.
+   - *Enforcement*:
+     - Every multi-tenant Firestore document MUST carry an immutable `tenantId`.
+     - Rules MUST verify `isActiveTenantMember(tenantId)` by reading `/databases/$(database)/documents/tenants/$(tenantId)/members/$(request.auth.uid)` and checking `data.status == 'ACTIVE'`.
+     - Restricted terminal/privileged states (`'COMPLETED'`, `'APPROVED'`, `'SETTLED'`) MUST only be written by the backend Firebase Admin SDK (which bypasses client rules inside server-side transactions) — client writes are strictly constrained to initial `'DRAFT'` creation and `'DRAFT' -> 'ACTIVE'` transitions.
+2. **Supabase PostgREST & RLS Hardening**:
+   - Revoke all default privileges from the `anon` role on private tables (`REVOKE ALL ON TABLE ... FROM anon`).
+   - Never use `user_metadata` inside RLS policies (`auth.jwt() -> 'user_metadata'`), because authenticated users can mutate their own `user_metadata` via `supabase.auth.updateUser()`. Always join against an authoritative `public.tenant_members` table with `status = 'ACTIVE'`.
+   - Never expose `SUPABASE_SERVICE_ROLE_KEY` outside trusted server environments.
 
 ---
 
-## 3. Firebase Security Hardening (The 8-Pillar `firestore.rules` Fortress & Admin SDK)
+## 2. Production Firebase Firestore Security Rules (Tenant Membership + State Machine Lockdown)
 
-When using Firebase (Firestore + Firebase Auth), client SDKs talk directly to Firestore. Your `firestore.rules` file **is** your backend authorization and schema validation layer for client-direct operations.
-
-### Hardened `firestore.rules` Reference Implementation
 ```javascript
+// firestore.rules — 8-Pillar Multi-Tenant & State-Machine Hardened Rules
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    // Pillar 0: Default-Deny Global Catch-All
+
+    // 1. Default Deny All
     match /{document=**} {
       allow read, write: if false;
     }
 
-    // Core Reusable Primitives
+    // 2. Core Identity & Active Tenant Membership Helpers
     function isSignedIn() {
-      return request.auth != null && request.auth.token.email_verified == true;
-    }
-    function isValidId(id) {
-      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
-    }
-    function incoming() {
-      return request.resource.data;
-    }
-    function existing() {
-      return resource.data;
-    }
-    function isAdmin() {
-      return isSignedIn() && exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+      return request.auth != null
+        && request.auth.uid is string
+        && request.auth.uid.size() > 0
+        && request.auth.token.email_verified == true;
     }
 
-    // Pillar 6: Split-Collection PII Isolation (Public profile vs. Private PII vault)
-    match /users/{userId} {
-      function isValidPublicProfile(data) {
-        return data.keys().hasAll(['displayName', 'createdAt', 'updatedAt'])
-          && data.keys().hasOnly(['displayName', 'avatarUrl', 'createdAt', 'updatedAt'])
-          && data.displayName is string && data.displayName.size() >= 2 && data.displayName.size() <= 80
-          && (!('avatarUrl' in data) || (data.avatarUrl is string && data.avatarUrl.size() <= 500));
-      }
-
-      allow get: if isSignedIn() && isValidId(userId);
-      allow list: if isSignedIn() && (request.auth.uid == userId || isAdmin());
-
-      allow create: if isSignedIn()
-        && isValidId(userId)
-        && request.auth.uid == userId
-        && isValidPublicProfile(incoming())
-        && incoming().createdAt == request.time
-        && incoming().updatedAt == request.time;
-
-      allow update: if isSignedIn()
-        && isValidId(userId)
-        && request.auth.uid == userId
-        && isValidPublicProfile(incoming())
-        && incoming().createdAt == existing().createdAt
-        && incoming().updatedAt == request.time
-        && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'avatarUrl', 'updatedAt']);
-
-      allow delete: if false;
-
-      // Strict Private PII Subcollection: Owner or Admin ONLY
-      match /private/{docId} {
-        allow get: if isSignedIn() && isValidId(userId) && isValidId(docId) && (request.auth.uid == userId || isAdmin());
-        allow list, write: if false; // Mutated only via server-side Admin SDK after KYC/validation
-      }
+    function memberDocPath(tenantId) {
+      return /databases/$(database)/documents/tenants/$(tenantId)/members/$(request.auth.uid);
     }
 
-    // Pillar 1, 2, 5, 6 & 8: Projects & Relational Subcollections
+    function isActiveTenantMember(tenantId) {
+      return isSignedIn()
+        && tenantId is string
+        && tenantId.size() > 0
+        && exists(memberDocPath(tenantId))
+        && get(memberDocPath(tenantId)).data.status == 'ACTIVE';
+    }
+
+    function hasActiveTenantRole(tenantId, allowedRoles) {
+      return isActiveTenantMember(tenantId)
+        && get(memberDocPath(tenantId)).data.role in allowedRoles;
+    }
+
+    function hasExactKeys(data, requiredKeys, optionalKeys) {
+      let allowedKeys = requiredKeys.concat(optionalKeys);
+      return data.keys().hasAll(requiredKeys)
+        && data.keys().hasOnly(allowedKeys);
+    }
+
+    // 3. Tenant Membership Roster (Read-only to active tenant members; mutated only via Admin SDK)
+    match /tenants/{tenantId}/members/{memberUid} {
+      allow get: if isSignedIn() && (request.auth.uid == memberUid || isActiveTenantMember(tenantId));
+      allow list: if isActiveTenantMember(tenantId);
+      allow create, update, delete: if false; // Managed exclusively by backend Admin SDK
+    }
+
+    // 4. Tenant Projects Collection — Enforces Active Tenant Membership & Blocks Client 'COMPLETED' Transition
     match /projects/{projectId} {
-      function isValidProject(data) {
-        return data.keys().hasAll(['ownerId', 'name', 'status', 'createdAt', 'updatedAt'])
-          && data.keys().hasOnly(['ownerId', 'name', 'status', 'createdAt', 'updatedAt'])
-          && data.ownerId is string && isValidId(data.ownerId)
-          && data.name is string && data.name.size() >= 2 && data.name.size() <= 120
-          && data.status in ['DRAFT', 'ACTIVE', 'COMPLETED'];
+      function isValidProjectShape(data) {
+        return hasExactKeys(
+            data,
+            ['tenantId', 'ownerId', 'name', 'status', 'budgetCents', 'createdAt', 'updatedAt'],
+            ['description']
+          )
+          && data.tenantId is string && data.tenantId.size() >= 3 && data.tenantId.size() <= 64
+          && data.ownerId is string && data.ownerId.size() > 0
+          && data.name is string && data.name.size() >= 1 && data.name.size() <= 120
+          && data.budgetCents is int && data.budgetCents >= 0 && data.budgetCents <= 1000000000
+          && data.createdAt is timestamp
+          && data.updatedAt is timestamp
+          && (!('description' in data) || (data.description is string && data.description.size() <= 2000));
       }
 
-      allow get: if isSignedIn() && isValidId(projectId) && (existing().ownerId == request.auth.uid || isAdmin());
-      // Pillar 8: Query Enforcer — never allow blanket list!
-      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      // Read: Caller must be an ACTIVE member of the project's tenant
+      allow get, list: if isActiveTenantMember(resource.data.tenantId);
 
-      allow create: if isSignedIn()
-        && isValidId(projectId)
-        && isValidProject(incoming())
-        && incoming().ownerId == request.auth.uid
-        && incoming().status == 'DRAFT'
-        && incoming().createdAt == request.time
-        && incoming().updatedAt == request.time;
+      // Create: Caller must be an ACTIVE member (ADMIN or EDITOR), ownerId must be caller,
+      // and initial status MUST be 'DRAFT' (clients can never create directly in 'ACTIVE' or 'COMPLETED')
+      allow create: if isValidProjectShape(request.resource.data)
+        && hasActiveTenantRole(request.resource.data.tenantId, ['ADMIN', 'EDITOR'])
+        && request.resource.data.ownerId == request.auth.uid
+        && request.resource.data.status == 'DRAFT'
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.updatedAt == request.time;
 
-      // Pillar 5 & 6: Action-Based Updates + Terminal State Locking ('COMPLETED' cannot be mutated)
-      allow update: if isSignedIn()
-        && isValidId(projectId)
-        && isValidProject(incoming())
-        && existing().status != 'COMPLETED'
-        && incoming().ownerId == existing().ownerId
-        && incoming().createdAt == existing().createdAt
-        && incoming().updatedAt == request.time
-        && (
-          isAdmin() ||
-          (existing().ownerId == request.auth.uid
-            && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'status', 'updatedAt']))
-        );
+      // Update: Caller must be an ACTIVE member of the existing project's tenant,
+      // immutable fields (tenantId, ownerId, createdAt) must not change,
+      // and client-driven status transitions are strictly limited to 'DRAFT' -> 'DRAFT' or 'DRAFT' -> 'ACTIVE'.
+      // Transitioning to 'COMPLETED' is FORBIDDEN from client SDKs and must be executed by the backend Admin SDK.
+      allow update: if isValidProjectShape(request.resource.data)
+        && isActiveTenantMember(resource.data.tenantId)
+        && (resource.data.ownerId == request.auth.uid || hasActiveTenantRole(resource.data.tenantId, ['ADMIN']))
+        && request.resource.data.tenantId == resource.data.tenantId
+        && request.resource.data.ownerId == resource.data.ownerId
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.updatedAt == request.time
+        && resource.data.status in ['DRAFT', 'ACTIVE']
+        && request.resource.data.status in ['DRAFT', 'ACTIVE']
+        && !(resource.data.status == 'ACTIVE' && request.resource.data.status == 'DRAFT');
 
-      allow delete: if isSignedIn() && isValidId(projectId) && existing().ownerId == request.auth.uid && existing().status == 'DRAFT';
+      // Delete: Never allowed from client SDK
+      allow delete: if false;
     }
   }
 }
@@ -216,37 +122,174 @@ service cloud.firestore {
 
 ---
 
-## 4. Hexagonal Anti-Lock-In Adapter Pattern (Combining BaaS with Custom Backends)
+## 3. Executable Firestore Rule Policy Evaluator & Negative Test Harness
 
-Never scatter raw `supabase.from(...)` or `getDocs(collection(db, ...))` calls across domain services or payment/notification workers. Wrap BaaS providers behind a **Domain Repository Port** so you can switch between Supabase, Firebase, Convex, or self-hosted PostgreSQL without changing a single line of business logic:
+To allow deterministic unit verification in Node.js CI pipelines alongside the Firebase Emulator Suite (`@firebase/rules-unit-testing`), the exact rule predicates are codified below and tested against cross-tenant and unauthorized state-transition attacks:
 
 ```typescript
-export interface OrderRecord {
-  id: string;
-  tenantId: string;
-  userId: string;
-  grandTotalMinor: bigint;
-  currencyCode: string;
-  status: 'PENDING' | 'PAID' | 'REFUNDED';
-  version: number;
-  createdAtUtc: string;
+// Executable TypeScript — Deterministic Evaluator for /projects/{projectId} Security Policy
+export interface FirestoreAuthContext {
+  uid: string;
+  emailVerified: boolean;
 }
 
-/**
- * Provider-Agnostic Domain Repository Port
- */
-export interface OrderRepositoryPort {
-  readonly providerName: 'supabase-postgres' | 'firebase-firestore' | 'convex' | 'native-pg';
-  findByIdScoped(tenantId: string, orderId: string): Promise<OrderRecord | null>;
-  createOrderWithOutboxAtomically(
-    order: OrderRecord,
-    outboxEvent: { eventId: string; eventType: string; payload: Record<string, unknown> }
-  ): Promise<void>;
-  transitionStatusCas(
-    tenantId: string,
-    orderId: string,
-    expectedVersion: number,
-    nextStatus: OrderRecord['status']
-  ): Promise<boolean>;
+export interface TenantMemberDoc {
+  tenantId: string;
+  uid: string;
+  status: 'ACTIVE' | 'SUSPENDED' | 'REVOKED';
+  role: 'ADMIN' | 'EDITOR' | 'VIEWER';
 }
+
+export interface ProjectDoc {
+  tenantId: string;
+  ownerId: string;
+  name: string;
+  status: 'DRAFT' | 'ACTIVE' | 'COMPLETED';
+  budgetCents: number;
+  createdAtMs: number;
+  updatedAtMs: number;
+  description?: string;
+}
+
+export function evaluateFirestoreProjectRule(params: {
+  operation: 'read' | 'create' | 'update' | 'delete';
+  auth: FirestoreAuthContext | null;
+  membership: TenantMemberDoc | null;
+  existingDoc: ProjectDoc | null;
+  incomingDoc: ProjectDoc | null;
+  requestTimeMs: number;
+}): { allowed: boolean; denialReason?: string } {
+  const { operation, auth, membership, existingDoc, incomingDoc, requestTimeMs } = params;
+
+  if (!auth || !auth.uid || !auth.emailVerified) {
+    return { allowed: false, denialReason: 'UNAUTHENTICATED_OR_UNVERIFIED_EMAIL' };
+  }
+
+  const isActiveMemberOf = (tenantId: string): boolean =>
+    Boolean(
+      membership &&
+        membership.uid === auth.uid &&
+        membership.tenantId === tenantId &&
+        membership.status === 'ACTIVE'
+    );
+
+  if (operation === 'read') {
+    if (!existingDoc || !isActiveMemberOf(existingDoc.tenantId)) {
+      return { allowed: false, denialReason: 'CROSS_TENANT_OR_INACTIVE_MEMBER_READ_DENIED' };
+    }
+    return { allowed: true };
+  }
+
+  if (operation === 'delete') {
+    return { allowed: false, denialReason: 'CLIENT_DELETE_FORBIDDEN' };
+  }
+
+  const isValidShape = (doc: ProjectDoc | null): doc is ProjectDoc => {
+    if (!doc) return false;
+    if (typeof doc.tenantId !== 'string' || doc.tenantId.length < 3 || doc.tenantId.length > 64) return false;
+    if (typeof doc.ownerId !== 'string' || doc.ownerId.length === 0) return false;
+    if (typeof doc.name !== 'string' || doc.name.length < 1 || doc.name.length > 120) return false;
+    if (!Number.isInteger(doc.budgetCents) || doc.budgetCents < 0 || doc.budgetCents > 1_000_000_000) return false;
+    return true;
+  };
+
+  if (operation === 'create') {
+    if (!isValidShape(incomingDoc)) {
+      return { allowed: false, denialReason: 'INVALID_PROJECT_SCHEMA' };
+    }
+    if (!isActiveMemberOf(incomingDoc.tenantId)) {
+      return { allowed: false, denialReason: 'CROSS_TENANT_OR_INACTIVE_MEMBER_CREATE_DENIED' };
+    }
+    if (!membership || !['ADMIN', 'EDITOR'].includes(membership.role)) {
+      return { allowed: false, denialReason: 'INSUFFICIENT_TENANT_ROLE_FOR_CREATE' };
+    }
+    if (incomingDoc.ownerId !== auth.uid) {
+      return { allowed: false, denialReason: 'OWNER_ID_SPOOFING_DENIED' };
+    }
+    if (incomingDoc.status !== 'DRAFT') {
+      return { allowed: false, denialReason: 'INITIAL_STATUS_MUST_BE_DRAFT' };
+    }
+    if (incomingDoc.createdAtMs !== requestTimeMs || incomingDoc.updatedAtMs !== requestTimeMs) {
+      return { allowed: false, denialReason: 'TIMESTAMP_SPOOFING_DENIED' };
+    }
+    return { allowed: true };
+  }
+
+  // operation === 'update'
+  if (!existingDoc || !isValidShape(incomingDoc)) {
+    return { allowed: false, denialReason: 'INVALID_UPDATE_TARGET_OR_SCHEMA' };
+  }
+  if (!isActiveMemberOf(existingDoc.tenantId)) {
+    return { allowed: false, denialReason: 'CROSS_TENANT_OR_INACTIVE_MEMBER_UPDATE_DENIED' };
+  }
+  const isOwnerOrAdmin =
+    existingDoc.ownerId === auth.uid || (membership !== null && membership.role === 'ADMIN');
+  if (!isOwnerOrAdmin) {
+    return { allowed: false, denialReason: 'NOT_OWNER_OR_TENANT_ADMIN' };
+  }
+  if (
+    incomingDoc.tenantId !== existingDoc.tenantId ||
+    incomingDoc.ownerId !== existingDoc.ownerId ||
+    incomingDoc.createdAtMs !== existingDoc.createdAtMs
+  ) {
+    return { allowed: false, denialReason: 'IMMUTABLE_FIELD_MUTATION_DENIED' };
+  }
+  if (incomingDoc.updatedAtMs !== requestTimeMs) {
+    return { allowed: false, denialReason: 'UPDATED_AT_MUST_EQUAL_REQUEST_TIME' };
+  }
+  if (
+    !['DRAFT', 'ACTIVE'].includes(existingDoc.status) ||
+    !['DRAFT', 'ACTIVE'].includes(incomingDoc.status) ||
+    (existingDoc.status === 'ACTIVE' && incomingDoc.status === 'DRAFT')
+  ) {
+    return { allowed: false, denialReason: 'UNAUTHORIZED_CLIENT_STATUS_TRANSITION' };
+  }
+
+  return { allowed: true };
+}
+```
+
+---
+
+## 4. Supabase RLS Policy Standard (Active Tenant Membership & Role Enforcement)
+
+```sql
+-- Authoritative Supabase RLS Policy on public.projects
+ALTER TABLE public.projects ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.projects FORCE ROW LEVEL SECURITY;
+REVOKE ALL ON TABLE public.projects FROM anon;
+
+CREATE POLICY tenant_active_member_select_projects
+  ON public.projects
+  FOR SELECT
+  TO authenticated
+  USING (
+    EXISTS (
+      SELECT 1
+      FROM public.tenant_members tm
+      WHERE tm.tenant_id = projects.tenant_id
+        AND tm.user_id = auth.uid()
+        AND tm.status = 'ACTIVE'
+    )
+  );
+
+CREATE POLICY tenant_active_editor_update_projects
+  ON public.projects
+  FOR UPDATE
+  TO authenticated
+  USING (
+    projects.status IN ('DRAFT', 'ACTIVE')
+    AND EXISTS (
+      SELECT 1
+      FROM public.tenant_members tm
+      WHERE tm.tenant_id = projects.tenant_id
+        AND tm.user_id = auth.uid()
+        AND tm.status = 'ACTIVE'
+        AND (projects.owner_id = auth.uid() OR tm.role = 'ADMIN')
+    )
+  )
+  WITH CHECK (
+    -- Clients can never transition a project directly to 'COMPLETED' via PostgREST
+    projects.status IN ('DRAFT', 'ACTIVE')
+  );
 ```

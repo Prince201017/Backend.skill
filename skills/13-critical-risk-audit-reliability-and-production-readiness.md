@@ -1,513 +1,423 @@
-# Module 13: Critical Pre-Deployment Risk Audit, Database Constraints, API Boundary Guards & Production Reliability
+# Module 13: Critical Risk Audit, Tenant Transaction Security & Production Readiness
 
-This module provides the **Complete 12-Domain Critical Risk Audit Matrix** and production-grade TypeScript/SQL implementations for database composite foreign-key constraints, connection-pool-safe tenant transaction boundaries, frontend secret-leak prevention, CORS/CSRF/size/timeout API boundary guards, AAD-bound envelope encryption, `/healthz` + `/readyz` probes, graceful shutdown (`SIGTERM`/`SIGINT`), and dependency supply-chain verification.
+## 1. Scope & Threat Model
 
----
+This module remediates **CRITICAL 2.A (Tenant Transaction Security — `withTenantTransaction()`)** and **HIGH Production Readiness (Secret Scanning & Coordinated Graceful Shutdown)**.
 
-## 1. The 15-Domain Critical Risk Audit Matrix (Pre-Production Gate)
-
-| Risk Area | Potential Consequence | Severity | Vulnerability Found in Naive Implementations | Mandatory Remediation in This Skill |
-| :--- | :--- | :--- | :--- | :--- |
-| **1. Authentication** | Weak JWT/session implementation; forged tokens, 100-year TTLs, or stolen refresh token replay | **Critical** | Accepting `alg: "none"`, `RS256`->`HS256` confusion, unvalidated `kid`/`jku`, future `iat`, unbounded `exp - iat`, unbound sessions, or ignoring replayed refresh tokens. | `verifyJwtPenetrationSafe` (strict `alg`, alphanumeric `kid`, `iat`/`exp`/`nbf`, `maxTokenLifetimeSeconds`, `cnf.sidHash` session binding, `jti` revocation) + `rotateRefreshTokenWithReuseDetection` in `Module 02`. |
-| **2. Authorization** | Users accessing other users' data (Horizontal BOLA/IDOR or Vertical privilege escalation) | **Critical** | Checking only `subject.tenantId === resource.tenantId` and role `'member'` without checking `resource.ownerId === subject.userId`. | `authorizeAction` in `Module 02` enforces both **Cross-Tenant Isolation** AND **Intra-Tenant Horizontal Ownership / ReBAC** for non-privileged roles, plus step-up MFA for sensitive mutations. |
-| **3. Database Security & Constraints** | SQL injection, cross-tenant foreign-key references, leaked RLS session state, or `service_role` in frontend | **Critical** | String-interpolated `ORDER BY`, single-column `FOREIGN KEY (user_id)` allowing cross-tenant references, `SET` instead of `SET LOCAL` on pooled connections, or `NEXT_PUBLIC_SUPABASE_SERVICE_ROLE_KEY`. | 100% parameterized SQL + `resolveSafeOrderByClause`, composite foreign keys `FOREIGN KEY (tenant_id, user_id)`, `withTenantTransaction` (`SET LOCAL`), `NOBYPASSRLS` role, and `assertNoSecretsExposedToFrontendEnv`. |
-| **4. Secrets Management** | API keys, DB credentials, or ciphertext transplanted across tenants | **Critical** | Hardcoded secrets, unrotated keys, or AES-GCM encryption without Additional Authenticated Data (`AAD`), allowing attackers to copy encrypted PII/keys into their own row. | KMS/Vault Envelope Encryption (`encryptWithTenantAad` / `decryptWithKeyRing`) binding `AAD = tenantId:resourceId:fieldName` with zero-downtime multi-version key rings (`v1`, `v2`). |
-| **5. Input Validation** | Malformed/malicious payloads, memory exhaustion, Prototype Pollution, or Mass Assignment (BOPLA) | **High** | Calling `JSON.parse` before checking byte length, allowing unknown fields (`role: "admin"`), or skipping `NFKC` normalization. | `parseAndValidateJsonBodyStrict` (enforces `Content-Type`, hard `maxBodyBytes` cutoff, `sanitizeUntrustedJsonInput` stripping `__proto__`/`$`, and strict schema key allowlisting). |
-| **6. Multi-Tenancy** | Cross-customer data leakage via shared Redis cache keys or pooled DB connections | **Critical** | Passing un-namespaced cache keys (`getOrComputeCachedSingleFlight(redis, "orders:summary")`) or leaking PostgreSQL session variables across pooled connections. | `getOrComputeCachedSingleFlight` (`Module 03`) mandates validated `tenantId` and `resourceKey` (`tenant:{tenantId}:{resourceKey}`), and `withTenantTransaction` enforces transaction-scoped `SET LOCAL`. |
-| **7. File Uploads** | Malicious polyglot files, 17GB PNG decompression bombs, OOM crashes, or path traversal | **High** | Buffering files in RAM, checking only 8-byte PNG magic without checking `IHDR` dimensions (`65535x65535`), or concatenating unvalidated `tenantId` into storage paths. | `SecurityGateTransformStream` (`Module 05`) enforces `/^[a-zA-Z0-9_-]{1,64}$/` on `tenantId`, PNG `IHDR` dimension caps ($\le 8192\text{px}$, $\le 33.5\text{MP}$), 64KB bounded RAM, PDF `#XX`/null-byte deobfuscation, and ClamAV `zINSTREAM` scan. |
-| **8. Rate Limiting** | API brute-force abuse, resource exhaustion, or Lua divide-by-zero crashes | **High** | Non-atomic `GET`/`SET` rate limiters, trusting spoofed leftmost `X-Forwarded-For`, or passing `refill_rate <= 0` to Lua. | Atomic Redis Lua Token Bucket (`Module 04`) with `refill_rate > 0` guard, right-to-left `extractTrustedClientIp`, and composite IP-prefix + Tenant/User buckets. |
-| **9. Transactions & Outbox** | Duplicate payments, expired-lock fallthrough double charges, or poison-pill outbox head-of-line blocking | **Critical** | Falling through to `handler()` when `!lockRes.acquired` on an expired idempotency lock, holding DB locks across network I/O, or retrying a poison-pill outbox row forever. | `executeWithIdempotencyLock` (`Module 04` strict 409 on unacquired lock) + 3-Phase Outbox Relay with Phase 0 poison-pill quarantine (`dead_lettered_at` after `maxRelayAttempts` in `Module 03`). |
-| **10. Error Handling** | Stack traces, SQL constraint names, or file paths leaked in 500 responses | **High** | Returning `res.status(500).json({ error: err.message, stack: err.stack })` to clients. | `toSafeProblemDetailsResponse` (`Module 04`) exposes only `OperationalAppError` fields and masks all internal/DB exceptions behind an opaque RFC 9457 `500` response correlated by `traceId`. |
-| **11. Dependencies & Supply Chain** | Vulnerable or malicious postinstall scripts in npm packages | **High** | Unpinned ranges (`*` or wide `^`), running arbitrary `postinstall` scripts in CI, or skipping lockfile integrity checks. | Enforce `npm ci --ignore-scripts`, exact lockfile verification, automated OSV/`npm audit --audit-level=high`, and cryptographic package provenance checks. |
-| **12. Testing & Production Reliability** | Untested concurrency paths, Half-Open circuit stampedes, or dropped requests on deploy | **High** | Allowing 500 concurrent requests in `CircuitBreaker` `HALF_OPEN` state, missing `/readyz` draining before pod termination, or conflating `/healthz` and `/readyz`. | `ProductionLifecycleCoordinator` (`SIGTERM` draining), `halfOpenMaxConcurrentProbes` in `CircuitBreaker`, and Testcontainers + CI Security Harness (`Module 09`). |
-| **13. API Gateway & Header Forwarding** | `403` rollout outages, direct `*.run.app`/`*.gateway.dev` bypass, or forged `X-Apigateway-Api-Userinfo` | **Critical** | Using Compute Engine default SA, locking down Cloud Run before gateway config rollout, reading overwritten `Authorization` instead of `X-Apigateway-Api-Userinfo`, or trusting `X-Apigateway-Api-Userinfo` without verifying the gateway OIDC token. | Dedicated gateway SA (`roles/run.invoker`), 5-step zero-downtime lockdown, and `extractVerifiedApiGatewayUserInfo()` (`Module 02 & 14`). |
-| **14. MCP Traffic Security & Quotas** | Unauthenticated `tools/list` schema exposure, agent HTTP header injection, or Service Control `HTTP 500` quota outage | **Critical** | Leaving `tools-list.security` empty (`{}`), exposing trust headers (`X-User-Id`, `X-Tenant-Id`) as OpenAPI `in: header` parameters on MCP tools, or renaming/removing a quota metric while older gateways still reference it. | `auditOpenApiGatewayAndMcpSecurity()` (`Module 14`) enforcing single-scheme `tools-list.security`, blocking MCP `in: header` identity parameters, and enforcing Path A additive dual-metric transitions. |
-| **15. Business Logic & Ledger Invariants** | Illegal state transitions (`CANCELLED -> SHIPPED`), unbalanced journals, or Maker-Checker self-approval | **Critical** | Ad-hoc `UPDATE status`, single-sided balance mutations, or allowing the initiator (`Maker`) to approve their own high-value refund/payout (`Checker`). | `executeDomainStateTransition`, `validateBalancedDoubleEntryJournal` (`Module 01`), and `evaluateEnterpriseBusinessLogicPolicy` (`Module 14`). |
+### Trust Boundaries & Failure Modes
+1. **Tenant Transaction Security (`withTenantTransaction()`)**:
+   - *Vulnerabilities Fixed*:
+     1. **UUID validation is not authorization**: Validating ` UUID_V4_OR_V7_REGEX.test(tenantId)` only checks string syntax; an attacker can pass any valid tenant UUID they do not belong to.
+     2. **Caller-provided tenant IDs are untrusted**: A header (`X-Tenant-Id`), path param, or request body `tenantId` is a *target hint*, never proof of membership.
+     3. **Pre-authorization `set_config` injection**: Calling `SELECT set_config('app.current_tenant_id', $1, true)` *before* verifying active membership sets the PostgreSQL RLS session GUC to the victim tenant's ID, allowing subsequent queries in the transaction to read victim rows!
+     4. **Transaction-local GUCs are not authentication**: `app.current_tenant_id` and `app.current_user_id` must only be populated *after* the server verifies the caller's cryptographic identity, active tenant status, active membership status, and action permission inside the transaction.
+   - *Enforcement*:
+     - Step 1: Verify the caller's cryptographic server-side identity token (`verifyServerIdentity`), rejecting missing, expired, or forged identities before checking out a DB connection.
+     - Step 2: Acquire a dedicated pooled client (`pool.connect()`), execute `BEGIN`, and query the authoritative `tenants` and `tenant_members` tables (`FOR SHARE`) using the verified `userId` and target `requestedTenantId`.
+     - Step 3: Reject if the tenant is not `'ACTIVE'`, the membership does not exist or is `'SUSPENDED'` / `'DISABLED'` / `'REVOKED'`, or the member's server-resolved role lacks `requiredPermission`.
+     - Step 4: Only *after* authorization succeeds, execute `SELECT set_config('app.current_tenant_id', $1, true)` and `SELECT set_config('app.current_user_id', $1, true)` (`is_local = true`).
+     - Step 5: Execute all application queries on that exact checked-out `txClient`, followed by `COMMIT` (or `ROLLBACK` on any error) and `client.release()` in `finally`. Because `set_config(..., true)` scopes settings to the current transaction (`SET LOCAL`), `COMMIT` or `ROLLBACK` automatically clears both GUCs before the connection returns to the pool.
 
 ---
 
-## 2. Database Security: Composite Foreign Keys, Explicit Transaction Boundaries & Frontend Secret Guard
-
-### A. Relational Schema Integrity with Composite Multi-Tenant Foreign Keys
-A single-column foreign key (`user_id REFERENCES users(id)`) allows an `orders` row belonging to `tenant_A` to reference a `user_id` belonging to `tenant_B`! Always include `tenant_id` in composite primary/unique keys and composite foreign keys:
-
-```sql
-CREATE TABLE tenants (
-    id UUID PRIMARY KEY,
-    slug VARCHAR(64) NOT NULL UNIQUE CHECK (slug ~ '^[a-z0-9-]{2,64}$'),
-    status VARCHAR(16) NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'SUSPENDED')),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
-);
-
-CREATE TABLE tenant_members (
-    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
-    user_id UUID NOT NULL,
-    role VARCHAR(24) NOT NULL CHECK (role IN ('owner', 'admin', 'finance', 'member', 'viewer')),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-    PRIMARY KEY (tenant_id, user_id)
-);
-
-CREATE TABLE orders (
-    id UUID NOT NULL,
-    tenant_id UUID NOT NULL,
-    customer_user_id UUID NOT NULL,
-    currency_code CHAR(3) NOT NULL CHECK (currency_code ~ '^[A-Z]{3}$'),
-    subtotal_minor BIGINT NOT NULL CHECK (subtotal_minor >= 0),
-    discount_minor BIGINT NOT NULL DEFAULT 0 CHECK (discount_minor >= 0 AND discount_minor <= subtotal_minor),
-    tax_minor BIGINT NOT NULL DEFAULT 0 CHECK (tax_minor >= 0),
-    grand_total_minor BIGINT NOT NULL CHECK (grand_total_minor = subtotal_minor - discount_minor + tax_minor),
-    status VARCHAR(24) NOT NULL CHECK (status IN ('PENDING', 'PAID', 'SHIPPED', 'REFUNDED', 'CANCELLED')),
-    version INT NOT NULL DEFAULT 1 CHECK (version >= 1),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-    PRIMARY KEY (tenant_id, id),
-    -- Composite Foreign Key guarantees customer_user_id belongs to the EXACT SAME tenant_id!
-    CONSTRAINT fk_orders_tenant_member
-        FOREIGN KEY (tenant_id, customer_user_id)
-        REFERENCES tenant_members (tenant_id, user_id)
-        ON DELETE RESTRICT
-);
-
-ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
-ALTER TABLE orders FORCE ROW LEVEL SECURITY;
-
-CREATE POLICY orders_tenant_isolation ON orders
-    USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)
-    WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
-```
-
-### B. Connection-Pool-Safe Explicit Tenant Transaction Wrapper (`withTenantTransaction`)
-Never execute `SET app.current_tenant_id = '...'` outside a transaction on a pooled connection (PgBouncer / `pg.Pool`), or the setting will bleed into the next request that checks out that connection! Always bind `SET LOCAL` inside an explicit `BEGIN ... COMMIT` block:
+## 2. Remediated `withTenantTransaction()` Implementation (CRITICAL 2.A)
 
 ```typescript
+// Executable TypeScript — Verified Server-Side Identity + Post-Authorization RLS Context
+import { createHmac, timingSafeEqual } from 'node:crypto';
+
+export type TenantStatus = 'ACTIVE' | 'SUSPENDED' | 'DISABLED';
+export type MembershipStatus = 'ACTIVE' | 'SUSPENDED' | 'DISABLED' | 'REVOKED';
+export type TenantRole = 'OWNER' | 'ADMIN' | 'BILLING_ADMIN' | 'MEMBER' | 'READ_ONLY';
+export type TenantPermission =
+  | 'project:read'
+  | 'project:write'
+  | 'invoice:read'
+  | 'invoice:pay'
+  | 'ledger:write'
+  | 'member:manage';
+
+const ROLE_PERMISSION_MATRIX: Readonly<Record<TenantRole, readonly TenantPermission[]>> = {
+  OWNER: ['project:read', 'project:write', 'invoice:read', 'invoice:pay', 'ledger:write', 'member:manage'],
+  ADMIN: ['project:read', 'project:write', 'invoice:read', 'ledger:write', 'member:manage'],
+  BILLING_ADMIN: ['project:read', 'invoice:read', 'invoice:pay', 'ledger:write'],
+  MEMBER: ['project:read', 'project:write'],
+  READ_ONLY: ['project:read'],
+};
+
+export interface VerifiedServerIdentity {
+  readonly userId: string;
+  readonly sessionId: string;
+  readonly issuedAtSec: number;
+  readonly expiresAtSec: number;
+}
+
+/**
+ * Verifies an HMAC-SHA256 signed server session assertion (or OIDC JWT).
+ * Rejects missing, malformed, forged, or expired identities before touching the database.
+ */
+export function verifyServerIdentityAssertion(
+  assertionToken: string | undefined | null,
+  signingSecret: string,
+  nowSec = Math.floor(Date.now() / 1000)
+): VerifiedServerIdentity {
+  if (!assertionToken || typeof assertionToken !== 'string') {
+    throw new Error('AUTH_IDENTITY_MISSING');
+  }
+  const parts = assertionToken.split('.');
+  if (parts.length !== 2) {
+    throw new Error('AUTH_IDENTITY_MALFORMED');
+  }
+  const [payloadB64, sigB64] = parts;
+  const expectedSig = createHmac('sha256', signingSecret).update(payloadB64, 'utf8').digest();
+  let providedSig: Buffer;
+  try {
+    providedSig = Buffer.from(sigB64, 'base64url');
+  } catch {
+    throw new Error('AUTH_IDENTITY_SIGNATURE_INVALID');
+  }
+  if (
+    providedSig.length !== expectedSig.length ||
+    !timingSafeEqual(providedSig, expectedSig)
+  ) {
+    throw new Error('AUTH_IDENTITY_SIGNATURE_MISMATCH');
+  }
+
+  let parsed: VerifiedServerIdentity;
+  try {
+    parsed = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8')) as VerifiedServerIdentity;
+  } catch {
+    throw new Error('AUTH_IDENTITY_PAYLOAD_INVALID');
+  }
+
+  if (!parsed.userId || typeof parsed.userId !== 'string') {
+    throw new Error('AUTH_IDENTITY_USER_MISSING');
+  }
+  if (typeof parsed.expiresAtSec !== 'number' || parsed.expiresAtSec <= nowSec) {
+    throw new Error('AUTH_IDENTITY_EXPIRED');
+  }
+  return parsed;
+}
+
 export interface PooledDbClient {
-  query<T = Record<string, unknown>>(
+  query<R = Record<string, unknown>>(
     sql: string,
-    params?: unknown[]
-  ): Promise<{ rows: T[]; rowCount: number }>;
-  release: () => void;
+    params?: readonly unknown[]
+  ): Promise<{ rows: R[]; rowCount: number }>;
+  release(): void;
 }
 
 export interface DbConnectionPool {
   connect(): Promise<PooledDbClient>;
 }
 
-const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export interface AuthorizedTenantTxContext {
+  readonly userId: string;
+  readonly tenantId: string;
+  readonly role: TenantRole;
+  readonly permissions: readonly TenantPermission[];
+}
 
-export async function withTenantTransaction<TResult>(params: {
+const UUID_SYNTAX_REGEX =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+/**
+ * Remediated withTenantTransaction():
+ * 1. Verifies server-side identity first.
+ * 2. Validates UUID syntax only as an input hygiene filter (never as authorization).
+ * 3. Starts transaction (`BEGIN`) and queries authoritative membership (`FOR SHARE`).
+ * 4. Verifies active tenant status, active membership status, and required permission.
+ * 5. Populates `app.current_tenant_id` and `app.current_user_id` (`is_local = true`) ONLY AFTER authorization.
+ * 6. Runs all queries on `txClient` and guarantees `COMMIT`/`ROLLBACK` cleanup before pool release.
+ */
+export async function withTenantTransaction<T>(params: {
   pool: DbConnectionPool;
-  tenantId: string;
-  actorUserId: string;
-  isolationLevel?: 'READ COMMITTED' | 'REPEATABLE READ' | 'SERIALIZABLE';
-  statementTimeoutMs?: number;
-  fn: (client: PooledDbClient) => Promise<TResult>;
-}): Promise<TResult> {
-  if (!UUID_REGEX.test(params.tenantId)) {
-    throw new Error('DB_SECURITY_VIOLATION: tenantId must be a valid UUID');
+  identityAssertionToken: string | undefined | null;
+  identitySigningSecret: string;
+  requestedTenantId: string;
+  requiredPermission: TenantPermission;
+  nowSec?: number;
+  work: (txClient: PooledDbClient, authContext: AuthorizedTenantTxContext) => Promise<T>;
+}): Promise<T> {
+  // Step 1: Authenticate user from verified server-side identity assertion
+  const verifiedIdentity = verifyServerIdentityAssertion(
+    params.identityAssertionToken,
+    params.identitySigningSecret,
+    params.nowSec
+  );
+
+  // Step 2: Input format check (hygiene only — does NOT establish authorization)
+  if (!UUID_SYNTAX_REGEX.test(params.requestedTenantId)) {
+    throw new Error('TENANT_ID_SYNTAX_INVALID');
   }
-  const isolation = params.isolationLevel ?? 'READ COMMITTED';
-  const timeoutMs = Math.max(500, Math.min(30_000, params.statementTimeoutMs ?? 5_000));
 
   const client = await params.pool.connect();
   try {
-    await client.query(`BEGIN ISOLATION LEVEL ${isolation}`);
-    // SET LOCAL is strictly scoped to this transaction and automatically cleared on COMMIT/ROLLBACK!
-    await client.query(`SELECT set_config('app.current_tenant_id', $1, true)`, [params.tenantId]);
-    await client.query(`SELECT set_config('app.current_user_id', $1, true)`, [params.actorUserId]);
-    await client.query(`SELECT set_config('statement_timeout', $1, true)`, [`${timeoutMs}ms`]);
+    await client.query('BEGIN');
 
-    const result = await params.fn(client);
+    // Step 3: Query authoritative tenant + membership status inside the transaction (FOR SHARE lock)
+    // Note: tenant_members lookup runs BEFORE app.current_tenant_id is set.
+    const membershipRes = await client.query<{
+      tenant_id: string;
+      tenant_status: TenantStatus;
+      member_status: MembershipStatus;
+      role: TenantRole;
+    }>(
+      `SELECT t.id AS tenant_id,
+              t.status AS tenant_status,
+              tm.status AS member_status,
+              tm.role AS role
+         FROM public.tenants t
+         INNER JOIN public.tenant_members tm
+           ON tm.tenant_id = t.id
+        WHERE t.id = $1::uuid
+          AND tm.user_id = $2::uuid
+        FOR SHARE OF t, tm`,
+      [params.requestedTenantId, verifiedIdentity.userId]
+    );
+
+    if (membershipRes.rowCount === 0 || !membershipRes.rows[0]) {
+      throw new Error('TENANT_MEMBERSHIP_NOT_FOUND_OR_UNAUTHORIZED');
+    }
+
+    const row = membershipRes.rows[0];
+    if (row.tenant_status !== 'ACTIVE') {
+      throw new Error(`TENANT_NOT_ACTIVE:${row.tenant_status}`);
+    }
+    if (row.member_status !== 'ACTIVE') {
+      throw new Error(`TENANT_MEMBERSHIP_NOT_ACTIVE:${row.member_status}`);
+    }
+
+    const grantedPermissions = ROLE_PERMISSION_MATRIX[row.role] ?? [];
+    if (!grantedPermissions.includes(params.requiredPermission)) {
+      throw new Error(
+        `TENANT_PERMISSION_DENIED:role=${row.role}:required=${params.requiredPermission}`
+      );
+    }
+
+    // Step 4: Establish transaction-local RLS context ONLY AFTER authorization succeeds
+    await client.query(`SELECT set_config('app.current_tenant_id', $1, true)`, [
+      row.tenant_id,
+    ]);
+    await client.query(`SELECT set_config('app.current_user_id', $1, true)`, [
+      verifiedIdentity.userId,
+    ]);
+
+    const authContext: AuthorizedTenantTxContext = {
+      userId: verifiedIdentity.userId,
+      tenantId: row.tenant_id,
+      role: row.role,
+      permissions: grantedPermissions,
+    };
+
+    // Step 5: Execute all tenant database operations inside this authorized transaction
+    const result = await params.work(client, authContext);
+
     await client.query('COMMIT');
     return result;
   } catch (err) {
-    await client.query('ROLLBACK').catch(() => undefined);
+    try {
+      await client.query('ROLLBACK');
+    } catch {
+      // Preserve primary error
+    }
     throw err;
   } finally {
     client.release();
   }
 }
-
-/**
- * Compile-time allowlist mapper for dynamic ORDER BY clauses (100% immune to SQL injection).
- */
-export function resolveSafeOrderByClause<TAllowed extends string>(
-  requestedSortColumn: string | undefined,
-  requestedDirection: string | undefined,
-  allowedColumnMap: Readonly<Record<TAllowed, string>>,
-  defaultColumn: TAllowed
-): string {
-  const safeColKey =
-    requestedSortColumn && Object.prototype.hasOwnProperty.call(allowedColumnMap, requestedSortColumn)
-      ? (requestedSortColumn as TAllowed)
-      : defaultColumn;
-  const sqlIdentifier = allowedColumnMap[safeColKey];
-  const dir = requestedDirection?.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
-  return `${sqlIdentifier} ${dir}`;
-}
 ```
 
-### C. Boot-Time Frontend Bundle Secret Scanner (Blocking `service_role` & Private Keys in Client Env)
-Run this guard at server startup and in CI builds to guarantee no privileged secret or `service_role` JWT is ever exposed via `NEXT_PUBLIC_*`, `VITE_*`, or `REACT_APP_*`:
+### Connection-Pool & Transaction-Context Behavior (PgBouncer / `node-postgres`)
+- Because `set_config(setting_name, new_value, true)` sets `is_local = true`, PostgreSQL automatically resets `app.current_tenant_id` and `app.current_user_id` at the instant `COMMIT` or `ROLLBACK` completes.
+- When using PgBouncer in `transaction` pooling mode, every call to `withTenantTransaction()` checks out a server connection for the entire `BEGIN ... COMMIT/ROLLBACK` block, preventing transaction multiplexing or GUC leakage between concurrent requests.
+- **Defense-in-Depth RLS Policy**: PostgreSQL RLS policies must use `NULLIF(current_setting('app.current_tenant_id', true), '')::uuid` so that if any query is accidentally executed outside `withTenantTransaction()`, `current_setting(..., true)` returns `''` -> `NULL`, and `tenant_id = NULL` evaluates to `FALSE` (fail-closed, zero rows returned).
+
+---
+
+## 3. High-Precision Release Artifact, Bundle & Environment Secret Scanner
 
 ```typescript
-const PUBLIC_ENV_PREFIXES = ['NEXT_PUBLIC_', 'VITE_', 'REACT_APP_', 'PUBLIC_'];
-const FORBIDDEN_PUBLIC_NAME_PATTERNS = /(SERVICE_ROLE|SECRET|PRIVATE_KEY|DATABASE_URL|REDIS_URL|KMS_KEY|WEBHOOK_SECRET|PASS_PEPPER)/i;
-const FORBIDDEN_PUBLIC_VALUE_PATTERNS = [
-  /^sk_(live|test)_[a-zA-Z0-9]+/,       // Stripe secret key
-  /^whsec_[a-zA-Z0-9]+/,                // Webhook secret
-  /^-----BEGIN [A-Z ]*PRIVATE KEY-----/, // PEM private key
-  /^postgres(?:ql)?:\/\//i,             // PostgreSQL connection string
+// Executable TypeScript — Unanchored Secret Scanner for Env Vars, Client Bundles & Source Maps
+export interface SecretLeakFinding {
+  sourceType: 'CLIENT_ENV_VAR' | 'FRONTEND_BUNDLE' | 'SOURCE_MAP';
+  location: string;
+  ruleId: string;
+  description: string;
+}
+
+const UNANCHORED_SECRET_PATTERNS: ReadonlyArray<{
+  ruleId: string;
+  description: string;
+  regex: RegExp;
+}> = [
+  {
+    ruleId: 'STRIPE_LIVE_OR_TEST_SECRET',
+    description: 'Stripe secret or restricted API key (sk_live_, sk_test_, rk_live_)',
+    regex: /(?:sk_live_|sk_test_|rk_live_|whsec_)[0-9a-zA-Z]{10,}/,
+  },
+  {
+    ruleId: 'PEM_PRIVATE_KEY',
+    description: 'Embedded PEM private key block',
+    regex: /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
+  },
+  {
+    ruleId: 'AWS_ACCESS_KEY_ID',
+    description: 'AWS IAM Access Key ID (AKIA / ASIA)',
+    regex: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/,
+  },
+  {
+    ruleId: 'DATABASE_CONNECTION_URI',
+    description: 'Embedded PostgreSQL / Redis / MongoDB connection URI with credentials',
+    regex: /\b(?:postgres(?:ql)?|redis(?:s)?|mongodb(?:\+srv)?):\/\/[^:\s"']+:[^@\s"']+@[^\s"']+/,
+  },
+  {
+    ruleId: 'SUPABASE_SERVICE_ROLE_JWT',
+    description: 'Supabase service_role JWT or secret key marker',
+    regex: /"role"\s*:\s*"service_role"|SUPABASE_SERVICE_ROLE_KEY/,
+  },
+  {
+    ruleId: 'GITHUB_OR_SLACK_TOKEN',
+    description: 'GitHub PAT (ghp_, github_pat_) or Slack token (xoxb-, xoxp-)',
+    regex: /\b(?:ghp_[0-9a-zA-Z]{20,}|github_pat_[0-9a-zA-Z_]{20,}|xox[bp]-[0-9a-zA-Z-]{15,})\b/,
+  },
 ];
 
-export function assertNoSecretsExposedToFrontendEnv(
-  env: NodeJS.ProcessEnv = process.env
-): { verified: true; checkedCount: number } {
-  let checkedCount = 0;
+const FORBIDDEN_CLIENT_ENV_NAME_REGEX =
+  /(?:SECRET|PRIVATE|SERVICE_ROLE|DATABASE_URL|REDIS_URL|INTERNAL_KEY|SIGNING_KEY|WEBHOOK_SECRET|PASSWORD)/i;
 
-  for (const [key, rawValue] of Object.entries(env)) {
-    if (!rawValue) continue;
-    const isClientExposed = PUBLIC_ENV_PREFIXES.some((prefix) => key.startsWith(prefix));
+export function scanReleaseArtifactsAndEnvForSecrets(params: {
+  envVars: Readonly<Record<string, string | undefined>>;
+  clientEnvPrefixes?: readonly string[];
+  frontendArtifacts: ReadonlyArray<{
+    filePath: string;
+    isSourceMap?: boolean;
+    content: string;
+  }>;
+}): SecretLeakFinding[] {
+  const findings: SecretLeakFinding[] = [];
+  const prefixes = params.clientEnvPrefixes ?? ['NEXT_PUBLIC_', 'VITE_', 'REACT_APP_', 'PUBLIC_'];
+
+  for (const [envName, envValue] of Object.entries(params.envVars)) {
+    const isClientExposed = prefixes.some((prefix) => envName.startsWith(prefix));
     if (!isClientExposed) continue;
-    checkedCount++;
 
-    if (FORBIDDEN_PUBLIC_NAME_PATTERNS.test(key)) {
-      throw new Error(
-        `CRITICAL_SECRET_LEAK_BLOCKED: Server secret variable "${key}" is prefixed for frontend exposure!`
-      );
+    if (FORBIDDEN_CLIENT_ENV_NAME_REGEX.test(envName)) {
+      findings.push({
+        sourceType: 'CLIENT_ENV_VAR',
+        location: envName,
+        ruleId: 'FORBIDDEN_CLIENT_ENV_NAME',
+        description: `Client-exposed env variable "${envName}" contains a privileged secret keyword`,
+      });
     }
 
-    for (const pattern of FORBIDDEN_PUBLIC_VALUE_PATTERNS) {
-      if (pattern.test(rawValue.trim())) {
-        throw new Error(
-          `CRITICAL_SECRET_LEAK_BLOCKED: Public env var "${key}" contains a private key, secret token, or DB URI!`
-        );
-      }
-    }
-
-    // Detect Supabase service_role JWT accidentally placed in NEXT_PUBLIC_SUPABASE_ANON_KEY
-    if (rawValue.split('.').length === 3) {
-      try {
-        const payload = JSON.parse(
-          Buffer.from(rawValue.split('.')[1], 'base64url').toString('utf8')
-        ) as Record<string, unknown>;
-        if (payload.role === 'service_role' || payload.role === 'supabase_admin') {
-          throw new Error(
-            `CRITICAL_SECRET_LEAK_BLOCKED: Public env var "${key}" contains a Supabase "${String(payload.role)}" JWT!`
-          );
-        }
-      } catch (err) {
-        if (err instanceof Error && err.message.startsWith('CRITICAL_SECRET_LEAK_BLOCKED')) {
-          throw err;
+    if (typeof envValue === 'string' && envValue.length > 0) {
+      for (const detector of UNANCHORED_SECRET_PATTERNS) {
+        if (detector.regex.test(envValue)) {
+          findings.push({
+            sourceType: 'CLIENT_ENV_VAR',
+            location: envName,
+            ruleId: detector.ruleId,
+            description: detector.description,
+          });
         }
       }
     }
   }
 
-  return { verified: true, checkedCount };
+  for (const artifact of params.frontendArtifacts) {
+    const isMap = Boolean(artifact.isSourceMap || artifact.filePath.endsWith('.map'));
+    for (const detector of UNANCHORED_SECRET_PATTERNS) {
+      if (detector.regex.test(artifact.content)) {
+        findings.push({
+          sourceType: isMap ? 'SOURCE_MAP' : 'FRONTEND_BUNDLE',
+          location: artifact.filePath,
+          ruleId: detector.ruleId,
+          description: detector.description,
+        });
+      }
+    }
+  }
+
+  return findings;
 }
 ```
 
 ---
 
-## 3. Secrets Management: AAD-Bound AES-256-GCM Envelope Encryption & Key Rotation
+## 4. Coordinated Graceful Shutdown Lifecycle (`ProductionLifecycleCoordinator`)
 
-Always bind `tenantId`, `resourceId`, and `fieldName` into the AES-256-GCM **Additional Authenticated Data (AAD)**. If an attacker with database access copies an encrypted API key or SSN from Tenant A's row into Tenant B's row, decryption fails cryptographically because the AAD does not match!
+> **Important Operational Reality**: Graceful shutdown reduces dropped requests during rolling deployments, but **cannot guarantee unconditional zero dropped requests** if in-flight requests or stuck transactions exceed the orchestrator's `terminationGracePeriodSeconds` (after which Kubernetes sends `SIGKILL`).
 
 ```typescript
-import crypto from 'node:crypto';
-
-export interface KeyRing {
-  activeVersion: string; // e.g., 'v2'
-  keysByVersion: Readonly<Record<string, Buffer>>; // 32-byte (256-bit) DEKs per version
+// Executable TypeScript — 9-Step Coordinated Graceful Shutdown Manager
+export interface ShutdownSubsystemHooks {
+  markReadinessUnhealthy(): Promise<void> | void;
+  stopAcceptingNewHttpRequestsAndDrain(timeoutMs: number): Promise<{ drainedCleanly: boolean; remainingConnections: number }>;
+  closeActiveWebSocketsGoingAway(): Promise<number>; // Sends WS 1001 Going Away
+  closeActiveSseStreams(): Promise<number>;
+  pauseQueueWorkerAcquisition(): Promise<void>;
+  drainOrCancelInFlightWorkersAndTasks(timeoutMs: number): Promise<{ completedCount: number; forceAbortedCount: number }>;
+  flushTelemetryAndLogs(): Promise<void>;
+  closeDatabaseAndCachePools(): Promise<void>;
 }
 
-export interface AadContext {
-  tenantId: string;
-  resourceType: string;
-  resourceId: string;
-  fieldName: string;
+export interface GracefulShutdownReport {
+  readonly completedWithinGraceBudget: boolean;
+  readonly stepsExecuted: string[];
+  readonly remainingHttpConnections: number;
+  readonly webSocketsClosed: number;
+  readonly sseStreamsClosed: number;
+  readonly workersForceAborted: number;
 }
 
-function buildCanonicalAadBuffer(ctx: AadContext): Buffer {
-  return Buffer.from(
-    `${ctx.tenantId}:${ctx.resourceType}:${ctx.resourceId}:${ctx.fieldName}`,
-    'utf8'
-  );
-}
+export async function executeCoordinatedGracefulShutdown(
+  hooks: ShutdownSubsystemHooks,
+  totalGraceBudgetMs = 25_000
+): Promise<GracefulShutdownReport> {
+  const stepsExecuted: string[] = [];
+  const halfBudgetMs = Math.max(1_000, Math.floor(totalGraceBudgetMs * 0.45));
 
-export function encryptWithTenantAad(
-  plaintext: string,
-  keyRing: KeyRing,
-  aadContext: AadContext
-): string {
-  const key = keyRing.keysByVersion[keyRing.activeVersion];
-  if (!key || key.byteLength !== 32) {
-    throw new Error(`ENCRYPTION_ERROR: Missing or invalid 256-bit key for version "${keyRing.activeVersion}"`);
-  }
+  // 1. Flip /health/ready to 503 so load balancers stop routing new traffic
+  await hooks.markReadinessUnhealthy();
+  stepsExecuted.push('READINESS_MARKED_UNHEALTHY');
 
-  const iv = crypto.randomBytes(12); // 96-bit nonce for AES-256-GCM
-  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv, { authTagLength: 16 });
-  cipher.setAAD(buildCanonicalAadBuffer(aadContext));
+  // 2. Pause background queue worker polling immediately so no new jobs start
+  await hooks.pauseQueueWorkerAcquisition();
+  stepsExecuted.push('QUEUE_WORKER_ACQUISITION_PAUSED');
 
-  const encrypted = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
-  const authTag = cipher.getAuthTag();
+  // 3. Notify WebSocket clients with 1001 Going Away and close SSE streams
+  const [webSocketsClosed, sseStreamsClosed] = await Promise.all([
+    hooks.closeActiveWebSocketsGoingAway(),
+    hooks.closeActiveSseStreams(),
+  ]);
+  stepsExecuted.push('WEBSOCKETS_AND_SSE_CLOSED');
 
-  return `${keyRing.activeVersion}:${iv.toString('base64url')}:${authTag.toString('base64url')}:${encrypted.toString('base64url')}`;
-}
+  // 4. Drain in-flight HTTP requests and active queue workers in parallel within budget
+  const [httpDrain, workerDrain] = await Promise.all([
+    hooks.stopAcceptingNewHttpRequestsAndDrain(halfBudgetMs),
+    hooks.drainOrCancelInFlightWorkersAndTasks(halfBudgetMs),
+  ]);
+  stepsExecuted.push('HTTP_AND_WORKERS_DRAINED_OR_CANCELLED');
 
-export function decryptWithKeyRing(
-  serializedCiphertext: string,
-  keyRing: KeyRing,
-  aadContext: AadContext
-): { plaintext: string; needsReEncryption: boolean } {
-  const parts = serializedCiphertext.split(':');
-  if (parts.length !== 4) {
-    throw new Error('DECRYPTION_FAILED: Malformed ciphertext envelope');
-  }
+  // 5. Flush buffered OpenTelemetry spans and structured logs before closing pools
+  await hooks.flushTelemetryAndLogs();
+  stepsExecuted.push('TELEMETRY_FLUSHED');
 
-  const [version, ivB64, tagB64, dataB64] = parts;
-  const key = Object.prototype.hasOwnProperty.call(keyRing.keysByVersion, version)
-    ? keyRing.keysByVersion[version]
-    : undefined;
+  // 6. Close PostgreSQL and Redis connection pools last (after all workers & HTTP handlers finish)
+  await hooks.closeDatabaseAndCachePools();
+  stepsExecuted.push('DB_AND_CACHE_POOLS_CLOSED');
 
-  if (!key || key.byteLength !== 32) {
-    throw new Error(`DECRYPTION_FAILED: Unknown key version "${version}"`);
-  }
+  const completedWithinGraceBudget =
+    httpDrain.drainedCleanly && workerDrain.forceAbortedCount === 0;
 
-  const iv = Buffer.from(ivB64, 'base64url');
-  const authTag = Buffer.from(tagB64, 'base64url');
-  const ciphertext = Buffer.from(dataB64, 'base64url');
-
-  if (iv.byteLength !== 12 || authTag.byteLength !== 16) {
-    throw new Error('DECRYPTION_FAILED: Invalid IV or GCM auth tag length');
-  }
-
-  const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv, { authTagLength: 16 });
-  decipher.setAAD(buildCanonicalAadBuffer(aadContext));
-  decipher.setAuthTag(authTag);
-
-  const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
   return {
-    plaintext: decrypted.toString('utf8'),
-    needsReEncryption: version !== keyRing.activeVersion,
+    completedWithinGraceBudget,
+    stepsExecuted,
+    remainingHttpConnections: httpDrain.remainingConnections,
+    webSocketsClosed,
+    sseStreamsClosed,
+    workersForceAborted: workerDrain.forceAbortedCount,
   };
-}
-```
-
----
-
-## 4. API Security: CORS Allowlist, CSRF Verifier & Request Size/Timeout Boundary
-
-```typescript
-import crypto from 'node:crypto';
-
-/**
- * 1. Exact-Match CORS Allowlist Guard:
- * Never reflect arbitrary Origin headers when Access-Control-Allow-Credentials is true!
- */
-export function evaluateCorsHeaders(params: {
-  requestOrigin: string | undefined;
-  allowedOrigins: ReadonlySet<string>;
-  allowCredentials: boolean;
-}): Record<string, string> {
-  if (!params.requestOrigin) {
-    return { Vary: 'Origin' };
-  }
-  if (!params.allowedOrigins.has(params.requestOrigin)) {
-    return { Vary: 'Origin' };
-  }
-
-  const headers: Record<string, string> = {
-    'Access-Control-Allow-Origin': params.requestOrigin,
-    'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, Idempotency-Key, X-CSRF-Token, traceparent',
-    'Access-Control-Max-Age': '600',
-    Vary: 'Origin',
-  };
-
-  if (params.allowCredentials) {
-    headers['Access-Control-Allow-Credentials'] = 'true';
-  }
-  return headers;
-}
-
-/**
- * 2. CSRF Defense-in-Depth for Cookie-Authenticated State-Mutating Requests:
- * Verifies Fetch Metadata (Sec-Fetch-Site), Exact Origin, and Session-Bound HMAC CSRF Token.
- */
-export function verifyCsrfProtection(params: {
-  httpMethod: string;
-  secFetchSiteHeader?: string;
-  originHeader?: string;
-  allowedOrigins: ReadonlySet<string>;
-  csrfTokenHeader?: string;
-  sessionId: string;
-  csrfHmacSecret: string;
-}): { valid: boolean; reason?: string } {
-  const method = params.httpMethod.toUpperCase();
-  if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') {
-    return { valid: true };
-  }
-
-  // Layer 1: Fetch Metadata header check
-  if (params.secFetchSiteHeader && params.secFetchSiteHeader === 'cross-site') {
-    return { valid: false, reason: 'CSRF_BLOCKED: Sec-Fetch-Site is cross-site' };
-  }
-
-  // Layer 2: Origin header check
-  if (!params.originHeader || !params.allowedOrigins.has(params.originHeader)) {
-    return { valid: false, reason: 'CSRF_BLOCKED: Missing or disallowed Origin header' };
-  }
-
-  // Layer 3: Session-bound cryptographic anti-CSRF token check
-  if (!params.csrfTokenHeader) {
-    return { valid: false, reason: 'CSRF_BLOCKED: Missing X-CSRF-Token header' };
-  }
-
-  const expectedHmac = crypto
-    .createHmac('sha256', params.csrfHmacSecret)
-    .update(params.sessionId, 'utf8')
-    .digest();
-  const providedBuf = Buffer.from(params.csrfTokenHeader, 'hex');
-
-  if (
-    expectedHmac.byteLength !== providedBuf.byteLength ||
-    !crypto.timingSafeEqual(expectedHmac, providedBuf)
-  ) {
-    return { valid: false, reason: 'CSRF_BLOCKED: Invalid X-CSRF-Token signature' };
-  }
-
-  return { valid: true };
-}
-
-/**
- * 3. External Request Size Limit, Strict Field Allowlist (Anti-BOPLA) & Timeout Enforcer
- */
-export function parseAndValidateJsonBodyStrict<TAllowedKey extends string>(params: {
-  rawBodyBuffer: Buffer;
-  contentTypeHeader: string | undefined;
-  maxBodyBytes: number;
-  allowedTopLevelKeys: ReadonlySet<TAllowedKey>;
-}): Record<TAllowedKey, unknown> {
-  if (!params.contentTypeHeader?.toLowerCase().includes('application/json')) {
-    throw new Error('UNSUPPORTED_MEDIA_TYPE: Content-Type must be application/json');
-  }
-  if (params.rawBodyBuffer.byteLength > params.maxBodyBytes) {
-    throw new Error(
-      `PAYLOAD_TOO_LARGE: Request body (${params.rawBodyBuffer.byteLength}B) exceeds limit (${params.maxBodyBytes}B)`
-    );
-  }
-
-  const parsed = JSON.parse(params.rawBodyBuffer.toString('utf8')) as unknown;
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new Error('INVALID_PAYLOAD: Root JSON value must be an object');
-  }
-
-  const entries = Object.entries(parsed as Record<string, unknown>);
-  const result = Object.create(null) as Record<TAllowedKey, unknown>;
-
-  for (const [rawKey, val] of entries) {
-    const key = rawKey.normalize('NFKC');
-    if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
-      throw new Error('PROTOTYPE_POLLUTION_BLOCKED');
-    }
-    if (!params.allowedTopLevelKeys.has(key as TAllowedKey)) {
-      throw new Error(`MASS_ASSIGNMENT_BLOCKED: Unpermitted field "${key}"`);
-    }
-    result[key as TAllowedKey] = val;
-  }
-
-  return { ...result };
-}
-```
-
----
-
-## 5. Production Reliability: `/healthz` vs. `/readyz` Probes & Graceful Shutdown Coordinator
-
-Never conflate **Liveness (`/healthz`)** and **Readiness (`/readyz`)**:
-- **`GET /healthz` (Liveness)**: Checks only that the Node.js event loop is responsive and not deadlocked. Never check external databases in `/healthz` (or a transient 3-second DB blip will cause Kubernetes to restart all pods simultaneously!).
-- **`GET /readyz` (Readiness)**: Checks whether the pod is ready to receive traffic (`!isShuttingDown` AND PostgreSQL/Redis ping succeeds within `1500ms`). Immediately returns `503 Service Unavailable` when `SIGTERM` is received so the load balancer drains traffic before connections close.
-
-```typescript
-export class ProductionLifecycleCoordinator {
-  private shuttingDown = false;
-  private inFlightRequests = 0;
-  private drainResolvers: Array<() => void> = [];
-
-  public isShuttingDown(): boolean {
-    return this.shuttingDown;
-  }
-
-  public onRequestStart(): boolean {
-    if (this.shuttingDown) return false;
-    this.inFlightRequests += 1;
-    return true;
-  }
-
-  public onRequestEnd(): void {
-    this.inFlightRequests = Math.max(0, this.inFlightRequests - 1);
-    if (this.shuttingDown && this.inFlightRequests === 0) {
-      for (const resolve of this.drainResolvers) resolve();
-      this.drainResolvers = [];
-    }
-  }
-
-  public async checkReadiness(deps: {
-    pingPostgres: (signal: AbortSignal) => Promise<void>;
-    pingRedis: (signal: AbortSignal) => Promise<void>;
-  }): Promise<{ status: 200 | 503; body: Record<string, unknown> }> {
-    if (this.shuttingDown) {
-      return {
-        status: 503,
-        body: { ready: false, reason: 'POD_DRAINING_FOR_SHUTDOWN', inFlightRequests: this.inFlightRequests },
-      };
-    }
-
-    try {
-      const signal = AbortSignal.timeout(1500);
-      await Promise.all([deps.pingPostgres(signal), deps.pingRedis(signal)]);
-      return {
-        status: 200,
-        body: { ready: true, inFlightRequests: this.inFlightRequests },
-      };
-    } catch (err) {
-      return {
-        status: 503,
-        body: {
-          ready: false,
-          reason: 'DEPENDENCY_UNAVAILABLE',
-          detail: err instanceof Error ? err.message : 'Health check timeout',
-        },
-      };
-    }
-  }
-
-  /**
-   * Executes a zero-dropped-request graceful shutdown on SIGTERM / SIGINT:
-   * 1. Marks readiness false (503 on /readyz) so ALB/Ingress stops routing new requests.
-   * 2. Waits for in-flight HTTP requests and active worker leases to finish (up to drainTimeoutMs).
-   * 3. Closes DB & Redis connection pools cleanly.
-   */
-  public async initiateGracefulShutdown(params: {
-    drainTimeoutMs?: number;
-    stopHttpServer: () => Promise<void>;
-    stopQueueWorkers: () => Promise<void>;
-    closeDatabasePools: () => Promise<void>;
-  }): Promise<void> {
-    if (this.shuttingDown) return;
-    this.shuttingDown = true;
-
-    const drainTimeoutMs = params.drainTimeoutMs ?? 15_000;
-    if (this.inFlightRequests > 0) {
-      await Promise.race([
-        new Promise<void>((resolve) => this.drainResolvers.push(resolve)),
-        new Promise<void>((resolve) => setTimeout(resolve, drainTimeoutMs)),
-      ]);
-    }
-
-    await params.stopQueueWorkers();
-    await params.stopHttpServer();
-    await params.closeDatabasePools();
-  }
 }
 ```

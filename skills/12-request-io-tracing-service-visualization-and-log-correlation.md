@@ -1,352 +1,346 @@
-# 12. Incoming/Outgoing Request I/O Tracing, Service Dependency Visualization & Correlated Log Telemetry
+# Module 12: Request I/O Tracing, Service Visualization & Log Correlation
 
-This module defines the zero-loss observability, request/response I/O envelope tracing, service-to-service topology capture, and correlated structured JSON log telemetry architecture required to inspect every incoming request, internal BaaS/database hop, outbox relay, and outgoing external API call in real time.
+## 1. Scope & Threat Model
 
----
+This module defines the end-to-end telemetry, W3C Trace Context propagation (`traceparent`), AsyncLocalStorage context management, and bounded I/O envelope serialization required for distributed backend observability and visual flow inspection.
 
-## 1. Architectural Principles for Request I/O & Service Telemetry
-
-1. **W3C `traceparent` Propagation Everywhere**:
-   - Every incoming HTTP, WebSocket, or Webhook request MUST either extract a valid W3C Trace Context (`traceparent: 00-<32-hex-trace-id>-<16-hex-parent-span-id>-<01>`) or mint a fresh CSPRNG 128-bit `trace_id` and 64-bit root `span_id`.
-   - Every internal hop (Auth/RBA evaluation, Supabase/Firebase/PostgreSQL query, Committed Outbox write, Queue worker execution, and Outgoing 3P HTTP call) MUST create a child `span_id` linked via `parent_span_id` and propagate `traceparent` in outbound headers or outbox metadata.
-2. **Bounded, PII-Scrubbed I/O Envelope Capture**:
-   - Capturing raw incoming and outgoing payloads without bounds or sanitization causes memory exhaustion (OOM) and compliance violations (GDPR/PCI-DSS).
-   - Every captured I/O payload snapshot MUST pass through:
-     - **Recursive Key & Pattern Scrubbing**: Redact `password`, `secret`, `token`, `authorization`, `cookie`, `cvv`, `pan`, `ssn`, and OTP codes before serialization.
-     - **Byte-Length Truncation Guard**: Truncate individual string fields exceeding `4,096` bytes and cap total captured envelope snapshots at `32 KB` (`[TRUNCATED_PAYLOAD: original_bytes=...]`).
-3. **Deterministic Service Hop Topology**:
-   - Every request trace is modeled as a Directed Acyclic Graph (DAG) of typed service hops:
-     1. `INGRESS_GATEWAY`: TLS termination, Trusted Proxy IP extraction, Prototype Pollution & NoSQL `$` sanitization, Rate Limiting.
-     2. `AUTH_RBA_ENGINE`: JWT cryptographic verification (`alg` whitelist), Session Binding, Risk-Based Authentication (RBA) scoring, BOLA/RBAC/ABAC policy evaluation.
-     3. `BAAS_DATA_PLANE`: Supabase (`auth.jwt() -> 'app_metadata'` RLS), Firebase (`firestore.rules` 8-Pillar evaluation), or PostgreSQL transactional execution + Committed Outbox (`outbox_events`) insertion.
-     4. `ASYNC_OUTBOX_RELAY`: Polling/CDC of committed outbox rows, priority queue routing (`P0_CRITICAL`..`P3_BULK`), atomic worker lease acquisition (`fencing_token`).
-     5. `EGRESS_EXTERNAL_PROVIDER`: DNS-pinned SSRF-safe outbound dispatch to Stripe, AWS SES, Postmark, Twilio, FCM, or webhooks with Definitive-vs-Ambiguous failover classification.
-4. **Correlated Structured JSON Logs**:
-   - Every log entry emitted during any service hop MUST carry `trace_id`, `span_id`, `service`, `hop_index`, `level` (`DEBUG` | `INFO` | `WARN` | `ERROR` | `SECURITY_AUDIT`), `duration_ms`, and structured `context` so operators can filter logs by clicking any node in the service topology graph.
+### Trust Boundaries & Failure Modes
+1. **Unbounded Trace / Hop Envelope Memory Exhaustion**:
+   - *Vulnerability*: Checking `Buffer.byteLength <= 32768` only on individual hop payloads (`recordHop`) while allowing `exportCorrelatedTraceEnvelope()` to accumulate hundreds of hops into a multi-megabyte JSON payload causes OOM crashes or log-ingestion pipeline drops.
+   - *Enforcement*: Enforce the strict `MAX_ENVELOPE_BYTES = 32_768` (32 KB) budget on **both** individual hop payloads and the serialized full trace envelope (`exportCorrelatedTraceEnvelope()`), deterministically truncating excess hop previews if the aggregate envelope approaches 32 KB.
+2. **Secret Leakage in Correlated I/O Envelopes**:
+   - *Vulnerability*: Recording request/response headers or body previews in trace spans without comprehensive secret key and value redaction leaks `passwordHash`, `x-api-key`, `Authorization: Bearer ...`, `clientSecret`, `refreshToken`, PEM private keys, and credit card PANs into observability stores.
+   - *Enforcement*: Pass all headers, query params, and payload previews through `redactTraceEnvelopeSecrets()` before storing or exporting any span.
+3. **Concurrent Span Context Mutation (`store.activeSpanId` Race Condition)**:
+   - *Vulnerability*: Mutating `store.activeSpanId = spanId` in place inside an `AsyncLocalStorage` store object shared across concurrent `Promise.all()` branches corrupts parent-child span relationships (`parentSpanId` points to a sibling branch instead of the true parent).
+   - *Enforcement*: Never mutate `AsyncLocalStorage` store properties in place. Always create an immutable child context via `traceStorage.run({ ...parentStore, activeSpanId: newSpanId }, fn)`.
 
 ---
 
-## 2. Production TypeScript Implementation: I/O Envelope Tracer, PII Scrubber & Correlated Logger
+## 2. Immutable `AsyncLocalStorage` Trace Context, Comprehensive Redaction & 32 KB Bounded Envelopes
 
 ```typescript
-import { randomBytes } from 'node:crypto';
+// Executable TypeScript — Concurrent-Safe Trace Context & 32 KB Bounded Envelope Exporter
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { randomBytes } from 'node:crypto';
 
-export type LogLevel = 'DEBUG' | 'INFO' | 'WARN' | 'ERROR' | 'SECURITY_AUDIT';
+export const MAX_HOP_PAYLOAD_BYTES = 8_192;   // 8 KB max per individual hop preview
+export const MAX_TRACE_ENVELOPE_BYTES = 32_768; // Hard 32 KB limit on full exported trace envelope
 
-export type ServiceHopType =
-  | 'INGRESS_GATEWAY'
-  | 'AUTH_RBA_ENGINE'
-  | 'BAAS_DATA_PLANE'
-  | 'ASYNC_OUTBOX_RELAY'
-  | 'EGRESS_EXTERNAL_PROVIDER';
-
-export type HopStatus = 'OK' | 'DEGRADED_FAILOVER' | 'BLOCKED_SECURITY' | 'ERROR';
-
-export interface CorrelatedLogEntry {
-  timestamp: string;
-  level: LogLevel;
-  trace_id: string;
-  span_id: string;
-  parent_span_id: string | null;
-  service: string;
-  hop_type: ServiceHopType;
-  event: string;
-  message: string;
-  duration_ms?: number;
-  http_status?: number;
-  security_rule?: string;
-  metadata: Record<string, unknown>;
+export interface TraceHopSpan {
+  spanId: string;
+  parentSpanId: string | null;
+  serviceName: string;
+  operationName: string;
+  direction: 'INBOUND' | 'OUTBOUND_HTTP' | 'DATABASE' | 'CACHE' | 'QUEUE';
+  startedAtMs: number;
+  durationMs: number;
+  statusCode?: number;
+  redactedRequestPreview?: unknown;
+  redactedResponsePreview?: unknown;
+  errorMessage?: string;
 }
 
-export interface ServiceHopSnapshot {
-  span_id: string;
-  parent_span_id: string | null;
-  hop_index: number;
-  hop_type: ServiceHopType;
-  service_name: string;
-  operation: string;
-  status: HopStatus;
-  started_at: string;
-  duration_ms: number;
-  policy_or_query?: string;
-  input_envelope: {
-    headers?: Record<string, string>;
-    payload: Record<string, unknown>;
-    byte_size: number;
-  };
-  output_envelope: {
-    status_code: number;
-    headers?: Record<string, string>;
-    payload: Record<string, unknown>;
-    byte_size: number;
-  };
-  error_code?: string;
+export interface SharedTraceBuffer {
+  readonly traceId: string;
+  readonly tenantId: string;
+  readonly requestId: string;
+  readonly hops: TraceHopSpan[];
 }
 
-export interface RequestTraceEnvelope {
-  trace_id: string;
-  traceparent: string;
-  started_at: string;
-  total_duration_ms: number;
-  http_method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
-  route: string;
-  client_ip: string;
-  tenant_id: string;
-  actor_id: string | null;
-  final_status: number;
-  overall_outcome: HopStatus;
-  incoming_request: {
-    headers: Record<string, string>;
-    body: Record<string, unknown>;
-  };
-  outgoing_response: {
-    status: number;
-    headers: Record<string, string>;
-    body: Record<string, unknown>;
-  };
-  service_hops: ServiceHopSnapshot[];
-  logs: CorrelatedLogEntry[];
+export interface ImmutableTraceContextStore {
+  readonly shared: SharedTraceBuffer;
+  readonly activeSpanId: string;
 }
 
-const SENSITIVE_KEY_REGEX =
-  /^(password|passcode|secret|token|access_token|refresh_token|authorization|cookie|set-cookie|api_key|apikey|client_secret|cvv|cvc|pan|card_number|ssn|tax_id|otp|code|private_key)$/i;
+const traceContextStorage = new AsyncLocalStorage<ImmutableTraceContextStore>();
 
-const VALUE_PATTERNS: Array<{ pattern: RegExp; replacement: string }> = [
-  // Bearer / JWT tokens
-  { pattern: /Bearer\s+[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+/gi, replacement: 'Bearer [REDACTED_JWT]' },
-  // Raw credit card numbers (13-19 digits)
-  { pattern: /\b(?:\d[ -]*?){13,19}\b/g, replacement: '[REDACTED_PAN]' },
+const NORMALIZED_SECRET_KEYS = new Set([
+  'password',
+  'passwd',
+  'passwordhash',
+  'passhash',
+  'secret',
+  'clientsecret',
+  'webhooksecret',
+  'signingsecret',
+  'token',
+  'accesstoken',
+  'refreshtoken',
+  'idtoken',
+  'sessiontoken',
+  'resettoken',
+  'apikey',
+  'xapikey',
+  'authorization',
+  'proxyauthorization',
+  'cookie',
+  'setcookie',
+  'privatekey',
+  'secretkey',
+  'serviceaccountkey',
+  'cvv',
+  'cvc',
+  'pan',
+  'cardnumber',
+  'ssn',
+  'taxid',
+  'otp',
+  'pin',
+]);
+
+export function isSensitiveTraceKey(key: string): boolean {
+  const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (NORMALIZED_SECRET_KEYS.has(normalized)) {
+    return true;
+  }
+  return (
+    normalized.endsWith('secret') ||
+    normalized.endsWith('token') ||
+    normalized.endsWith('password') ||
+    normalized.endsWith('passwordhash') ||
+    normalized.endsWith('apikey') ||
+    normalized.endsWith('privatekey')
+  );
+}
+
+const SECRET_STRING_PATTERNS: readonly RegExp[] = [
+  /Bearer\s+[A-Za-z0-9\-._~+/]+=*/gi,
+  /Basic\s+[A-Za-z0-9+/=]+/gi,
+  /eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g,
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
+  /\b(?:sk_live_|sk_test_|rk_live_|whsec_|ghp_|xoxb-|xoxp-)[A-Za-z0-9_]+\b/g,
+  /\b(?:\d[ -]*?){13,19}\b/g,
 ];
 
-const MAX_STRING_LENGTH = 4096;
-const MAX_DEPTH = 8;
+export function redactTraceEnvelopeSecrets(input: unknown, depth = 0): unknown {
+  if (depth > 8) return '[MAX_DEPTH_TRUNCATED]';
+  if (input === null || input === undefined) return input;
 
-/**
- * Recursively scrubs PII, credentials, and tokens from arbitrary I/O payloads
- * while enforcing strict recursion depth and string length caps.
- */
-export function scrubIoPayload(
-  value: unknown,
-  depth = 0,
-  seen: WeakSet<object> = new WeakSet()
-): unknown {
-  if (depth > MAX_DEPTH) {
-    return '[TRUNCATED_MAX_DEPTH]';
-  }
-  if (value === null || value === undefined) {
-    return value;
-  }
-  if (typeof value === 'string') {
-    let scrubbed = value;
-    for (const { pattern, replacement } of VALUE_PATTERNS) {
-      scrubbed = scrubbed.replace(pattern, replacement);
-    }
-    if (scrubbed.length > MAX_STRING_LENGTH) {
-      return `${scrubbed.slice(0, MAX_STRING_LENGTH)}...[TRUNCATED_${scrubbed.length}_BYTES]`;
+  if (typeof input === 'string') {
+    let scrubbed = input;
+    for (const pattern of SECRET_STRING_PATTERNS) {
+      scrubbed = scrubbed.replace(pattern, '[REDACTED_SECRET]');
     }
     return scrubbed;
   }
-  if (typeof value === 'number' || typeof value === 'boolean') {
-    return value;
+
+  if (typeof input !== 'object') return input;
+
+  if (Array.isArray(input)) {
+    return input.map((item) => redactTraceEnvelopeSecrets(item, depth + 1));
   }
-  if (typeof value === 'object') {
-    if (seen.has(value)) {
-      return '[CIRCULAR_REF]';
+
+  const output: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(input as Record<string, unknown>)) {
+    if (isSensitiveTraceKey(key)) {
+      output[key] = '[REDACTED]';
+    } else {
+      output[key] = redactTraceEnvelopeSecrets(value, depth + 1);
     }
-    seen.add(value);
-    if (Array.isArray(value)) {
-      return value.slice(0, 50).map((item) => scrubIoPayload(item, depth + 1, seen));
-    }
-    const result: Record<string, unknown> = Object.create(null);
-    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      if (k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
-      if (SENSITIVE_KEY_REGEX.test(k)) {
-        result[k] = '[REDACTED_SECRET]';
-      } else {
-        result[k] = scrubIoPayload(v, depth + 1, seen);
-      }
-    }
-    return { ...result };
   }
-  return String(value);
+  return output;
 }
 
-export interface TraceContextStore {
-  traceId: string;
-  rootSpanId: string;
-  activeSpanId: string;
-  tenantId: string;
-  actorId: string | null;
-  hops: ServiceHopSnapshot[];
-  logs: CorrelatedLogEntry[];
+function boundPreviewPayload(value: unknown, maxBytes: number): unknown {
+  if (value === undefined) return undefined;
+  const redacted = redactTraceEnvelopeSecrets(value);
+  const serialized = JSON.stringify(redacted);
+  if (!serialized) return undefined;
+  const byteLen = Buffer.byteLength(serialized, 'utf8');
+  if (byteLen <= maxBytes) {
+    return redacted;
+  }
+  return {
+    _truncated: true,
+    _originalBytes: byteLen,
+    preview: serialized.slice(0, Math.max(128, maxBytes - 128)),
+  };
 }
 
-export const traceStorage = new AsyncLocalStorage<TraceContextStore>();
-
-export function parseOrMintTraceparent(header?: string | null): {
-  traceId: string;
-  parentSpanId: string | null;
-  rootSpanId: string;
-  traceparent: string;
-} {
-  const w3cRegex = /^00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$/;
-  const match = header ? w3cRegex.exec(header.trim().toLowerCase()) : null;
-
-  const traceId =
-    match && match[1] !== '00000000000000000000000000000000'
-      ? match[1]
-      : randomBytes(16).toString('hex');
-  const parentSpanId =
-    match && match[2] !== '0000000000000000' ? match[2] : null;
+export async function runInRootTraceContext<T>(
+  params: {
+    traceId?: string;
+    tenantId: string;
+    requestId: string;
+    rootOperationName: string;
+  },
+  fn: () => Promise<T>
+): Promise<{ result: T; envelope: CorrelatedTraceEnvelope }> {
+  const traceId = params.traceId ?? randomBytes(16).toString('hex');
   const rootSpanId = randomBytes(8).toString('hex');
+  const shared: SharedTraceBuffer = {
+    traceId,
+    tenantId: params.tenantId,
+    requestId: params.requestId,
+    hops: [],
+  };
+
+  const rootStore: ImmutableTraceContextStore = {
+    shared,
+    activeSpanId: rootSpanId,
+  };
+
+  const startedAtMs = Date.now();
+  const result = await traceContextStorage.run(rootStore, fn);
+  const durationMs = Math.max(0, Date.now() - startedAtMs);
+
+  shared.hops.unshift({
+    spanId: rootSpanId,
+    parentSpanId: null,
+    serviceName: 'api-gateway-entry',
+    operationName: params.rootOperationName,
+    direction: 'INBOUND',
+    startedAtMs,
+    durationMs,
+    statusCode: 200,
+  });
 
   return {
-    traceId,
-    parentSpanId,
-    rootSpanId,
-    traceparent: `00-${traceId}-${rootSpanId}-01`,
+    result,
+    envelope: exportCorrelatedTraceEnvelope(shared),
   };
 }
 
 /**
- * Emits a structured JSON log entry bound to the current W3C trace_id and span_id.
+ * Executes a child span without mutating the parent AsyncLocalStorage store in place.
+ * Parallel calls via Promise.all() each receive their own immutable child store,
+ * preserving exact parentSpanId lineage across concurrent branches.
  */
-export function emitCorrelatedLog(params: {
-  level: LogLevel;
-  service: string;
-  hopType: ServiceHopType;
-  event: string;
-  message: string;
-  durationMs?: number;
-  httpStatus?: number;
-  securityRule?: string;
-  metadata?: Record<string, unknown>;
-}): CorrelatedLogEntry {
-  const store = traceStorage.getStore();
-  const entry: CorrelatedLogEntry = {
-    timestamp: new Date().toISOString(),
-    level: params.level,
-    trace_id: store?.traceId ?? randomBytes(16).toString('hex'),
-    span_id: store?.activeSpanId ?? randomBytes(8).toString('hex'),
-    parent_span_id: store?.rootSpanId ?? null,
-    service: params.service,
-    hop_type: params.hopType,
-    event: params.event,
-    message: params.message,
-    duration_ms: params.durationMs,
-    http_status: params.httpStatus,
-    security_rule: params.securityRule,
-    metadata: (scrubIoPayload(params.metadata ?? {}) as Record<string, unknown>) ?? {},
-  };
-
-  if (store) {
-    store.logs.push(entry);
-  }
-  return entry;
-}
-
-/**
- * Wraps any service hop (Ingress, Auth/RBA, Supabase/Firebase/DB, Outbox, Outbound API)
- * to automatically capture scrubbed input/output envelopes, execution latency, and correlated logs,
- * including uncaught error hops so failed spans are never lost.
- */
-export async function traceServiceHop<TOutput extends Record<string, unknown>>(params: {
-  hopType: ServiceHopType;
-  serviceName: string;
-  operation: string;
-  policyOrQuery?: string;
-  inputHeaders?: Record<string, string>;
-  inputPayload: Record<string, unknown>;
-  execute: (spanId: string) => Promise<{
-    status: HopStatus;
-    statusCode: number;
-    outputHeaders?: Record<string, string>;
-    outputPayload: TOutput;
-    errorCode?: string;
-  }>;
-}): Promise<TOutput> {
-  const store = traceStorage.getStore();
+export async function executeTracedHop<T>(
+  params: {
+    serviceName: string;
+    operationName: string;
+    direction: TraceHopSpan['direction'];
+    requestPreview?: unknown;
+  },
+  fn: (spanContext: { traceparent: string; spanId: string; parentSpanId: string | null }) => Promise<{
+    result: T;
+    statusCode?: number;
+    responsePreview?: unknown;
+  }>
+): Promise<T> {
+  const currentStore = traceContextStorage.getStore();
   const spanId = randomBytes(8).toString('hex');
-  const parentSpanId = store?.activeSpanId ?? null;
-  const startedAt = new Date().toISOString();
-  const startHr = performance.now();
+  const parentSpanId = currentStore ? currentStore.activeSpanId : null;
+  const traceId = currentStore ? currentStore.shared.traceId : randomBytes(16).toString('hex');
+  const traceparent = `00-${traceId}-${spanId}-01`;
 
-  if (store) {
-    store.activeSpanId = spanId;
+  const startedAtMs = Date.now();
+
+  const runCallback = async (): Promise<T> => {
+    try {
+      const { result, statusCode, responsePreview } = await fn({
+        traceparent,
+        spanId,
+        parentSpanId,
+      });
+      if (currentStore) {
+        currentStore.shared.hops.push({
+          spanId,
+          parentSpanId,
+          serviceName: params.serviceName,
+          operationName: params.operationName,
+          direction: params.direction,
+          startedAtMs,
+          durationMs: Math.max(0, Date.now() - startedAtMs),
+          statusCode,
+          redactedRequestPreview: boundPreviewPayload(params.requestPreview, MAX_HOP_PAYLOAD_BYTES),
+          redactedResponsePreview: boundPreviewPayload(responsePreview, MAX_HOP_PAYLOAD_BYTES),
+        });
+      }
+      return result;
+    } catch (err) {
+      if (currentStore) {
+        currentStore.shared.hops.push({
+          spanId,
+          parentSpanId,
+          serviceName: params.serviceName,
+          operationName: params.operationName,
+          direction: params.direction,
+          startedAtMs,
+          durationMs: Math.max(0, Date.now() - startedAtMs),
+          statusCode: 500,
+          redactedRequestPreview: boundPreviewPayload(params.requestPreview, MAX_HOP_PAYLOAD_BYTES),
+          errorMessage: err instanceof Error ? String(redactTraceEnvelopeSecrets(err.message)) : 'UNKNOWN_ERROR',
+        });
+      }
+      throw err;
+    }
+  };
+
+  if (!currentStore) {
+    return runCallback();
   }
 
-  const scrubbedInput = scrubIoPayload(params.inputPayload) as Record<string, unknown>;
-  const scrubbedInHeaders = scrubIoPayload(params.inputHeaders ?? {}) as Record<string, string>;
-  const inBytes = Buffer.byteLength(JSON.stringify(scrubbedInput), 'utf8');
+  // Create a new immutable store object for this child execution tree
+  const childStore: ImmutableTraceContextStore = {
+    shared: currentStore.shared,
+    activeSpanId: spanId,
+  };
+  return traceContextStorage.run(childStore, runCallback);
+}
 
-  try {
-    const result = await params.execute(spanId);
-    const durationMs = Number((performance.now() - startHr).toFixed(2));
-    const scrubbedOutput = scrubIoPayload(result.outputPayload) as Record<string, unknown>;
-    const scrubbedOutHeaders = scrubIoPayload(result.outputHeaders ?? {}) as Record<string, string>;
-    const outBytes = Buffer.byteLength(JSON.stringify(scrubbedOutput), 'utf8');
+export interface CorrelatedTraceEnvelope {
+  traceId: string;
+  tenantId: string;
+  requestId: string;
+  hopCount: number;
+  envelopeTruncated: boolean;
+  byteLength: number;
+  hops: TraceHopSpan[];
+}
 
-    if (store) {
-      store.hops.push({
-        span_id: spanId,
-        parent_span_id: parentSpanId,
-        hop_index: store.hops.length + 1,
-        hop_type: params.hopType,
-        service_name: params.serviceName,
-        operation: params.operation,
-        status: result.status,
-        started_at: startedAt,
-        duration_ms: durationMs,
-        policy_or_query: params.policyOrQuery,
-        input_envelope: {
-          headers: scrubbedInHeaders,
-          payload: scrubbedInput,
-          byte_size: inBytes,
-        },
-        output_envelope: {
-          status_code: result.statusCode,
-          headers: scrubbedOutHeaders,
-          payload: scrubbedOutput,
-          byte_size: outBytes,
-        },
-        error_code: result.errorCode,
-      });
-    }
+export function exportCorrelatedTraceEnvelope(shared: SharedTraceBuffer): CorrelatedTraceEnvelope {
+  const sanitizedHops: TraceHopSpan[] = shared.hops.map((hop) => ({
+    ...hop,
+    redactedRequestPreview: boundPreviewPayload(hop.redactedRequestPreview, MAX_HOP_PAYLOAD_BYTES),
+    redactedResponsePreview: boundPreviewPayload(hop.redactedResponsePreview, MAX_HOP_PAYLOAD_BYTES),
+  }));
 
-    return result.outputPayload;
-  } catch (err) {
-    const durationMs = Number((performance.now() - startHr).toFixed(2));
-    if (store) {
-      store.hops.push({
-        span_id: spanId,
-        parent_span_id: parentSpanId,
-        hop_index: store.hops.length + 1,
-        hop_type: params.hopType,
-        service_name: params.serviceName,
-        operation: params.operation,
-        status: 'ERROR',
-        started_at: startedAt,
-        duration_ms: durationMs,
-        policy_or_query: params.policyOrQuery,
-        input_envelope: {
-          headers: scrubbedInHeaders,
-          payload: scrubbedInput,
-          byte_size: inBytes,
-        },
-        output_envelope: {
-          status_code: 500,
-          payload: { error: 'UNHANDLED_HOP_EXCEPTION' },
-          byte_size: 36,
-        },
-        error_code: err instanceof Error ? err.name : 'UNKNOWN_ERROR',
-      });
-    }
-    throw err;
-  } finally {
-    if (store && parentSpanId) {
-      store.activeSpanId = parentSpanId;
-    }
+  const candidate: CorrelatedTraceEnvelope = {
+    traceId: shared.traceId,
+    tenantId: shared.tenantId,
+    requestId: shared.requestId,
+    hopCount: sanitizedHops.length,
+    envelopeTruncated: false,
+    byteLength: 0,
+    hops: sanitizedHops,
+  };
+
+  let serialized = JSON.stringify(candidate);
+  let byteLength = Buffer.byteLength(serialized, 'utf8');
+
+  if (byteLength <= MAX_TRACE_ENVELOPE_BYTES) {
+    candidate.byteLength = byteLength;
+    return candidate;
   }
+
+  // Step 1: Strip request/response previews on non-root hops to fit within 32 KB
+  candidate.envelopeTruncated = true;
+  candidate.hops = sanitizedHops.map((hop) => ({
+    spanId: hop.spanId,
+    parentSpanId: hop.parentSpanId,
+    serviceName: hop.serviceName,
+    operationName: hop.operationName,
+    direction: hop.direction,
+    startedAtMs: hop.startedAtMs,
+    durationMs: hop.durationMs,
+    statusCode: hop.statusCode,
+    errorMessage: hop.errorMessage,
+  }));
+
+  serialized = JSON.stringify(candidate);
+  byteLength = Buffer.byteLength(serialized, 'utf8');
+
+  // Step 2: Drop oldest non-root hops until strictly <= 32,768 bytes
+  while (byteLength > MAX_TRACE_ENVELOPE_BYTES && candidate.hops.length > 1) {
+    candidate.hops.pop();
+    serialized = JSON.stringify(candidate);
+    byteLength = Buffer.byteLength(serialized, 'utf8');
+  }
+
+  candidate.byteLength = byteLength;
+  return candidate;
 }
 ```

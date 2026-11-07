@@ -1,40 +1,43 @@
-# Module 08: Deep API Security, Secrets Management, Disaster Recovery, Networking, Microservices, AI Infrastructure & Data Governance
+# Module 08: Deep API Security, Transport-Pinned SSRF Defense, CIDR Proxy Trust, KMS Secrets & Data Governance
 
-This reference covers the remaining 7 enterprise architecture domains: API threat defense (SSRF, CSRF, XSS, CORS, SQLi, BOLA), KMS/Vault secrets management, PITR disaster recovery, infrastructure networking, microservices architecture, AI backend infrastructure, and data governance.
+This module remediates the Node.js `fetch()` / Undici vs. `https.Agent` DNS-pinning mismatch, provides a complete **DNS-rebinding-proof HTTPS requester and Undici connect-lookup pin** with redirect re-validation, response-size cutoffs, and header stripping, replaces blind proxy-hop counting with **CIDR-verified `X-Forwarded-For` traversal**, and covers KMS/Vault envelope encryption and HMAC hash-chained audit logs.
 
 ---
 
-## 1. Deep API Security (SSRF, CSRF, XSS, CORS, SQLi & BOLA/BOPLA)
+## 1. Threat Model, Trust Boundaries & Technical Reality of Node.js `fetch()`
 
-### Server-Side Request Forgery (SSRF) Defense
-Whenever the backend fetches a user-supplied URL (webhooks, avatar URL import, link previews, OIDC discovery):
-1. **Never pass raw user URLs directly to `fetch()`**.
-2. **Parse & Restrict Protocol/Port**: Allow only `https:` (or `http:` if explicitly required) on standard ports (`443`, `80`).
-3. **Custom DNS Resolution + Private/Metadata IP Blocklist (Anti-DNS-Rebinding)**: Resolve the hostname to its IP address(es) **once**, verify that **every** resolved IP is a public routable unicast address, and connect directly to that verified IP with `redirect: 'error'` (or re-validate every redirect hop).
+| Control | Technical Vulnerability / Reality | Enforcement Location | Failure Behavior |
+| :--- | :--- | :--- | :--- |
+| **SSRF & DNS Rebinding (`executePinnedSafeHttpsRequest` / `createPinnedUndiciConnectLookup`)** | **Critical Node.js Reality**: Node's built-in `globalThis.fetch()` uses **Undici**, which **completely ignores `https.Agent`**! Passing an `https.Agent` to `fetch()` does not pin DNS and leaves `fetch()` vulnerable to `TTL=0` DNS rebinding. Furthermore, mixed public/private DNS responses or unvalidated `301`/`302` redirects bypass single-hop checks. | Outbound HTTP client transport layer (`https.request` with `agent` OR Undici `Agent({ connect: { lookup } })`). | Resolves all A/AAAA records once, rejects if **any** record is non-global/private, pins socket connection to the validated IP, strips sensitive headers on cross-origin redirects, re-validates every redirect hop (`maxRedirects = 3`), and aborts if response exceeds `maxResponseBytes`. |
+| **Client IP Extraction (`extractTrustedClientIpByCidr`)** | Counting a fixed `trustedProxyHopCount` blindly trusts `X-Forwarded-For` even when an attacker connects directly to the server or when CDN/WAF hop counts vary. | HTTP ingress boundary starting from `socket.remoteAddress`. | Only inspects `X-Forwarded-For` if `socketRemoteAddress` is inside `trustedProxyCidrs`; walks right-to-left until the first non-trusted IP; fails closed to `socketRemoteAddress` on malformed entries. |
+
+---
+
+## 2. Remediated SSRF & DNS-Rebinding Defense (IPv4/IPv6 Classification, Pinned Transport & Redirect Re-Validation)
 
 ```typescript
 import dns from 'node:dns/promises';
 import https from 'node:https';
 import net from 'node:net';
 
-function isReservedIpv4Octets(a: number, b: number, c: number, _d: number): boolean {
+function isReservedIpv4Octets(a: number, b: number, c: number, d: number): boolean {
   if (a === 0 || a === 10 || a === 127) return true;                     // 0.0.0.0/8, 10.0.0.0/8, 127.0.0.0/8
-  if (a === 169 && b === 254) return true;                               // 169.254.0.0/16 (Cloud IMDS!)
+  if (a === 169 && b === 254) return true;                               // 169.254.0.0/16 (Cloud IMDS / Link-local)
   if (a === 172 && b >= 16 && b <= 31) return true;                      // 172.16.0.0/12
   if (a === 192 && b === 168) return true;                               // 192.168.0.0/16
   if (a === 100 && b >= 64 && b <= 127) return true;                     // 100.64.0.0/10 (CGNAT)
-  if (a === 192 && b === 0 && (c === 0 || c === 2)) return true;         // 192.0.0.0/24, 192.0.2.0/24 (TEST-NET-1)
+  if (a === 192 && b === 0 && (c === 0 || c === 2)) return true;         // 192.0.0.0/24, 192.0.2.0/24
   if (a === 198 && (b === 18 || b === 19)) return true;                  // 198.18.0.0/15 (Benchmarking)
-  if (a === 198 && b === 51 && c === 100) return true;                   // 198.51.100.0/24 (TEST-NET-2)
-  if (a === 203 && b === 0 && c === 113) return true;                    // 203.0.113.0/24 (TEST-NET-3)
-  if (a >= 224) return true;                                             // Multicast (224/4) & Reserved (240/4)
+  if (a === 198 && b === 51 && c === 100) return true;                   // 198.51.100.0/24
+  if (a === 203 && b === 0 && c === 113) return true;                    // 203.0.113.0/24
+  if (a >= 224) return true;                                             // Multicast (224/4), Reserved (240/4) & Broadcast (255.255.255.255)
+  if (a === 255 && b === 255 && c === 255 && d === 255) return true;
   return false;
 }
 
-/**
- * Expands any valid IPv6 string (including '::' and dotted-quad suffixes) into 8 16-bit numbers.
- */
-function parseIpv6Hextets(ip: string): number[] | null {
+export function parseIpv6Hextets(ip: string): number[] | null {
+  // Reject IPv6 zone indices (e.g. fe80::1%eth0)
+  if (ip.includes('%')) return null;
   let normalized = ip.toLowerCase();
   if (normalized.includes('.')) {
     const lastColon = normalized.lastIndexOf(':');
@@ -57,120 +60,451 @@ function parseIpv6Hextets(ip: string): number[] | null {
 }
 
 /**
- * Checks whether an IPv4 or IPv6 address belongs to loopback, link-local,
- * cloud metadata (169.254.169.254), RFC 1918, CGNAT, ULA, NAT64, 6to4, or hex IPv4-mapped ranges.
+ * Classifies IPv4 and IPv6 addresses, rejecting loopback, private (RFC 1918 / ULA),
+ * link-local (IMDS 169.254.169.254 / fe80::/10), multicast, unspecified, CGNAT,
+ * IPv4-mapped/compatible IPv6, NAT64, 6to4, Teredo, ISATAP, Discard (100::/64), and non-global ranges.
  */
 export function isPrivateOrReservedIp(ip: string): boolean {
-  const version = net.isIP(ip);
+  const cleaned = ip.trim();
+  const version = net.isIP(cleaned);
   if (version === 4) {
-    const [a, b, c, d] = ip.split('.').map(Number);
+    const [a, b, c, d] = cleaned.split('.').map(Number);
     return isReservedIpv4Octets(a, b, c, d);
   }
   if (version === 6) {
-    const h = parseIpv6Hextets(ip);
+    const h = parseIpv6Hextets(cleaned);
     if (!h) return true;
 
     const isAllZeroPrefix = h[0] === 0 && h[1] === 0 && h[2] === 0 && h[3] === 0 && h[4] === 0;
     // :: (Unspecified) or ::1 (Loopback)
     if (isAllZeroPrefix && h[5] === 0 && h[6] === 0 && (h[7] === 0 || h[7] === 1)) return true;
 
-    // IPv4-mapped (::ffff:0:0/96) or IPv4-compatible (::0:0/96) — handles both dotted-quad and hex (::ffff:7f00:1)
+    // IPv4-mapped (::ffff:0:0/96) or IPv4-compatible (::0:0/96)
     if (isAllZeroPrefix && (h[5] === 0xffff || h[5] === 0)) {
       return isReservedIpv4Octets(h[6] >> 8, h[6] & 0xff, h[7] >> 8, h[7] & 0xff);
     }
 
-    // NAT64 Well-Known Prefix (64:ff9b::/96) embedding IPv4 in h[6..7]
-    if (h[0] === 0x0064 && h[1] === 0xff9b && h[2] === 0 && h[3] === 0 && h[4] === 0 && h[5] === 0) {
+    // IPv4-translated (::ffff:0:w.x.y.z /96)
+    if (h[0] === 0 && h[1] === 0 && h[2] === 0 && h[3] === 0 && h[4] === 0xffff && h[5] === 0) {
       return isReservedIpv4Octets(h[6] >> 8, h[6] & 0xff, h[7] >> 8, h[7] & 0xff);
     }
 
-    // 6to4 Prefix (2002::/16) embedding IPv4 in h[1..2]
+    // Discard-Only Address Block (100::/64)
+    if (h[0] === 0x0100 && h[1] === 0 && h[2] === 0 && h[3] === 0) return true;
+
+    // NAT64 Well-Known (64:ff9b::/96) & Local-Use (64:ff9b:1::/48)
+    if (h[0] === 0x0064 && h[1] === 0xff9b) {
+      return isReservedIpv4Octets(h[6] >> 8, h[6] & 0xff, h[7] >> 8, h[7] & 0xff);
+    }
+
+    // 6to4 (2002::/16)
     if (h[0] === 0x2002) {
       return isReservedIpv4Octets(h[1] >> 8, h[1] & 0xff, h[2] >> 8, h[2] & 0xff);
     }
 
-    // Teredo Tunneling Prefix (2001:0000::/32) — embeds bitwise-INVERTED client IPv4 in h[6..7]!
-    if (h[0] === 0x2001 && h[1] === 0x0000) {
+    // Teredo (2001:0000::/32)
+    if (h[0] === 0x2001 && h[1] === 0x0000) return true;
+
+    // Benchmarking (2001:0002::/48), Orchid (2001:0010::/28), Documentation (2001:0db8::/32)
+    if (h[0] === 0x2001 && (h[1] === 0x0002 || (h[1] & 0xfff0) === 0x0010 || h[1] === 0x0db8)) {
       return true;
     }
 
-    // ISATAP Interface Identifier (::0000:5efe:w.x.y.z or ::0200:5efe:w.x.y.z) embedding IPv4 in h[6..7]
+    // ISATAP (::0000:5efe:w.x.y.z or ::0200:5efe:w.x.y.z)
     if ((h[4] === 0x0000 || h[4] === 0x0200) && h[5] === 0x5efe) {
       return isReservedIpv4Octets(h[6] >> 8, h[6] & 0xff, h[7] >> 8, h[7] & 0xff);
     }
 
     if ((h[0] & 0xffc0) === 0xfe80) return true; // Link-local fe80::/10
+    if ((h[0] & 0xffc0) === 0xfec0) return true; // Deprecated Site-local fec0::/10
     if ((h[0] & 0xfe00) === 0xfc00) return true; // Unique Local fc00::/7
-    if (h[0] === 0x2001 && h[1] === 0x0db8) return true; // Documentation 2001:db8::/32
     if ((h[0] & 0xff00) === 0xff00) return true; // Multicast ff00::/8
+
+    // Require Global Unicast range (2000::/3 -> first 3 bits 001)
+    if ((h[0] & 0xe000) !== 0x2000) return true;
+
     return false;
   }
   return true;
 }
 
+export type DnsResolverFn = (
+  hostname: string
+) => Promise<ReadonlyArray<{ address: string; family: 4 | 6 }>>;
+
+const defaultDnsResolver: DnsResolverFn = async (hostname) => {
+  const res = await dns.lookup(hostname, { all: true, verbatim: true });
+  return res.map((r) => ({ address: r.address, family: r.family as 4 | 6 }));
+};
+
 /**
- * Resolves DNS ONCE, validates all returned IPs against the SSRF blocklist,
- * and returns a pinned https.Agent that connects directly to the verified IP
- * to completely defeat DNS Rebinding (TTL=0 TOCTOU) attacks while supporting Node 20+ lookup({ all: true }).
+ * Validates URL scheme, credentials, port, and resolves DNS once, verifying that EVERY
+ * returned A/AAAA record is a public global unicast IP (defeating mixed public/private DNS responses).
+ * Returns a lookup function compatible with BOTH Node's `https.Agent` AND Undici's `Agent({ connect: { lookup } })`.
  */
-export async function createPinnedSafeHttpsAgent(rawUrl: string): Promise<{
+export async function resolveAndPinSafeTarget(
+  rawUrl: string,
+  options: {
+    allowedPorts?: ReadonlySet<number>;
+    dnsResolver?: DnsResolverFn;
+  } = {}
+): Promise<{
   parsedUrl: URL;
   pinnedIp: string;
   pinnedFamily: 4 | 6;
-  agent: https.Agent;
+  pinnedLookup: net.LookupFunction;
+  httpsAgent: https.Agent;
 }> {
-  const parsedUrl = new URL(rawUrl);
-  if (parsedUrl.protocol !== 'https:') {
-    throw new Error('SSRF_BLOCKED: Only https:// URLs are permitted');
-  }
-  if (parsedUrl.username || parsedUrl.password) {
-    throw new Error('SSRF_BLOCKED: URL credentials are forbidden');
-  }
-  if (parsedUrl.port && parsedUrl.port !== '443') {
-    throw new Error(`SSRF_BLOCKED: Non-standard outbound port ${parsedUrl.port} is forbidden`);
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(rawUrl);
+  } catch {
+    throw new Error('SSRF_BLOCKED: Malformed URL');
   }
 
-  const records = await dns.lookup(parsedUrl.hostname, { all: true, verbatim: true });
-  if (records.length === 0) {
-    throw new Error('SSRF_BLOCKED: Hostname did not resolve');
+  if (parsedUrl.protocol !== 'https:') {
+    throw new Error(`SSRF_BLOCKED: Protocol "${parsedUrl.protocol}" is forbidden; only https: is permitted`);
   }
+  if (parsedUrl.username || parsedUrl.password) {
+    throw new Error('SSRF_BLOCKED: Embedded URL credentials are forbidden');
+  }
+
+  const allowedPorts = options.allowedPorts ?? new Set([443]);
+  const effectivePort = parsedUrl.port ? Number(parsedUrl.port) : 443;
+  if (!Number.isInteger(effectivePort) || !allowedPorts.has(effectivePort)) {
+    throw new Error(`SSRF_BLOCKED: Outbound port ${effectivePort} is not permitted`);
+  }
+
+  // Handle IP literal in hostname directly (e.g. https://127.0.0.1/ or https://[::1]/)
+  const cleanHost = parsedUrl.hostname.replace(/^\[|\]$/g, '');
+  const literalVersion = net.isIP(cleanHost);
+  let records: ReadonlyArray<{ address: string; family: 4 | 6 }>;
+
+  if (literalVersion === 4 || literalVersion === 6) {
+    records = [{ address: cleanHost, family: literalVersion }];
+  } else {
+    const resolver = options.dnsResolver ?? defaultDnsResolver;
+    try {
+      records = await resolver(cleanHost);
+    } catch {
+      throw new Error('SSRF_BLOCKED: DNS resolution failed');
+    }
+  }
+
+  if (!records || records.length === 0) {
+    throw new Error('SSRF_BLOCKED: Hostname did not resolve to any address');
+  }
+
+  // CRITICAL: Validate EVERY resolved record! If a domain returns [93.184.216.34, 127.0.0.1], reject immediately!
   for (const rec of records) {
     if (isPrivateOrReservedIp(rec.address)) {
-      throw new Error(`SSRF_BLOCKED: Hostname resolved to restricted IP ${rec.address}`);
+      throw new Error(`SSRF_BLOCKED: Hostname resolved to restricted/private IP ${rec.address}`);
     }
   }
 
   const pinnedIp = records[0].address;
-  const pinnedFamily = records[0].family as 4 | 6;
+  const pinnedFamily = records[0].family;
 
-  // Pin socket lookup to the already-validated IP so a second DNS lookup never occurs!
-  // Handles both Node 20+ `{ all: true }` array signature and single-address callback signature.
-  const agent = new https.Agent({
+  const pinnedLookup: net.LookupFunction = (_hostname, lookupOpts, callback) => {
+    if (typeof lookupOpts === 'object' && lookupOpts !== null && 'all' in lookupOpts && lookupOpts.all) {
+      (
+        callback as unknown as (
+          err: NodeJS.ErrnoException | null,
+          addresses: Array<{ address: string; family: number }>
+        ) => void
+      )(null, [{ address: pinnedIp, family: pinnedFamily }]);
+      return;
+    }
+    callback(null, pinnedIp, pinnedFamily);
+  };
+
+  const httpsAgent = new https.Agent({
     keepAlive: false,
-    servername: parsedUrl.hostname,
-    lookup: (_hostname, options, callback) => {
-      if (typeof options === 'object' && options !== null && 'all' in options && options.all) {
-        (callback as unknown as (err: NodeJS.ErrnoException | null, addresses: Array<{ address: string; family: number }>) => void)(
-          null,
-          [{ address: pinnedIp, family: pinnedFamily }]
-        );
-        return;
-      }
-      callback(null, pinnedIp, pinnedFamily);
-    },
+    servername: cleanHost,
+    lookup: pinnedLookup,
   });
 
-  return { parsedUrl, pinnedIp, pinnedFamily, agent };
+  return { parsedUrl, pinnedIp, pinnedFamily, pinnedLookup, httpsAgent };
+}
+
+const SENSITIVE_OUTBOUND_HEADERS = new Set([
+  'authorization',
+  'cookie',
+  'proxy-authorization',
+  'x-api-key',
+  'x-apigateway-api-userinfo',
+]);
+
+/**
+ * Transport-Matched, DNS-Pinned Safe HTTPS Fetcher with Hop-by-Hop Redirect Re-Validation,
+ * Header Stripping, Hard Timeouts, and Streaming Response-Size Cutoff.
+ *
+ * Why this uses `https.request` with `httpsAgent` instead of `globalThis.fetch(url, { agent })`:
+ * Node's built-in `fetch()` uses Undici and silently ignores `https.Agent`! Using `https.request`
+ * guarantees that `httpsAgent`'s `lookup` callback is invoked by `net.Socket` and `tls.connect`.
+ */
+export async function executePinnedSafeHttpsRequest(params: {
+  url: string;
+  method?: 'GET' | 'POST' | 'PUT' | 'DELETE';
+  headers?: Readonly<Record<string, string>>;
+  bodyBuffer?: Buffer;
+  maxRedirects?: number;
+  timeoutMs?: number;
+  maxResponseBytes?: number;
+  dnsResolver?: DnsResolverFn;
+  transportOverride?: (hop: {
+    parsedUrl: URL;
+    pinnedIp: string;
+    headers: Record<string, string>;
+  }) => Promise<{ statusCode: number; headers: Record<string, string>; body: Buffer }>;
+}): Promise<{
+  statusCode: number;
+  headers: Record<string, string>;
+  body: Buffer;
+  finalUrl: string;
+  pinnedIpUsed: string;
+}> {
+  const maxRedirects = params.maxRedirects ?? 3;
+  const timeoutMs = params.timeoutMs ?? 5_000;
+  const maxResponseBytes = params.maxResponseBytes ?? 2 * 1024 * 1024; // 2MB max response
+
+  // Never forward Authorization, Cookie, or internal gateway headers to untrusted external URLs
+  const safeHeaders: Record<string, string> = {};
+  for (const [k, v] of Object.entries(params.headers ?? {})) {
+    if (!SENSITIVE_OUTBOUND_HEADERS.has(k.toLowerCase())) {
+      safeHeaders[k] = v;
+    }
+  }
+
+  let currentUrl = params.url;
+  let currentMethod = params.method ?? 'GET';
+  let currentBody = params.bodyBuffer;
+
+  for (let redirectCount = 0; redirectCount <= maxRedirects; redirectCount++) {
+    // Re-validate and DNS-pin EVERY hop (initial request + each redirect Location target)
+    const pinned = await resolveAndPinSafeTarget(currentUrl, {
+      dnsResolver: params.dnsResolver,
+    });
+
+    const requestHeaders: Record<string, string> = {
+      ...safeHeaders,
+      Host: pinned.parsedUrl.host,
+    };
+
+    const hopResponse = params.transportOverride
+      ? await params.transportOverride({
+          parsedUrl: pinned.parsedUrl,
+          pinnedIp: pinned.pinnedIp,
+          headers: requestHeaders,
+        })
+      : await new Promise<{ statusCode: number; headers: Record<string, string>; body: Buffer }>(
+          (resolve, reject) => {
+            const req = https.request(
+              {
+                protocol: 'https:',
+                hostname: pinned.parsedUrl.hostname,
+                port: pinned.parsedUrl.port || 443,
+                path: `${pinned.parsedUrl.pathname}${pinned.parsedUrl.search}`,
+                method: currentMethod,
+                headers: requestHeaders,
+                agent: pinned.httpsAgent,
+                servername: pinned.parsedUrl.hostname,
+                timeout: timeoutMs,
+              },
+              (res) => {
+                const chunks: Buffer[] = [];
+                let totalBytes = 0;
+
+                res.on('data', (chunk: Buffer) => {
+                  totalBytes += chunk.byteLength;
+                  if (totalBytes > maxResponseBytes) {
+                    req.destroy(
+                      new Error(`SSRF_RESPONSE_TOO_LARGE: Exceeded ${maxResponseBytes} bytes`)
+                    );
+                    return;
+                  }
+                  chunks.push(chunk);
+                });
+
+                res.on('end', () => {
+                  if (totalBytes > maxResponseBytes) return;
+                  const normHeaders: Record<string, string> = {};
+                  for (const [hk, hv] of Object.entries(res.headers)) {
+                    if (typeof hv === 'string') normHeaders[hk.toLowerCase()] = hv;
+                    else if (Array.isArray(hv)) normHeaders[hk.toLowerCase()] = hv.join(', ');
+                  }
+                  resolve({
+                    statusCode: res.statusCode ?? 500,
+                    headers: normHeaders,
+                    body: Buffer.concat(chunks),
+                  });
+                });
+
+                res.on('error', reject);
+              }
+            );
+
+            req.on('timeout', () => {
+              req.destroy(new Error('SSRF_REQUEST_TIMEOUT'));
+            });
+            req.on('error', reject);
+
+            if (currentBody && currentBody.byteLength > 0) {
+              req.write(currentBody);
+            }
+            req.end();
+          }
+        );
+
+    if (hopResponse.body.byteLength > maxResponseBytes) {
+      throw new Error(`SSRF_RESPONSE_TOO_LARGE: Exceeded ${maxResponseBytes} bytes`);
+    }
+
+    const status = hopResponse.statusCode;
+    if (status === 301 || status === 302 || status === 303 || status === 307 || status === 308) {
+      if (redirectCount >= maxRedirects) {
+        throw new Error(`SSRF_MAX_REDIRECTS_EXCEEDED: Exceeded ${maxRedirects} redirects`);
+      }
+      const locationHeader = hopResponse.headers['location'] ?? hopResponse.headers['Location'];
+      if (!locationHeader) {
+        throw new Error('SSRF_REDIRECT_ERROR: Redirect response missing Location header');
+      }
+      const nextUrl = new URL(locationHeader, pinned.parsedUrl).toString();
+      currentUrl = nextUrl;
+      if (status === 301 || status === 302 || status === 303) {
+        currentMethod = 'GET';
+        currentBody = undefined;
+      }
+      continue;
+    }
+
+    return {
+      statusCode: hopResponse.statusCode,
+      headers: hopResponse.headers,
+      body: hopResponse.body,
+      finalUrl: pinned.parsedUrl.toString(),
+      pinnedIpUsed: pinned.pinnedIp,
+    };
+  }
+
+  throw new Error(`SSRF_MAX_REDIRECTS_EXCEEDED: Exceeded ${maxRedirects} redirects`);
 }
 ```
 
-### CSRF, CORS, XSS, SQLi, NoSQLi, Prototype Pollution, Host Poisoning & GraphQL Amplification Defenses
+### Proxy & Network-Level Egress Controls
+- **Outbound Proxy Warning (`HTTP_PROXY` / `HTTPS_PROXY`)**: If your runtime routes outbound requests through a corporate HTTP proxy, the proxy resolves DNS on its side unless configured otherwise. Enforce SSRF IP blocklists on the outbound proxy itself (e.g., Envoy / Squid ACLs) and apply VPC Egress Firewall rules blocking outbound connections from application subnets to RFC 1918 and `169.254.169.254/32`.
+
+---
+
+## 3. Remediated Proxy IP Extraction (`extractTrustedClientIpByCidr`)
+
+### Why Fixed Proxy-Hop Counts Are Vulnerable
+Counting `chain.length - trustedProxyHopCount` without verifying that `socketRemoteAddress` and intermediate hops actually belong to your trusted proxy CIDRs allows an attacker who connects directly to the service (or through a different ingress path) to spoof `X-Forwarded-For`!
 
 ```typescript
+function ipv4ToUint32(ip: string): number | null {
+  if (net.isIP(ip) !== 4) return null;
+  const [a, b, c, d] = ip.split('.').map(Number);
+  return (((a << 24) >>> 0) | (b << 16) | (c << 8) | d) >>> 0;
+}
+
+function ipv6ToBigInt(ip: string): bigint | null {
+  const hextets = parseIpv6Hextets(ip);
+  if (!hextets) return null;
+  let val = 0n;
+  for (const h of hextets) {
+    val = (val << 16n) | BigInt(h);
+  }
+  return val;
+}
+
+export function isIpInCidr(rawIp: string, cidr: string): boolean {
+  const ip = rawIp.trim();
+  const [rangeIp, prefixStr] = cidr.trim().split('/');
+  const prefixLen = Number(prefixStr);
+  const ipVer = net.isIP(ip);
+  const rangeVer = net.isIP(rangeIp);
+
+  if (ipVer === 0 || ipVer !== rangeVer || !Number.isInteger(prefixLen)) {
+    return false;
+  }
+
+  if (ipVer === 4) {
+    if (prefixLen < 0 || prefixLen > 32) return false;
+    const ipNum = ipv4ToUint32(ip)!;
+    const rangeNum = ipv4ToUint32(rangeIp)!;
+    const mask = prefixLen === 0 ? 0 : (~0 << (32 - prefixLen)) >>> 0;
+    return (ipNum & mask) === (rangeNum & mask);
+  }
+
+  if (prefixLen < 0 || prefixLen > 128) return false;
+  const ipBig = ipv6ToBigInt(ip);
+  const rangeBig = ipv6ToBigInt(rangeIp);
+  if (ipBig === null || rangeBig === null) return false;
+  if (prefixLen === 0) return true;
+  const shift = BigInt(128 - prefixLen);
+  return (ipBig >> shift) === (rangeBig >> shift);
+}
+
+export function isTrustedProxyIp(ip: string, trustedProxyCidrs: readonly string[]): boolean {
+  return trustedProxyCidrs.some((cidr) => isIpInCidr(ip, cidr));
+}
+
 /**
- * 1. Anti-Prototype-Pollution & JSON Bomb / Depth Sanitizer:
- * Blocks "__proto__", "constructor", "prototype", deeply nested JSON bombs, and MongoDB "$" operator injection.
+ * CIDR-Verified Right-to-Left Client IP Extractor:
+ * 1. Verifies that the immediate TCP peer (`socketRemoteAddress`) belongs to `trustedProxyCidrs`.
+ *    If not, `X-Forwarded-For` is untrusted and ignored immediately.
+ * 2. Parses `X-Forwarded-For` and rejects malformed/ambiguous chains (failing closed to `socketRemoteAddress`).
+ * 3. Walks right-to-left across the chain, skipping hops that belong to `trustedProxyCidrs`,
+ *    and returns the first IP outside `trustedProxyCidrs` (the true client IP that connected to our edge).
  */
+export function extractTrustedClientIpByCidr(params: {
+  socketRemoteAddress: string;
+  xForwardedForHeader?: string;
+  trustedProxyCidrs: readonly string[];
+}): string {
+  const peerIp = params.socketRemoteAddress.trim();
+  if (net.isIP(peerIp) === 0) {
+    throw new Error(`INVALID_SOCKET_PEER_IP: "${params.socketRemoteAddress}"`);
+  }
+
+  // 1. If the immediate socket peer is NOT a trusted proxy, never trust X-Forwarded-For!
+  if (!isTrustedProxyIp(peerIp, params.trustedProxyCidrs)) {
+    return peerIp;
+  }
+
+  if (!params.xForwardedForHeader || params.xForwardedForHeader.trim().length === 0) {
+    return peerIp;
+  }
+
+  const rawEntries = params.xForwardedForHeader.split(',').map((s) => s.trim());
+  // 2. Reject malformed or ambiguous X-Forwarded-For chains (every entry must be a valid IPv4/IPv6 literal)
+  for (const entry of rawEntries) {
+    if (!entry || net.isIP(entry) === 0) {
+      throw new Error(`MALFORMED_X_FORWARDED_FOR_CHAIN: Invalid IP entry "${entry}"`);
+    }
+  }
+
+  // 3. Walk right-to-left: the first IP that is NOT in trustedProxyCidrs is the untrusted external client
+  for (let i = rawEntries.length - 1; i >= 0; i--) {
+    const hopIp = rawEntries[i];
+    if (!isTrustedProxyIp(hopIp, params.trustedProxyCidrs)) {
+      return hopIp;
+    }
+  }
+
+  // All IPs in the chain were internal trusted proxies; return the leftmost trusted hop
+  return rawEntries[0];
+}
+```
+
+---
+
+## 4. Anti-Prototype-Pollution Input Sanitizer & Keyed HMAC Audit Chain
+
+```typescript
+import crypto from 'node:crypto';
+
 const FORBIDDEN_OBJECT_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
 export function sanitizeUntrustedJsonInput(
@@ -185,10 +519,8 @@ export function sanitizeUntrustedJsonInput(
   if (currentDepth > maxDepth) {
     throw new Error(`PAYLOAD_REJECTED: JSON nesting depth exceeds maximum of ${maxDepth}`);
   }
-
   if (input === null || input === undefined) return input;
   if (typeof input === 'string') {
-    // Normalize Unicode (NFKC) BEFORE downstream validation to defeat fullwidth/homoglyph bypasses
     if (input.includes('\0')) throw new Error('PAYLOAD_REJECTED: Null byte in string');
     return input.normalize('NFKC');
   }
@@ -220,126 +552,6 @@ export function sanitizeUntrustedJsonInput(
   return { ...cleanObj };
 }
 
-/**
- * 2. SQL LIKE Wildcard Escaper:
- * Prevents attackers from injecting "%" or "_" wildcards into search strings to cause pathological table scans.
- */
-export function escapeSqlLikePattern(rawSearch: string): string {
-  return rawSearch
-    .normalize('NFKC')
-    .replace(/[\\%_]/g, (match) => `\\${match}`);
-}
-
-/**
- * 3. Trusted Reverse-Proxy Client IP Extractor (Defeats X-Forwarded-For Spoofing):
- * Never read the leftmost IP in X-Forwarded-For (which is attacker-controlled!).
- * Walk right-to-left skipping exactly `trustedProxyCount` hops added by your own ingress load balancers.
- */
-export function extractTrustedClientIp(params: {
-  socketRemoteAddress: string;
-  xForwardedForHeader?: string;
-  trustedProxyHopCount: number;
-}): string {
-  if (params.trustedProxyHopCount <= 0 || !params.xForwardedForHeader) {
-    return params.socketRemoteAddress;
-  }
-  const chain = params.xForwardedForHeader
-    .split(',')
-    .map((ip) => ip.trim())
-    .filter((ip) => net.isIP(ip) !== 0);
-
-  if (chain.length === 0) {
-    return params.socketRemoteAddress;
-  }
-
-  // Select the hop immediately preceding our trusted proxies
-  const targetIndex = Math.max(0, chain.length - params.trustedProxyHopCount);
-  return chain[targetIndex];
-}
-```
-
-### Additional Mandatory Penetration Defenses
-- **Host Header & Password Reset Poisoning Defense**: Never construct password-reset, magic-link, or OAuth redirect URLs using `req.headers.host` or `X-Forwarded-Host`. Always read the canonical origin from an immutable server environment variable (`process.env.APP_URL`).
-- **HTTP Request Smuggling (`CL.TE` / `TE.CL`) Defense**: Configure the edge load balancer and HTTP server to reject any request containing both `Content-Length` and `Transfer-Encoding`, normalize HTTP/2 -> HTTP/1.1 downgrade headers, and reject malformed whitespace in header names.
-- **GraphQL Batching & Alias Amplification Defense**: Enforce max query depth ($\le 8$), max aliases per query ($\le 15$ to block `login1: login(...) ... login500: login(...)` brute-force amplification), max batch array size ($\le 1$ for mutations), and disable introspection in production.
-- **CSRF**: For cookie-authenticated endpoints, enforce `SameSite=Strict` (or `Lax`), verify `Origin` / `Sec-Fetch-Site` headers on all `POST`/`PUT`/`PATCH`/`DELETE` requests, and require a cryptographic anti-CSRF header (`X-CSRF-Token`).
-- **CORS**: Never reflect arbitrary `Origin` headers with `Access-Control-Allow-Credentials: true`. Match `Origin` against an explicit exact-match allowlist.
-- **BOLA & BOPLA (Broken Object / Property-Level Authorization)**:
-  - **BOLA**: Always filter by `tenant_id` and `owner_id` in the `WHERE` clause.
-  - **BOPLA / Mass Assignment**: Never pass `req.body` directly into ORM `.create()` or `.update()`. Explicitly pick allowed DTO fields via Zod `.strict()` so attackers cannot inject `role: "admin"` or `is_verified: true`.
-
----
-
-## 2. Secrets Management (KMS, HashiCorp Vault, Envelope Encryption & Rotation)
-
-1. **Envelope Encryption Architecture**:
-   - **KEK (Key Encryption Key)**: Master key stored inside hardware-backed **AWS KMS / Google Cloud KMS / HashiCorp Vault Transit Engine** (never leaves KMS).
-   - **DEK (Data Encryption Key)**: Generated per tenant or per batch, used locally for fast `AES-256-GCM` encryption, and stored encrypted (`encrypted_dek`) alongside the record.
-2. **Zero-Downtime Dual-Key Rotation**:
-   - Support an active key ring (`activeKeyVersion: 'v3'`, `decryptableVersions: ['v3', 'v2', 'v1']`).
-   - All new writes encrypt with `v3`; reads inspect the version prefix (`v2:...`) to decrypt seamlessly while a background job re-encrypts legacy `v1`/`v2` ciphertexts to `v3`.
-   - For API keys and webhook secrets: allow a configurable overlap window (e.g., 24 hours) where both the primary and secondary secret are accepted during rotation.
-
----
-
-## 3. Backup, Recovery & Disaster Recovery (PITR, RPO, RTO)
-
-| Tier | Workload | Target RPO (Max Data Loss) | Target RTO (Max Recovery Time) | Architecture |
-| :--- | :--- | :--- | :--- | :--- |
-| **Tier 1 (Mission Critical)** | Financial ledgers, payments, auth | `RPO = 0s` | `RTO < 60s` | Multi-AZ synchronous standby replica + continuous WAL archiving to immutable object storage (`pgBackRest` / `WAL-G`). |
-| **Tier 2 (Core Business)** | SaaS CRUD, orders, user profiles | `RPO < 5m` | `RTO < 15m` | Asynchronous streaming replica + continuous Point-In-Time Recovery (PITR) WAL shipping + daily base backups. |
-| **Tier 3 (Analytical / Derived)** | Search indexes, caches, rollups | Rebuildable from primary | `RTO < 1h` | Snapshot backups + automated rebuild from primary RDBMS. |
-
-- **Mandatory Backup Verification**: An untested backup is not a backup. Run an automated weekly CI/cron job that restores the latest base backup + WAL stream into an ephemeral container, runs `pg_amcheck` and invariant queries, and alerts if restoration fails or exceeds the RTO budget.
-
----
-
-## 4. Infrastructure Networking (DNS, Reverse Proxies, Load Balancers & Service Discovery)
-
-- **DNS & Traffic Routing**: Keep DNS TTLs low (`60s–300s`) on ingress records to allow rapid failover; configure `CAA` records to restrict certificate issuance and `SPF`/`DKIM`/`DMARC` on email domains.
-- **L4 vs. L7 Load Balancing**:
-  - **L4 (TCP/UDP / NLB)**: Ultra-low latency passthrough for high-throughput TCP/WebSocket/gRPC ingress.
-  - **L7 (HTTP/HTTPS / ALB / Envoy / Nginx)**: TLS termination, HTTP/2 & HTTP/3 multiplexing, WAF filtering, path/header routing, and connection draining on pod termination.
-- **Service Discovery & Zero-Trust Internal Networking**: Use Kubernetes DNS / Envoy Service Mesh with **mTLS (Mutual TLS)** and SPIFFE/SPIRE workload identities so internal service-to-service traffic is encrypted and authenticated inside the VPC.
-
----
-
-## 5. Microservices Architecture (Bounded Contexts, Communication & Data Ownership)
-
-1. **Database-per-Service Rule**: Never allow Service B to query or mutate Service A's database tables directly (shared-database coupling breaks independent deployment and schema evolution). Service A exposes versioned APIs or publishes domain events via its Transactional Outbox.
-2. **Synchronous vs. Asynchronous Communication**:
-   - **Synchronous (gRPC / Protobuf or REST)**: Use only when the caller requires an immediate read response; enforce strict deadlines/timeouts, circuit breakers, and hedging.
-   - **Asynchronous (Events / Queues)**: Prefer for cross-service state propagation and long-running workflows to prevent temporal coupling (if Service B is down for 2 minutes, Service A still succeeds).
-
----
-
-## 6. AI Backend Infrastructure (Model Gateways, Inference Queues & Streaming)
-
-When a backend powers AI features (LLM generation, embeddings, document analysis, agents):
-1. **Server-Side Model Gateway**:
-   - Centralize all LLM/model provider calls behind an internal server-side Gateway service (never expose `GEMINI_API_KEY` or provider credentials to the client).
-   - Implement provider fallback chains, prompt-version registries, and structured output validation (JSON Schema / Zod).
-2. **Token-Aware Rate Limiting & Cost Ledgers**:
-   - Rate-limit tenants by **Tokens Per Minute (TPM)** and **Daily Cost Budget (Minor Units)** in addition to Requests Per Minute (RPM).
-   - Record `input_tokens`, `output_tokens`, `cached_tokens`, `model_id`, and `latency_ms` in an append-only `ai_usage_ledger` table.
-3. **SSE Streaming & Async Inference Queues**:
-   - For interactive chat/completion: stream tokens via **SSE** with client disconnect propagation (`req.signal` aborts upstream model generation immediately if the user closes the tab).
-   - For heavy batch pipelines (document indexing, video generation, deep research): enqueue into a **BullMQ / Kafka Inference Queue** with concurrency caps matching provider quota limits.
-
----
-
-## 7. Data Governance (PII Taxonomy, Retention, Crypto-Shredding & Immutable Audit Trails)
-
-### PII Classification & GDPR Right-to-Erasure (Crypto-Shredding)
-- Classify every schema column (`PUBLIC`, `INTERNAL`, `CONFIDENTIAL_PII`, `RESTRICTED_FINANCIAL_HEALTH`).
-- **Crypto-Shredding for Immutable Logs/Backups**: Encrypt a user's PII fields with a per-user DEK stored in `user_encryption_keys`. When a user exercises GDPR Right to Erasure, anonymize mutable profile rows AND permanently destroy the user's DEK—rendering any historical PII in immutable backups or event logs permanently undecryptable without corrupting financial ledger integrity.
-
-### Tamper-Evident Keyed HMAC Hash-Chained Audit Trail
-For security, compliance, and admin actions, maintain an append-only hash-chained `audit_logs` table where each row signs the previous row's hash (`prev_hash`) using **length-prefixed canonical encoding** (preventing delimiter-collision forgery) and a **KMS-backed HMAC secret** (preventing rogue DBAs from rewriting the hash chain):
-
-```typescript
-import crypto from 'node:crypto';
-
 export function computeAuditChainHash(params: {
   auditHmacSecret: string;
   prevHashHex: string;
@@ -364,14 +576,27 @@ export function computeAuditChainHash(params: {
     params.payloadJson,
     params.createdAtIsoUtc,
   ];
-  // Length-prefixed encoding ("len:value;") eliminates delimiter collision attacks
-  const canonical = fields
-    .map((f) => `${Buffer.byteLength(f, 'utf8')}:${f};`)
-    .join('');
-
-  return crypto
-    .createHmac('sha256', params.auditHmacSecret)
-    .update(canonical, 'utf8')
-    .digest('hex');
+  const canonical = fields.map((f) => `${Buffer.byteLength(f, 'utf8')}:${f};`).join('');
+  return crypto.createHmac('sha256', params.auditHmacSecret).update(canonical, 'utf8').digest('hex');
 }
 ```
+
+---
+
+## 5. Verification & Test Requirements
+
+1. **SSRF Private IPv4, IPv6, Mapped IPv6, Mixed DNS & DNS Rebinding Tests (`TEST-14`, `TEST-15`, `TEST-16`)**:
+   - Assert `isPrivateOrReservedIp` blocks `127.0.0.1`, `10.0.0.1`, `169.254.169.254`, `::1`, `fe80::1`, `::ffff:169.254.169.254`, `::ffff:7f00:1`, `64:ff9b::a9fe:a9fe`, `2001:0000::1`, and `100::1`.
+   - Assert `resolveAndPinSafeTarget` rejects a domain that returns mixed public + private DNS records (`['93.184.216.34', '127.0.0.1']`).
+   - Assert `executePinnedSafeHttpsRequest` connects strictly to the pinned IP from the initial resolution without performing a second DNS lookup.
+2. **Redirect-Based SSRF, Non-HTTPS Scheme, Port & Oversized Response Tests (`TEST-17`)**:
+   - Assert that an HTTPS endpoint returning `302 Location: https://internal.example.com/` (resolving to `10.0.0.5` or `http://example.com/`) is blocked during redirect re-validation.
+   - Assert that responses exceeding `maxResponseBytes` or ports other than `443` fail closed.
+3. **CIDR Proxy IP Extraction Tests**:
+   - Assert that if `socketRemoteAddress` is `198.51.100.25` (outside `trustedProxyCidrs: ['10.0.0.0/8']`), `X-Forwarded-For: 1.2.3.4` is ignored and `198.51.100.25` is returned.
+   - Assert that malformed `X-Forwarded-For: 1.2.3.4, not-an-ip, 10.0.1.5` throws `MALFORMED_X_FORWARDED_FOR_CHAIN`.
+
+### Authoritative References
+- **OWASP Server-Side Request Forgery Prevention Cheat Sheet**: https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html
+- **Node.js `https.request` & `net.Socket` Lookup Documentation**: https://nodejs.org/api/https.html#httpsrequesturl-options-callback
+- **IANA IPv4 & IPv6 Special-Purpose Address Registries**: https://www.iana.org/assignments/iana-ipv6-special-registry/iana-ipv6-special-registry.xhtml

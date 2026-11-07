@@ -1,45 +1,20 @@
-# Module 04: APIs (REST & GraphQL), Versioning, OpenAPI Governance, Payments, Rate Limiting & Circuit Breakers
+# Module 04: APIs, Versioning, Fenced Payment Idempotency, Persistent Webhook Anti-Replay & Resilience
 
-This reference covers API contracts, versioning, OpenAPI/Swagger generation, payment gateway integrations, idempotency, rate limiting/throttling, and circuit breakers.
+This module provides production-grade implementations for RFC 9457 error boundaries, **fenced payment idempotency state machines with ambiguous timeout reconciliation**, **persistent database-backed webhook replay & out-of-order protection**, atomic Redis Lua token-bucket rate limiting, and half-open-gated circuit breakers.
 
 ---
 
-## 1. API Versioning, RFC 9457 Error Contracts & OpenAPI / Swagger Governance
+## 1. Threat Model, Trust Boundaries & Failure Behavior
 
-### URL & Header Versioning Strategy
-- **URL Namespace Versioning**: `/api/v1/orders`, `/api/v2/orders`.
-- **Deprecation Lifecycle Headers**: When a v1 endpoint is scheduled for retirement while old mobile clients still use it, inject:
-  ```http
-  Deprecation: @1798761600
-  Sunset: Thu, 31 Dec 2026 23:59:59 GMT
-  Link: <https://api.example.com/docs/migrations/v2>; rel="deprecation"
-  ```
+| Control | Threat / Failure Vector | Enforcement Location | Failure Behavior |
+| :--- | :--- | :--- | :--- |
+| **Payment Idempotency (`executeWithIdempotencyLock`)** | 1) TTL lock expires while Worker 1 is still running; Worker 2 acquires lock and charges a second time, or Worker 1 overwrites Worker 2's completed state.<br>2) Provider times out after receiving the charge request; naive retry issues a duplicate charge. | Application + PostgreSQL `idempotency_keys` table (`lock_owner`, monotonic `fencing_token`, lease heartbeat). | Rejects stale worker completion if `lock_owner` or `fencing_token` changed; transitions post-write timeouts to `UNKNOWN_RECONCILIATION_REQUIRED` and reconciles before any retry. |
+| **Webhook Anti-Replay (`verifyAndProcessWebhookIdempotently`)** | HMAC signature + 300s timestamp window alone allows an attacker or retrying proxy to replay a valid signed webhook hundreds of times inside the 5-minute window, or deliver older events out of order. | Ingress raw-body verifier + PostgreSQL `webhook_events` & aggregate version check. | Atomically records `(provider, provider_event_id)` in DB; ignores duplicates (`DUPLICATE_ALREADY_PROCESSED`) and stale out-of-order events (`OUT_OF_ORDER_STALE_EVENT_IGNORED`). |
+| **Error Boundary (`toSafeProblemDetailsResponse`)** | Returning raw `err.message` or `err.stack` leaks SQL table/constraint names and internal paths. | Global HTTP response boundary. | Exposes only `OperationalAppError` fields; masks unexpected errors as generic `500` correlated by `traceId`. |
 
-### Standard RFC 9457 Problem Details Error Response
-Never return inconsistent `{ error: "..." }` or `{ message: "..." }` shapes. Standardize all 4xx/5xx responses:
+---
 
-```json
-{
-  "type": "https://api.example.com/errors/validation-failed",
-  "title": "Request Validation Failed",
-  "status": 422,
-  "detail": "One or more fields failed validation.",
-  "instance": "/api/v1/orders",
-  "requestId": "019300e8-7c2a-7000-8b12-9a4f8c1d2e3f",
-  "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
-  "timestamp": "2026-11-05T16:26:45.000Z",
-  "errors": [
-    {
-      "field": "items[0].quantity",
-      "code": "TOO_SMALL",
-      "message": "Quantity must be greater than or equal to 1"
-    }
-  ]
-}
-```
-
-### Safe Error Boundary Serializer (Zero Stack-Trace or SQL Constraint Leakage)
-Never serialize raw `Error.stack`, database error codes/table names (`duplicate key value violates unique constraint "users_email_key"`), or internal file paths in HTTP responses. Only expose operational `AppError` details; mask all unexpected/internal exceptions as generic `500 Internal Server Error` while logging the full stack internally with `traceId`:
+## 2. API Versioning & Safe RFC 9457 Error Boundary Serializer
 
 ```typescript
 export class OperationalAppError extends Error {
@@ -88,8 +63,6 @@ export function toSafeProblemDetailsResponse(params: {
     };
   }
 
-  // Unexpected/internal error (e.g., PostgreSQL syntax/constraint error, Redis timeout, TypeError):
-  // Log full stack & DB metadata internally, but return an opaque 500 response to the client!
   params.logInternalError(params.error, {
     requestId: params.requestId,
     traceId: params.traceId,
@@ -114,35 +87,132 @@ export function toSafeProblemDetailsResponse(params: {
 
 ---
 
-## 2. Payment Endpoints, Atomic Idempotency State Machine & Signed Webhook Verification
+## 3. Remediated Payment Idempotency Engine (Fencing Tokens, Lease Renewal & Ambiguous Outcome Reconciliation)
 
-### Atomic Idempotency Middleware State Machine
-Every mutating financial or order endpoint (`POST /api/v1/payments/intents`, `POST /api/v1/refunds`, `POST /api/v1/orders`) MUST enforce an `Idempotency-Key` header using a single atomic `INSERT ... ON CONFLICT` state transition (never a race-prone `SELECT`-then-`INSERT`):
+### Why TTL Locks Without Fencing & Reconciliation Are Unsafe
+1. **Stale Worker Overwrite**: If Worker 1 pauses (GC pause or slow network) past `locked_until`, Worker 2 acquires the expired lock with `fencing_token = 2`. If Worker 1 wakes up and calls `completeLock` without checking `lock_owner` and `fencing_token`, Worker 1 overwrites Worker 2's state.
+2. **Ambiguous Provider Timeout Double-Charge**: If a payment gateway times out *after* the HTTP request body was sent, the charge may have succeeded on the provider side. Releasing the lock as `FAILED_TERMINAL` and letting the client retry with a new provider call causes a duplicate charge.
 
 ```sql
 CREATE TABLE idempotency_keys (
     tenant_id UUID NOT NULL,
     idempotency_key VARCHAR(128) NOT NULL,
     endpoint VARCHAR(128) NOT NULL,
-    request_hash CHAR(64) NOT NULL, -- SHA-256 of canonical request body
-    status VARCHAR(16) NOT NULL CHECK (status IN ('IN_PROGRESS', 'COMPLETED', 'FAILED')),
+    request_hash CHAR(64) NOT NULL,
+    provider_idempotency_key CHAR(64) NOT NULL,
+    status VARCHAR(40) NOT NULL CHECK (status IN (
+        'PENDING',
+        'SUCCEEDED',
+        'FAILED_TERMINAL',
+        'UNKNOWN_RECONCILIATION_REQUIRED'
+    )),
+    lock_owner VARCHAR(128) NULL,
+    fencing_token BIGINT NOT NULL DEFAULT 1,
+    locked_until TIMESTAMPTZ NOT NULL,
     response_status INT NULL,
     response_body JSONB NULL,
-    locked_until TIMESTAMPTZ NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     PRIMARY KEY (tenant_id, idempotency_key)
 );
+
+-- Atomic Lock Acquisition & Stale-Lease Takeover Query (Increments fencing_token monotonically):
+-- INSERT INTO idempotency_keys (tenant_id, idempotency_key, endpoint, request_hash, provider_idempotency_key, status, lock_owner, fencing_token, locked_until)
+-- VALUES ($1, $2, $3, $4, $5, 'PENDING', $6, 1, clock_timestamp() + ($7::int * interval '1 second'))
+-- ON CONFLICT (tenant_id, idempotency_key) DO UPDATE
+-- SET status = CASE
+--       WHEN idempotency_keys.status = 'UNKNOWN_RECONCILIATION_REQUIRED' THEN 'UNKNOWN_RECONCILIATION_REQUIRED'
+--       ELSE 'PENDING'
+--     END,
+--     lock_owner = EXCLUDED.lock_owner,
+--     fencing_token = idempotency_keys.fencing_token + 1,
+--     locked_until = EXCLUDED.locked_until,
+--     updated_at = clock_timestamp()
+-- WHERE idempotency_keys.request_hash = EXCLUDED.request_hash
+--   AND (
+--     idempotency_keys.status = 'FAILED_TERMINAL'
+--     OR (idempotency_keys.status IN ('PENDING', 'UNKNOWN_RECONCILIATION_REQUIRED') AND idempotency_keys.locked_until < clock_timestamp())
+--   )
+-- RETURNING fencing_token, status, provider_idempotency_key;
 ```
 
 ```typescript
 import crypto from 'node:crypto';
 
+export type IdempotencyRecordStatus =
+  | 'PENDING'
+  | 'SUCCEEDED'
+  | 'FAILED_TERMINAL'
+  | 'UNKNOWN_RECONCILIATION_REQUIRED';
+
 export interface IdempotencyRow {
   request_hash: string;
-  status: 'IN_PROGRESS' | 'COMPLETED' | 'FAILED';
+  provider_idempotency_key: string;
+  status: IdempotencyRecordStatus;
+  lock_owner: string | null;
+  fencing_token: bigint;
   response_status: number | null;
   response_body: Record<string, unknown> | null;
   is_lock_expired: boolean;
+}
+
+export class AmbiguousPaymentProviderTimeoutError extends Error {
+  public readonly isAmbiguousProviderOutcome = true;
+  constructor(message: string) {
+    super(message);
+  }
+}
+
+export interface FencedIdempotencyDbPort {
+  tryAcquireOrTakeoverExpiredLock(params: {
+    tenantId: string;
+    key: string;
+    endpoint: string;
+    reqHash: string;
+    providerIdempotencyKey: string;
+    lockOwnerToken: string;
+    ttlSeconds: number;
+  }): Promise<
+    | {
+        acquired: true;
+        fencingToken: bigint;
+        currentStatus: 'PENDING' | 'UNKNOWN_RECONCILIATION_REQUIRED';
+        providerIdempotencyKey: string;
+      }
+    | { acquired: false; existing: IdempotencyRow | null }
+  >;
+
+  renewLockLease(params: {
+    tenantId: string;
+    key: string;
+    lockOwnerToken: string;
+    fencingToken: bigint;
+    ttlSeconds: number;
+  }): Promise<boolean>;
+
+  completeLockConditionally(params: {
+    tenantId: string;
+    key: string;
+    lockOwnerToken: string;
+    fencingToken: bigint;
+    status: 'SUCCEEDED' | 'FAILED_TERMINAL';
+    responseStatus: number;
+    responseBody: Record<string, unknown>;
+  }): Promise<boolean>;
+
+  markUnknownReconciliationRequiredConditionally(params: {
+    tenantId: string;
+    key: string;
+    lockOwnerToken: string;
+    fencingToken: bigint;
+  }): Promise<boolean>;
+
+  releaseTerminalFailedLockConditionally(params: {
+    tenantId: string;
+    key: string;
+    lockOwnerToken: string;
+    fencingToken: bigint;
+  }): Promise<boolean>;
 }
 
 export async function executeWithIdempotencyLock(params: {
@@ -151,24 +221,21 @@ export async function executeWithIdempotencyLock(params: {
   endpoint: string;
   canonicalRequestBody: string;
   lockTtlSeconds?: number;
-  db: {
-    tryAcquireLock: (
-      tenantId: string,
-      key: string,
-      endpoint: string,
-      reqHash: string,
-      ttlSec: number
-    ) => Promise<{ acquired: boolean; existing?: IdempotencyRow }>;
-    completeLock: (
-      tenantId: string,
-      key: string,
-      status: number,
-      body: Record<string, unknown>
-    ) => Promise<void>;
-    releaseFailedLock: (tenantId: string, key: string) => Promise<void>;
-  };
-  handler: () => Promise<{ status: number; body: Record<string, unknown> }>;
-}): Promise<{ status: number; body: Record<string, unknown>; replayed: boolean }> {
+  db: FencedIdempotencyDbPort;
+  reconcileAmbiguousPayment?: (
+    providerIdempotencyKey: string,
+    signal: AbortSignal
+  ) => Promise<
+    | { resolved: 'SUCCEEDED'; status: number; body: Record<string, unknown> }
+    | { resolved: 'NOT_FOUND_SAFE_TO_EXECUTE' }
+    | { resolved: 'STILL_UNKNOWN' }
+  >;
+  handler: (ctx: {
+    providerIdempotencyKey: string;
+    fencingToken: bigint;
+    signal: AbortSignal;
+  }) => Promise<{ status: number; body: Record<string, unknown> }>;
+}): Promise<{ status: number; body: Record<string, unknown>; replayed: boolean; fencingToken?: bigint }> {
   if (!params.idempotencyKey || !/^[a-zA-Z0-9_.:-]{8,128}$/.test(params.idempotencyKey)) {
     throw new OperationalAppError(
       400,
@@ -183,13 +250,24 @@ export async function executeWithIdempotencyLock(params: {
     .update(`${params.endpoint}:${params.canonicalRequestBody}`, 'utf8')
     .digest('hex');
 
-  const lockRes = await params.db.tryAcquireLock(
-    params.tenantId,
-    params.idempotencyKey,
-    params.endpoint,
+  // Stable deterministic provider-side idempotency key bound to tenant + endpoint + client key
+  const providerIdempotencyKey = crypto
+    .createHash('sha256')
+    .update(`provider:${params.tenantId}:${params.endpoint}:${params.idempotencyKey}`, 'utf8')
+    .digest('hex');
+
+  const lockOwnerToken = crypto.randomUUID();
+  const ttlSeconds = params.lockTtlSeconds ?? 30;
+
+  const lockRes = await params.db.tryAcquireOrTakeoverExpiredLock({
+    tenantId: params.tenantId,
+    key: params.idempotencyKey,
+    endpoint: params.endpoint,
     reqHash,
-    params.lockTtlSeconds ?? 60
-  );
+    providerIdempotencyKey,
+    lockOwnerToken,
+    ttlSeconds,
+  });
 
   if (!lockRes.acquired) {
     const ex = lockRes.existing;
@@ -209,49 +287,186 @@ export async function executeWithIdempotencyLock(params: {
         'The same Idempotency-Key was reused with different request parameters.'
       );
     }
-    if (ex.status === 'COMPLETED' && ex.response_status !== null && ex.response_body !== null) {
+    if (ex.status === 'SUCCEEDED' && ex.response_status !== null && ex.response_body !== null) {
       return {
         status: ex.response_status,
         body: ex.response_body,
         replayed: true,
+        fencingToken: ex.fencing_token,
       };
     }
-    // CRITICAL: Never fall through to params.handler() when !lockRes.acquired!
-    // Even if an earlier lock expired or failed, the caller must atomically claim ownership inside tryAcquireLock
-    // (INSERT ... ON CONFLICT DO UPDATE ... WHERE status = 'FAILED' OR locked_until < clock_timestamp()).
+    if (ex.status === 'UNKNOWN_RECONCILIATION_REQUIRED') {
+      throw new OperationalAppError(
+        409,
+        'payment-reconciliation-in-progress',
+        'Payment Outcome Reconciliation Required',
+        'Previous payment attempt experienced an ambiguous provider timeout and is being reconciled. Do not issue a new key.'
+      );
+    }
     throw new OperationalAppError(
       409,
       'request-in-flight',
       'Concurrent Request In Flight',
-      'A request with this Idempotency-Key is currently being processed or being reclaimed. Retry after 2 seconds.'
+      'A request with this Idempotency-Key is currently being processed.'
     );
   }
 
+  const { fencingToken, currentStatus } = lockRes;
+  const abortController = new AbortController();
+  const heartbeatIntervalMs = Math.max(250, Math.floor((ttlSeconds * 1000) / 3));
+
+  const heartbeatTimer = setInterval(async () => {
+    try {
+      const renewed = await params.db.renewLockLease({
+        tenantId: params.tenantId,
+        key: params.idempotencyKey,
+        lockOwnerToken,
+        fencingToken,
+        ttlSeconds,
+      });
+      if (!renewed) {
+        abortController.abort(new Error('IDEMPOTENCY_LEASE_LOST'));
+      }
+    } catch {
+      abortController.abort(new Error('IDEMPOTENCY_LEASE_RENEWAL_ERROR'));
+    }
+  }, heartbeatIntervalMs);
+
   try {
-    const result = await params.handler();
-    await params.db.completeLock(
-      params.tenantId,
-      params.idempotencyKey,
-      result.status,
-      result.body
-    );
-    return { ...result, replayed: false };
+    // If recovering an UNKNOWN_RECONCILIATION_REQUIRED lock after lease expiry, reconcile FIRST!
+    if (currentStatus === 'UNKNOWN_RECONCILIATION_REQUIRED') {
+      if (!params.reconcileAmbiguousPayment) {
+        throw new OperationalAppError(
+          409,
+          'payment-reconciliation-required',
+          'Ambiguous Payment Outcome Requires Reconciliation',
+          'Cannot automatically re-run handler without reconciling prior ambiguous provider state.'
+        );
+      }
+      const recon = await params.reconcileAmbiguousPayment(
+        lockRes.providerIdempotencyKey,
+        abortController.signal
+      );
+      if (recon.resolved === 'SUCCEEDED') {
+        const committed = await params.db.completeLockConditionally({
+          tenantId: params.tenantId,
+          key: params.idempotencyKey,
+          lockOwnerToken,
+          fencingToken,
+          status: 'SUCCEEDED',
+          responseStatus: recon.status,
+          responseBody: recon.body,
+        });
+        if (!committed) {
+          throw new Error('IDEMPOTENCY_FENCING_TOKEN_REJECTED_STALE_OWNER');
+        }
+        return { status: recon.status, body: recon.body, replayed: true, fencingToken };
+      }
+      if (recon.resolved === 'STILL_UNKNOWN') {
+        await params.db.markUnknownReconciliationRequiredConditionally({
+          tenantId: params.tenantId,
+          key: params.idempotencyKey,
+          lockOwnerToken,
+          fencingToken,
+        });
+        throw new OperationalAppError(
+          503,
+          'payment-reconciliation-pending',
+          'Payment Reconciliation Still Pending',
+          'Provider status is still indeterminate; please retry with the same Idempotency-Key shortly.'
+        );
+      }
+      // resolved === 'NOT_FOUND_SAFE_TO_EXECUTE': provider confirmed prior call never arrived; safe to execute below
+    }
+
+    const result = await params.handler({
+      providerIdempotencyKey: lockRes.providerIdempotencyKey,
+      fencingToken,
+      signal: abortController.signal,
+    });
+
+    if (abortController.signal.aborted) {
+      throw new Error('IDEMPOTENCY_FENCING_TOKEN_REJECTED_STALE_OWNER');
+    }
+
+    const committed = await params.db.completeLockConditionally({
+      tenantId: params.tenantId,
+      key: params.idempotencyKey,
+      lockOwnerToken,
+      fencingToken,
+      status: 'SUCCEEDED',
+      responseStatus: result.status,
+      responseBody: result.body,
+    });
+
+    if (!committed) {
+      throw new Error('IDEMPOTENCY_FENCING_TOKEN_REJECTED_STALE_OWNER');
+    }
+
+    return { ...result, replayed: false, fencingToken };
   } catch (err) {
-    await params.db.releaseFailedLock(params.tenantId, params.idempotencyKey);
+    if (
+      err instanceof AmbiguousPaymentProviderTimeoutError ||
+      (err instanceof Error && 'isAmbiguousProviderOutcome' in err)
+    ) {
+      // CRITICAL: Never release lock as FAILED_TERMINAL when provider outcome is ambiguous!
+      await params.db.markUnknownReconciliationRequiredConditionally({
+        tenantId: params.tenantId,
+        key: params.idempotencyKey,
+        lockOwnerToken,
+        fencingToken,
+      });
+      throw err;
+    }
+
+    if (!(err instanceof Error && err.message === 'IDEMPOTENCY_FENCING_TOKEN_REJECTED_STALE_OWNER')) {
+      await params.db.releaseTerminalFailedLockConditionally({
+        tenantId: params.tenantId,
+        key: params.idempotencyKey,
+        lockOwnerToken,
+        fencingToken,
+      });
+    }
     throw err;
+  } finally {
+    clearInterval(heartbeatTimer);
   }
 }
 ```
 
-### Cryptographic Payment Webhook Verification (Anti-Replay + Constant-Time HMAC)
+---
+
+## 4. Persistent Webhook Anti-Replay, Signature Verification & Out-of-Order Guard
+
+### Why Signature + Timestamp Verification Alone Does Not Prevent Replay
+Validating `t=<timestamp>,v1=<hmac>` within $\pm 300\text{s}$ proves only that the payload was signed by the provider within the last 5 minutes. If a webhook is delivered twice (or replayed by an attacker within that 300-second window), signature verification will succeed both times!
+- **Mandatory Control**: Combine raw-body HMAC verification with **atomic persistent event deduplication** (`UNIQUE (provider, provider_event_id)` in PostgreSQL) AND **monotonic entity event timestamp/version ordering** so delayed out-of-order webhooks never overwrite newer state.
+
+```sql
+CREATE TABLE webhook_events (
+    provider VARCHAR(32) NOT NULL,
+    provider_event_id VARCHAR(128) NOT NULL,
+    event_type VARCHAR(128) NOT NULL,
+    entity_id VARCHAR(128) NOT NULL,
+    provider_created_at_sec BIGINT NOT NULL,
+    payload_sha256 CHAR(64) NOT NULL,
+    status VARCHAR(24) NOT NULL CHECK (status IN ('PROCESSING', 'PROCESSED', 'FAILED_RETRYABLE')),
+    lock_owner VARCHAR(128) NULL,
+    locked_until TIMESTAMPTZ NOT NULL,
+    processed_at TIMESTAMPTZ NULL,
+    PRIMARY KEY (provider, provider_event_id)
+);
+```
+
 ```typescript
 export function verifyWebhookSignature(params: {
   rawBodyBuffer: Buffer;
-  signatureHeader: string; // Supports multiple v1 signatures during secret rotation: "t=1762388805,v1=sig1,v1=sig2"
-  webhookSecrets: string[]; // Supports active + retiring webhook secrets
+  signatureHeader: string;
+  webhookSecrets: string[];
   toleranceSeconds?: number;
-}): { valid: boolean; reason?: string } {
-  const tolerance = params.toleranceSeconds ?? 300; // 5 minutes max replay window
+  nowMs?: number;
+}): { valid: boolean; reason?: string; timestampSec?: number } {
+  const tolerance = params.toleranceSeconds ?? 300;
   if (!params.signatureHeader || params.webhookSecrets.length === 0) {
     return { valid: false, reason: 'MISSING_SIGNATURE_OR_SECRET' };
   }
@@ -272,7 +487,7 @@ export function verifyWebhookSignature(params: {
     return { valid: false, reason: 'MALFORMED_SIGNATURE_HEADER' };
   }
 
-  const nowSec = Math.floor(Date.now() / 1000);
+  const nowSec = Math.floor((params.nowMs ?? Date.now()) / 1000);
   if (Math.abs(nowSec - timestampSec) > tolerance) {
     return { valid: false, reason: 'TIMESTAMP_OUTSIDE_TOLERANCE_WINDOW' };
   }
@@ -304,23 +519,151 @@ export function verifyWebhookSignature(params: {
     return { valid: false, reason: 'SIGNATURE_MISMATCH' };
   }
 
-  return { valid: true };
+  return { valid: true, timestampSec };
+}
+
+export interface PersistentWebhookStore {
+  /**
+   * Atomically claims (provider, providerEventId) in PostgreSQL.
+   */
+  claimWebhookEvent(params: {
+    provider: string;
+    providerEventId: string;
+    eventType: string;
+    entityId: string;
+    providerCreatedAtSec: number;
+    payloadSha256: string;
+    lockOwner: string;
+    leaseSeconds: number;
+  }): Promise<
+    | { claimStatus: 'CLAIMED' }
+    | { claimStatus: 'DUPLICATE_ALREADY_PROCESSED' }
+    | { claimStatus: 'IN_FLIGHT_CONCURRENT' }
+  >;
+
+  /**
+   * Executes inside a single DB transaction: checks whether providerCreatedAtSec >= entity's
+   * last_webhook_created_at_sec, applies the domain mutation if newer, and marks the webhook PROCESSED.
+   */
+  applyOrderedDomainEffectAndMarkProcessed(params: {
+    provider: string;
+    providerEventId: string;
+    entityId: string;
+    providerCreatedAtSec: number;
+    lockOwner: string;
+    applyEffect: () => Promise<void>;
+  }): Promise<'APPLIED_AND_PROCESSED' | 'OUT_OF_ORDER_STALE_EVENT_IGNORED'>;
+
+  markWebhookFailedRetryable(params: {
+    provider: string;
+    providerEventId: string;
+    lockOwner: string;
+  }): Promise<void>;
+}
+
+export async function verifyAndProcessWebhookIdempotently(params: {
+  provider: string;
+  rawBodyBuffer: Buffer;
+  signatureHeader: string;
+  webhookSecrets: string[];
+  store: PersistentWebhookStore;
+  parseEventEnvelope: (rawJson: string) => {
+    providerEventId: string;
+    eventType: string;
+    entityId: string;
+    providerCreatedAtSec: number;
+  };
+  applyDomainEffect: () => Promise<void>;
+  toleranceSeconds?: number;
+  nowMs?: number;
+}): Promise<{
+  outcome:
+    | 'PROCESSED'
+    | 'DUPLICATE_ALREADY_PROCESSED'
+    | 'OUT_OF_ORDER_STALE_EVENT_IGNORED'
+    | 'IN_FLIGHT_CONCURRENT';
+}> {
+  // 1. Cryptographic signature & timestamp verification against exact rawBodyBuffer
+  const sigVerdict = verifyWebhookSignature({
+    rawBodyBuffer: params.rawBodyBuffer,
+    signatureHeader: params.signatureHeader,
+    webhookSecrets: params.webhookSecrets,
+    toleranceSeconds: params.toleranceSeconds,
+    nowMs: params.nowMs,
+  });
+
+  if (!sigVerdict.valid) {
+    throw new OperationalAppError(
+      401,
+      'webhook-signature-invalid',
+      'Invalid Webhook Signature',
+      `Webhook verification failed: ${sigVerdict.reason ?? 'UNKNOWN'}`
+    );
+  }
+
+  const envelope = params.parseEventEnvelope(params.rawBodyBuffer.toString('utf8'));
+  if (!envelope.providerEventId || !envelope.entityId) {
+    throw new OperationalAppError(
+      400,
+      'webhook-malformed-envelope',
+      'Malformed Webhook Envelope',
+      'Webhook payload is missing required id or entity identifier.'
+    );
+  }
+
+  const payloadSha256 = crypto.createHash('sha256').update(params.rawBodyBuffer).digest('hex');
+  const lockOwner = crypto.randomUUID();
+
+  // 2. Atomic persistent claim in PostgreSQL (defeats replay inside the 300s window & concurrent deliveries)
+  const claim = await params.store.claimWebhookEvent({
+    provider: params.provider,
+    providerEventId: envelope.providerEventId,
+    eventType: envelope.eventType,
+    entityId: envelope.entityId,
+    providerCreatedAtSec: envelope.providerCreatedAtSec,
+    payloadSha256,
+    lockOwner,
+    leaseSeconds: 30,
+  });
+
+  if (claim.claimStatus === 'DUPLICATE_ALREADY_PROCESSED') {
+    return { outcome: 'DUPLICATE_ALREADY_PROCESSED' };
+  }
+  if (claim.claimStatus === 'IN_FLIGHT_CONCURRENT') {
+    return { outcome: 'IN_FLIGHT_CONCURRENT' };
+  }
+
+  // 3. Apply domain mutation with out-of-order protection and mark PROCESSED atomically
+  try {
+    const res = await params.store.applyOrderedDomainEffectAndMarkProcessed({
+      provider: params.provider,
+      providerEventId: envelope.providerEventId,
+      entityId: envelope.entityId,
+      providerCreatedAtSec: envelope.providerCreatedAtSec,
+      lockOwner,
+      applyEffect: params.applyDomainEffect,
+    });
+
+    if (res === 'OUT_OF_ORDER_STALE_EVENT_IGNORED') {
+      return { outcome: 'OUT_OF_ORDER_STALE_EVENT_IGNORED' };
+    }
+    return { outcome: 'PROCESSED' };
+  } catch (err) {
+    await params.store.markWebhookFailedRetryable({
+      provider: params.provider,
+      providerEventId: envelope.providerEventId,
+      lockOwner,
+    });
+    throw err;
+  }
 }
 ```
 
 ---
 
-## 3. Distributed Rate Limiting & Throttling (Atomic Redis Token Bucket Lua Script)
-
-Never implement rate limiting with separate `GET` and `SET` calls (race conditions allow bursts under concurrency). Execute an atomic Redis Lua script with strict input bounds:
+## 5. Distributed Rate Limiting (Atomic Redis Token Bucket Lua Script)
 
 ```lua
--- KEYS[1] = rate limit bucket key (e.g., "rl:login:ip:203.0.113.5")
--- ARGV[1] = capacity (max burst tokens, e.g., 10)
--- ARGV[2] = refill_rate_per_ms (tokens added per millisecond, MUST be > 0)
--- ARGV[3] = now_ms (current timestamp in milliseconds)
--- ARGV[4] = requested_tokens (usually 1)
-
 local key = KEYS[1]
 local capacity = tonumber(ARGV[1])
 local refill_rate = tonumber(ARGV[2])
@@ -363,20 +706,18 @@ return { allowed, math.floor(tokens), retry_after_ms }
 
 ---
 
-## 4. Circuit Breaker Pattern (With Half-Open Probe Concurrency Gate)
-
-Wrap every outbound third-party call (payment gateway, KYC provider, shipping carrier, SMS gateway) in a stateful Circuit Breaker with hard timeouts AND a **Half-Open Probe Concurrency Cap** (`halfOpenMaxConcurrentProbes`) so 500 concurrent requests do not stampede a recovering downstream service the instant `openCooldownMs` elapses:
+## 6. Circuit Breaker Pattern (With Half-Open Probe Concurrency Gate)
 
 ```typescript
 export type CircuitState = 'CLOSED' | 'OPEN' | 'HALF_OPEN';
 
 export interface CircuitBreakerOptions {
   name: string;
-  failureThreshold: number;            // e.g., 5 consecutive failures
-  successThreshold: number;            // e.g., 2 successes in HALF_OPEN to close
-  openCooldownMs: number;              // e.g., 30_000ms (30s) before testing HALF_OPEN
-  requestTimeoutMs: number;            // e.g., 3_500ms hard timeout per call
-  halfOpenMaxConcurrentProbes?: number; // Default 1 (prevents Half-Open thundering herd!)
+  failureThreshold: number;
+  successThreshold: number;
+  openCooldownMs: number;
+  requestTimeoutMs: number;
+  halfOpenMaxConcurrentProbes?: number;
 }
 
 export class CircuitBreaker {
@@ -455,3 +796,19 @@ export class CircuitBreaker {
 }
 ```
 
+---
+
+## 7. Verification & Test Requirements
+
+1. **Concurrent Duplicate Payment Request & Stale Worker Fencing (`TEST-09`, `TEST-10`)**:
+   - Worker 1 acquires lock (`fencingToken = 1`), its lease expires, and Worker 2 takes over the lock (`fencingToken = 2`) and completes. When Worker 1 subsequently calls `completeLockConditionally` with `fencingToken = 1`, it is rejected with `IDEMPOTENCY_FENCING_TOKEN_REJECTED_STALE_OWNER`.
+2. **Ambiguous Payment Provider Timeout & Reconciliation (`TEST-11`)**:
+   - Handler throws `AmbiguousPaymentProviderTimeoutError`. Row transitions to `UNKNOWN_RECONCILIATION_REQUIRED` (not `FAILED_TERMINAL`). A subsequent retry after lease expiry invokes `reconcileAmbiguousPayment(providerIdempotencyKey)` and returns the reconciled `SUCCEEDED` charge without calling `handler` a second time.
+3. **Webhook Replay Inside Timestamp Window, Concurrent Delivery & Out-of-Order Events (`TEST-12`, `TEST-13`)**:
+   - Delivering the exact same valid signed webhook twice within the 300s tolerance window executes `applyDomainEffect` once (`PROCESSED`) and returns `DUPLICATE_ALREADY_PROCESSED` on the second delivery.
+   - Delivering an older webhook (`providerCreatedAtSec: 1000`) after a newer webhook (`providerCreatedAtSec: 2000`) returns `OUT_OF_ORDER_STALE_EVENT_IGNORED`.
+
+### Authoritative References
+- **RFC 9457 — Problem Details for HTTP APIs**: https://datatracker.ietf.org/doc/html/rfc9457
+- **IETF Draft — `Idempotency-Key` HTTP Header Field**: https://datatracker.ietf.org/doc/html/draft-ietf-httpapi-idempotency-key-header
+- **Stripe Webhook Signature & Replay Prevention Best Practices**: https://docs.stripe.com/webhooks/signatures

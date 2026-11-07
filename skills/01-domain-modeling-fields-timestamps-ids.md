@@ -1,32 +1,72 @@
-# Module 01: Domain Modeling, Financial Engine, Timestamps & Cryptographic Generators
+# Module 01: Domain Modeling, Financial Engine, Timestamps, OTPs & Composable Business Logic
 
-This reference provides production-grade implementations for domain modeling, strict field-type logic, currency-aware financial calculations (with exact prorated discount reconciliation, GST/VAT inclusive/exclusive policies, and partial refunds/credit notes), strict UTC vs. offset timestamps, and CSPRNG generators.
+This module provides production-grade TypeScript implementations for domain validation, currency-aware financial engines (with PostgreSQL `BIGINT` bounds checking, jurisdiction-configurable tax rounding, exact Largest-Remainder proration, and partial refund credit notes), atomic one-time OTP verification with attempt throttling, deterministic state machines, and atomic tenant-verified double-entry accounting journals.
 
 ---
 
-## 1. Field Type Logic Design & Validation Engine (TypeScript + Zod)
+## 1. Threat Model, Trust Boundaries & Failure Behavior
+
+| Boundary / Component | Threat / Exploit Vector | Enforcement Location | Failure Behavior |
+| :--- | :--- | :--- | :--- |
+| **Currency Registry (`CURRENCY_EXPONENTS_MAP`)** | Passing `"toString"`, `"constructor"`, or `"__proto__"` as `currencyCode` passes `code in CURRENCY_EXPONENTS` on plain objects via `Object.prototype` inheritance. | Domain boundary & schema validation (`Map.has()`). | Rejects immediately with `UNSUPPORTED_CURRENCY_CODE`. |
+| **PostgreSQL `BIGINT` Arithmetic** | Unbounded JavaScript `BigInt` (`10n ** 30n`) passes JS math but overflows signed 64-bit PostgreSQL `BIGINT` (`-2^63 .. 2^63 - 1`) at DB write time. | Domain boundary & post-calculation invariant (`assertPgBigIntRange`). | Rejects with `PG_BIGINT_OVERFLOW_REJECTED` before touching DB. |
+| **OTP Verification & Consumption** | 1) Passing `expiresAt = undefined` or `new Date('invalid')` (`Date.now() > NaN === false`) bypasses expiry forever.<br>2) Non-atomic verify-then-update allows concurrent replay of the same 6-digit OTP.<br>3) Missing attempt counter allows brute-forcing $10^6$ codes. | Server-side persistence transaction (`verifyAndConsumeOtpAtomically`). | Fails closed on missing/invalid `expiresAt`; locks OTP after `maxAttempts` (default 5); marks `CONSUMED` atomically on match. |
+| **Double-Entry Journal Persistence** | 1) `if (dir === 'DEBIT') ... else` treats typos (`'DEBT'`) as `'CREDIT'`.<br>2) Posting to an `accountId` owned by another tenant corrupts cross-tenant balances.<br>3) Validating in memory without atomic persistence + `UNIQUE (tenant_id, idempotency_key)` allows duplicate postings. | Transactional persistence boundary (`persistBalancedJournalAtomically`). | Rolls back transaction on unknown direction, cross-tenant account, currency mismatch, or duplicate `idempotency_key`. |
+
+---
+
+## 2. Field Type Logic Design, `Map`-Backed Currency Registry & PostgreSQL `BIGINT` Bounds
 
 ```typescript
 import { z } from 'zod';
 
 /**
- * ISO-4217 Currency Exponent Registry:
- * Defines how many decimal places (minor unit exponent) each currency uses.
- * - 0 decimals: JPY, KRW, VND, CLP, ISK
- * - 2 decimals: USD, EUR, GBP, INR, CAD, AUD, SGD, CHF
- * - 3 decimals: BHD, KWD, OMR, JOD, TND
+ * Signed 64-bit PostgreSQL BIGINT limits (-9,223,372,036,854,775,808 to +9,223,372,036,854,775,807).
+ * We also enforce a safe pre-multiplication ceiling (PG_BIGINT_SAFE_AMOUNT_MAX = 10^15 minor units)
+ * on individual monetary inputs so intermediate multiplication by 10_000n basis points never overflows.
  */
-export const CURRENCY_EXPONENTS: Record<string, 0 | 2 | 3> = {
-  JPY: 0, KRW: 0, VND: 0, CLP: 0, ISK: 0,
-  USD: 2, EUR: 2, GBP: 2, INR: 2, CAD: 2, AUD: 2, SGD: 2, CHF: 2,
-  BHD: 3, KWD: 3, OMR: 3, JOD: 3, TND: 3,
-};
+export const PG_BIGINT_MIN = -9_223_372_036_854_775_808n;
+export const PG_BIGINT_MAX = 9_223_372_036_854_775_807n;
+export const PG_BIGINT_SAFE_INPUT_MAX = 900_000_000_000_000n; // 9 * 10^14 minor units ($9 trillion)
+
+export function assertPgBigIntRange(
+  value: bigint,
+  fieldName: string,
+  options: { allowNegative?: boolean; maxSafeInput?: boolean } = {}
+): void {
+  const minAllowed = options.allowNegative ? PG_BIGINT_MIN : 0n;
+  const maxAllowed = options.maxSafeInput ? PG_BIGINT_SAFE_INPUT_MAX : PG_BIGINT_MAX;
+  if (value < minAllowed || value > maxAllowed) {
+    throw new Error(
+      `PG_BIGINT_RANGE_ERROR: Field "${fieldName}" (${value.toString()}) is outside allowed range [${minAllowed.toString()}, ${maxAllowed.toString()}]`
+    );
+  }
+}
+
+/**
+ * ISO-4217 Currency Exponent Registry stored in an immutable Map (never a plain object with 'in' checks,
+ * which is vulnerable to Object.prototype property names like "toString", "valueOf", or "constructor").
+ */
+export const CURRENCY_EXPONENTS_MAP: ReadonlyMap<string, 0 | 2 | 3> = new Map<string, 0 | 2 | 3>([
+  ['JPY', 0], ['KRW', 0], ['VND', 0], ['CLP', 0], ['ISK', 0],
+  ['USD', 2], ['EUR', 2], ['GBP', 2], ['INR', 2], ['CAD', 2], ['AUD', 2], ['SGD', 2], ['CHF', 2],
+  ['BHD', 3], ['KWD', 3], ['OMR', 3], ['JOD', 3], ['TND', 3],
+]);
+
+export function getCurrencyExponentStrict(currencyCode: string): 0 | 2 | 3 {
+  if (typeof currencyCode !== 'string' || !/^[A-Z]{3}$/.test(currencyCode)) {
+    throw new Error(`UNSUPPORTED_CURRENCY_CODE: "${String(currencyCode)}" is not a valid 3-letter ISO-4217 code`);
+  }
+  const exponent = CURRENCY_EXPONENTS_MAP.get(currencyCode);
+  if (exponent === undefined) {
+    throw new Error(`UNSUPPORTED_CURRENCY_CODE: "${currencyCode}" is not in the supported currency registry`);
+  }
+  return exponent;
+}
 
 export const FieldSchemas = {
-  // UUIDv7 or UUIDv4 identifier
   id: z.string().uuid({ message: 'Invalid UUID identifier' }),
 
-  // Normalized Email: NFKC normalized, trimmed, lowercased, max 254 chars (RFC 5321)
   email: z
     .string()
     .trim()
@@ -35,86 +75,69 @@ export const FieldSchemas = {
     .transform((v) => v.normalize('NFKC').toLowerCase())
     .pipe(z.string().email()),
 
-  // E.164 Phone Number (+14155552671)
   e164Phone: z
     .string()
     .trim()
     .regex(/^\+[1-9]\d{6,14}$/, 'Phone must be in E.164 format (e.g. +14155552671)'),
 
-  // ISO-4217 Currency Code
   currencyCode: z
     .string()
     .trim()
     .toUpperCase()
-    .refine((code) => code in CURRENCY_EXPONENTS, {
+    .refine((code) => /^[A-Z]{3}$/.test(code) && CURRENCY_EXPONENTS_MAP.has(code), {
       message: 'Unsupported or invalid ISO-4217 currency code',
     }),
 
-  // Non-negative Monetary Minor Units (cents/paise/fils as integer or BigInt string)
   nonNegativeMoneyMinor: z
-    .union([z.number().int().nonnegative().safe(), z.string().regex(/^\d+$/)])
-    .transform((v) => BigInt(v)),
+    .union([z.number().int().nonnegative().safe(), z.string().regex(/^\d{1,19}$/)])
+    .transform((v) => BigInt(v))
+    .refine((val) => val >= 0n && val <= PG_BIGINT_SAFE_INPUT_MAX, {
+      message: 'Monetary amount exceeds safe PostgreSQL BIGINT bounds',
+    }),
 
-  // Signed Monetary Minor Units (for ledger adjustments or credit notes)
   signedMoneyMinor: z
-    .union([z.number().int().safe(), z.string().regex(/^-?\d+$/)])
-    .transform((v) => BigInt(v)),
+    .union([z.number().int().safe(), z.string().regex(/^-?\d{1,19}$/)])
+    .transform((v) => BigInt(v))
+    .refine((val) => val >= -PG_BIGINT_SAFE_INPUT_MAX && val <= PG_BIGINT_SAFE_INPUT_MAX, {
+      message: 'Signed monetary amount exceeds safe PostgreSQL BIGINT bounds',
+    }),
 
-  // Standard Percentage Basis Points: strictly 0 to 10,000 (0.00% to 100.00%)
   percentageBasisPoints: z
     .number()
     .int()
     .min(0, 'Basis points cannot be negative')
     .max(10_000, 'Percentage basis points cannot exceed 10,000 (100.00%)'),
 
-  // Strict UTC ISO-8601 Timestamp: MUST end with literal 'Z' (no arbitrary timezone offsets allowed)
   strictIsoUtcTimestamp: z
     .string()
     .datetime({ offset: false, message: 'Timestamp must be strict UTC ending with Z' }),
 
-  // Offset-Aware ISO-8601 Timestamp normalized to canonical UTC on ingest
   isoTimestampNormalizedToUtc: z
     .string()
     .datetime({ offset: true })
-    .transform((v) => new Date(v).toISOString()),
-
-  // IANA Timezone Identifier (e.g., "America/New_York", "Asia/Kolkata")
-  ianaTimezone: z.string().refine(
-    (tz) => {
-      try {
-        Intl.DateTimeFormat(undefined, { timeZone: tz });
-        return true;
-      } catch {
-        return false;
+    .transform((v) => {
+      const parsed = new Date(v);
+      if (Number.isNaN(parsed.getTime())) {
+        throw new Error('Invalid ISO timestamp');
       }
-    },
-    { message: 'Invalid IANA timezone identifier' }
-  ),
+      return parsed.toISOString();
+    }),
 };
 ```
 
 ---
 
-## 2. Deterministic Financial Calculation Engine (Exact Proration, GST/VAT Inclusive/Exclusive & Refunds)
+## 3. Deterministic Financial Engine (Jurisdiction Tax Rounding, Proration & Credit Notes)
 
-### Key Financial Engineering Invariants
-1. **Strict Input Validation**: Reject negative quantities, negative unit prices, discount basis points outside `[0, 10_000]`, tax rates outside `[0, 10_000]`, or negative shipping amounts.
-2. **Zero Penny-Drift Prorated Discount Reconciliation**:
-   - When an order-level discount (`totalDiscountMinor`) is prorated across multiple line items, independently rounding each line's share can produce a sum that differs from `totalDiscountMinor` by $1..N$ minor units.
-   - **Solution (Largest Remainder Allocation)**:
-     1. Compute exact floor share for each line: $\text{floorShare}_i = \lfloor \frac{\text{lineGross}_i \times \text{totalDiscount}}{\text{subtotal}} \rfloor$
-     2. Compute exact remainder for each line: $\text{rem}_i = (\text{lineGross}_i \times \text{totalDiscount}) \bmod \text{subtotal}$
-     3. Compute leftover minor units: $\Delta = \text{totalDiscount} - \sum \text{floorShare}_i$
-     4. Sort lines by $\text{rem}_i$ descending (breaking ties deterministically by line index) and add `1n` minor unit to the top $\Delta$ lines.
-     5. Guarantee: $\sum_{i} \text{allocatedDiscount}_i \equiv \text{totalDiscountMinor}$ with zero discrepancy.
-3. **Tax / GST Exclusive vs. Inclusive Policies**:
-   - `TAX_EXCLUSIVE`: Unit price is net of tax. $\text{LineTax} = \text{roundHalfEven}(\frac{\text{LineNetAfterDiscount} \times \text{taxRateBps}}{10000})$.
-   - `TAX_INCLUSIVE` (common in GST/VAT jurisdictions like EU, UK, India, Australia): Unit price already includes tax. After subtracting the prorated gross discount ($\text{LineGrossAfterDiscount}$), extract the embedded tax:
-     $$\text{LineNet} = \text{roundHalfEven}\left(\frac{\text{LineGrossAfterDiscount} \times 10000}{10000 + \text{taxRateBps}}\right)$$
-     $$\text{LineTax} = \text{LineGrossAfterDiscount} - \text{LineNet}$$
+### Jurisdiction-Specific Tax Rounding Rules
+Tax authorities do **not** mandate a single universal rounding rule across all jurisdictions:
+- **US Sales Tax / Standard GAAP & IFRS Ledgers**: Commonly use `HALF_EVEN` (Banker's rounding) or `HALF_UP` (round `0.5` away from zero).
+- **EU VAT / UK HMRC / India GST**: Often allow or require `HALF_UP` at the invoice/line level, or `FLOOR` (truncation) on specific statutory withholdings.
+Always pass an explicit `taxRoundingMode: TaxRoundingMode` (`'HALF_EVEN' | 'HALF_UP' | 'FLOOR'`) configured for the tenant's tax jurisdiction.
 
 ```typescript
 export type TaxPricingPolicy = 'TAX_EXCLUSIVE' | 'TAX_INCLUSIVE';
+export type TaxRoundingMode = 'HALF_EVEN' | 'HALF_UP' | 'FLOOR';
 
 export interface LineItemInput {
   lineId: string;
@@ -139,6 +162,7 @@ export interface CalculatedLineItem {
 export interface OrderCalculationInput {
   currencyCode: string;
   taxPolicy: TaxPricingPolicy;
+  taxRoundingMode?: TaxRoundingMode; // Defaults to 'HALF_EVEN'; configurable per tax jurisdiction
   items: LineItemInput[];
   discountBps: bigint;               // 0n..10_000n
   fixedDiscountMinor?: bigint;       // Optional fixed voucher amount >= 0n
@@ -151,6 +175,7 @@ export interface OrderCalculationResult {
   currencyCode: string;
   currencyExponent: 0 | 2 | 3;
   taxPolicy: TaxPricingPolicy;
+  taxRoundingMode: TaxRoundingMode;
   lines: CalculatedLineItem[];
   subtotalMinor: bigint;
   totalDiscountMinor: bigint;
@@ -163,71 +188,90 @@ export interface OrderCalculationResult {
 }
 
 /**
- * Banker's Rounding (Round Half to Even) for non-negative and signed BigInt values.
+ * Configurable integer division with explicit rounding mode ('HALF_EVEN', 'HALF_UP', 'FLOOR').
  */
-export function divRoundHalfEven(numerator: bigint, denominator: bigint): bigint {
+export function divRoundBigInt(
+  numerator: bigint,
+  denominator: bigint,
+  mode: TaxRoundingMode = 'HALF_EVEN'
+): bigint {
   if (denominator <= 0n) throw new Error('Denominator must be a positive BigInt');
   const isNegative = numerator < 0n;
   const absNum = isNegative ? -numerator : numerator;
 
   const quotient = absNum / denominator;
   const remainder = absNum % denominator;
-  const twiceRemainder = remainder * 2n;
 
-  let rounded = quotient;
-  if (twiceRemainder > denominator) {
-    rounded = quotient + 1n;
-  } else if (twiceRemainder === denominator && quotient % 2n !== 0n) {
-    rounded = quotient + 1n;
+  if (remainder === 0n) {
+    return isNegative ? -quotient : quotient;
   }
 
-  return isNegative ? -rounded : rounded;
+  let rounded = quotient;
+  if (mode === 'FLOOR') {
+    rounded = isNegative ? quotient + 1n : quotient;
+  } else if (mode === 'HALF_UP') {
+    if (remainder * 2n >= denominator) {
+      rounded = quotient + 1n;
+    }
+  } else {
+    // HALF_EVEN (Banker's rounding)
+    const twiceRemainder = remainder * 2n;
+    if (twiceRemainder > denominator) {
+      rounded = quotient + 1n;
+    } else if (twiceRemainder === denominator && quotient % 2n !== 0n) {
+      rounded = quotient + 1n;
+    }
+  }
+
+  const result = isNegative ? -rounded : rounded;
+  assertPgBigIntRange(result, 'divRoundBigIntResult', { allowNegative: true });
+  return result;
+}
+
+export function divRoundHalfEven(numerator: bigint, denominator: bigint): bigint {
+  return divRoundBigInt(numerator, denominator, 'HALF_EVEN');
 }
 
 export function calculateOrderTotals(input: OrderCalculationInput): OrderCalculationResult {
-  const currencyExponent = CURRENCY_EXPONENTS[input.currencyCode];
-  if (currencyExponent === undefined) {
-    throw new Error(`Unsupported currency code: ${input.currencyCode}`);
-  }
-  if (input.items.length === 0) {
-    throw new Error('Order must contain at least one line item');
+  const currencyExponent = getCurrencyExponentStrict(input.currencyCode);
+  const roundingMode: TaxRoundingMode = input.taxRoundingMode ?? 'HALF_EVEN';
+
+  if (input.items.length === 0 || input.items.length > 1000) {
+    throw new Error('Order must contain between 1 and 1000 line items');
   }
   if (input.discountBps < 0n || input.discountBps > 10_000n) {
     throw new Error(`Invalid discountBps: ${input.discountBps}. Must be between 0 and 10000`);
   }
-  if (input.fixedDiscountMinor !== undefined && input.fixedDiscountMinor < 0n) {
-    throw new Error('fixedDiscountMinor cannot be negative');
+  if (input.fixedDiscountMinor !== undefined) {
+    assertPgBigIntRange(input.fixedDiscountMinor, 'fixedDiscountMinor', { maxSafeInput: true });
   }
-  if (input.shippingMinor < 0n) {
-    throw new Error('shippingMinor cannot be negative');
-  }
+  assertPgBigIntRange(input.shippingMinor, 'shippingMinor', { maxSafeInput: true });
   if (input.shippingTaxRateBps < 0n || input.shippingTaxRateBps > 10_000n) {
     throw new Error('shippingTaxRateBps must be between 0 and 10000');
   }
-  if (input.maxDiscountCapMinor !== null && input.maxDiscountCapMinor < 0n) {
-    throw new Error('maxDiscountCapMinor cannot be negative');
+  if (input.maxDiscountCapMinor !== null) {
+    assertPgBigIntRange(input.maxDiscountCapMinor, 'maxDiscountCapMinor', { maxSafeInput: true });
   }
 
   let subtotalMinor = 0n;
   const lineSubtotals: bigint[] = [];
 
   for (const item of input.items) {
-    if (item.quantity <= 0n) {
-      throw new Error(`Line ${item.lineId}: quantity must be > 0`);
+    if (item.quantity <= 0n || item.quantity > 1_000_000_000n) {
+      throw new Error(`Line ${item.lineId}: quantity must be between 1 and 1,000,000,000`);
     }
-    if (item.unitPriceMinor < 0n) {
-      throw new Error(`Line ${item.lineId}: unitPriceMinor cannot be negative`);
-    }
+    assertPgBigIntRange(item.unitPriceMinor, `item[${item.lineId}].unitPriceMinor`, { maxSafeInput: true });
     if (item.taxRateBps < 0n || item.taxRateBps > 10_000n) {
       throw new Error(`Line ${item.lineId}: taxRateBps must be between 0 and 10000`);
     }
     const lineSub = item.quantity * item.unitPriceMinor;
+    assertPgBigIntRange(lineSub, `item[${item.lineId}].lineSubtotalMinor`, { maxSafeInput: true });
     lineSubtotals.push(lineSub);
     subtotalMinor += lineSub;
+    assertPgBigIntRange(subtotalMinor, 'subtotalMinor', { maxSafeInput: true });
   }
 
-  // Compute total order-level discount (percentage + optional fixed discount, capped at subtotal)
-  const pctDiscount = divRoundHalfEven(subtotalMinor * input.discountBps, 10_000n);
+  const pctDiscount = divRoundBigInt(subtotalMinor * input.discountBps, 10_000n, roundingMode);
   let totalDiscountMinor = pctDiscount + (input.fixedDiscountMinor ?? 0n);
   if (input.maxDiscountCapMinor !== null && totalDiscountMinor > input.maxDiscountCapMinor) {
     totalDiscountMinor = input.maxDiscountCapMinor;
@@ -236,7 +280,6 @@ export function calculateOrderTotals(input: OrderCalculationInput): OrderCalcula
     totalDiscountMinor = subtotalMinor;
   }
 
-  // Prorate totalDiscountMinor across lines using Largest Remainder Method (exact reconciliation)
   const allocatedDiscounts = allocateProratedAmountExact(lineSubtotals, subtotalMinor, totalDiscountMinor);
 
   const lines: CalculatedLineItem[] = [];
@@ -255,12 +298,11 @@ export function calculateOrderTotals(input: OrderCalculationInput): OrderCalcula
 
     if (input.taxPolicy === 'TAX_EXCLUSIVE') {
       lineNetMinor = afterDiscountMinor;
-      lineTaxMinor = divRoundHalfEven(lineNetMinor * item.taxRateBps, 10_000n);
+      lineTaxMinor = divRoundBigInt(lineNetMinor * item.taxRateBps, 10_000n, roundingMode);
       lineTotalMinor = lineNetMinor + lineTaxMinor;
     } else {
-      // TAX_INCLUSIVE (GST/VAT embedded in price)
       lineTotalMinor = afterDiscountMinor;
-      lineNetMinor = divRoundHalfEven(lineTotalMinor * 10_000n, 10_000n + item.taxRateBps);
+      lineNetMinor = divRoundBigInt(lineTotalMinor * 10_000n, 10_000n + item.taxRateBps, roundingMode);
       lineTaxMinor = lineTotalMinor - lineNetMinor;
     }
 
@@ -280,24 +322,25 @@ export function calculateOrderTotals(input: OrderCalculationInput): OrderCalcula
     });
   }
 
-  // Shipping tax calculation
   let shippingNetMinor: bigint;
   let shippingTaxMinor: bigint;
   if (input.taxPolicy === 'TAX_EXCLUSIVE') {
     shippingNetMinor = input.shippingMinor;
-    shippingTaxMinor = divRoundHalfEven(shippingNetMinor * input.shippingTaxRateBps, 10_000n);
+    shippingTaxMinor = divRoundBigInt(shippingNetMinor * input.shippingTaxRateBps, 10_000n, roundingMode);
   } else {
-    shippingNetMinor = divRoundHalfEven(input.shippingMinor * 10_000n, 10_000n + input.shippingTaxRateBps);
+    shippingNetMinor = divRoundBigInt(input.shippingMinor * 10_000n, 10_000n + input.shippingTaxRateBps, roundingMode);
     shippingTaxMinor = input.shippingMinor - shippingNetMinor;
   }
 
   const totalTaxMinor = merchandiseTaxMinor + shippingTaxMinor;
   const grandTotalMinor = netMerchandiseMinor + shippingNetMinor + totalTaxMinor;
+  assertPgBigIntRange(grandTotalMinor, 'grandTotalMinor');
 
   return {
     currencyCode: input.currencyCode,
     currencyExponent,
     taxPolicy: input.taxPolicy,
+    taxRoundingMode: roundingMode,
     lines,
     subtotalMinor,
     totalDiscountMinor,
@@ -319,9 +362,9 @@ export function allocateProratedAmountExact(
   totalWeight: bigint,
   targetTotal: bigint
 ): bigint[] {
-  if (targetTotal < 0n || totalWeight < 0n) {
-    throw new Error('PRORATION_REJECTED: targetTotal and totalWeight must be non-negative');
-  }
+  assertPgBigIntRange(totalWeight, 'totalWeight', { maxSafeInput: true });
+  assertPgBigIntRange(targetTotal, 'targetTotal', { maxSafeInput: true });
+
   if (weights.length === 0) {
     if (targetTotal > 0n || totalWeight > 0n) {
       throw new Error('PRORATION_REJECTED: Cannot allocate non-zero amount across an empty weights array');
@@ -337,9 +380,7 @@ export function allocateProratedAmountExact(
 
   let verifiedWeightSum = 0n;
   for (const w of weights) {
-    if (w < 0n) {
-      throw new Error('PRORATION_REJECTED: Individual line weight cannot be negative');
-    }
+    assertPgBigIntRange(w, 'lineWeight', { maxSafeInput: true });
     verifiedWeightSum += w;
   }
   if (verifiedWeightSum !== totalWeight) {
@@ -362,7 +403,7 @@ export function allocateProratedAmountExact(
   const leftover = Number(targetTotal - sumFloors);
   remainders.sort((a, b) => {
     if (b.rem !== a.rem) return b.rem > a.rem ? 1 : -1;
-    return a.index - b.index; // Deterministic tie-breaker
+    return a.index - b.index;
   });
 
   for (let i = 0; i < leftover; i++) {
@@ -374,8 +415,6 @@ export function allocateProratedAmountExact(
 ```
 
 ### Partial Refunds & Credit Note Engine
-Never mutate historical invoices on refund. Track cumulative refunded amounts per line and issue an immutable **Credit Note**:
-
 ```typescript
 export interface LineRefundState {
   lineId: string;
@@ -397,7 +436,8 @@ export interface CreditNoteLine {
 
 export function calculatePartialRefundCreditNote(
   lineState: LineRefundState,
-  requestedQuantityToRefund: bigint
+  requestedQuantityToRefund: bigint,
+  roundingMode: TaxRoundingMode = 'HALF_EVEN'
 ): CreditNoteLine {
   if (requestedQuantityToRefund <= 0n) {
     throw new Error('Refund quantity must be positive');
@@ -411,19 +451,16 @@ export function calculatePartialRefundCreditNote(
 
   const remainingNet = lineState.capturedNetMinor - lineState.alreadyRefundedNetMinor;
   const remainingTax = lineState.capturedTaxMinor - lineState.alreadyRefundedTaxMinor;
-
-  // If refunding the final remaining units on the line, refund the exact remaining net & tax to prevent penny drift
   const isFinalLineRefund = requestedQuantityToRefund === remainingQty;
 
   const rawRefundNet = isFinalLineRefund
     ? remainingNet
-    : divRoundHalfEven(lineState.capturedNetMinor * requestedQuantityToRefund, lineState.capturedQuantity);
+    : divRoundBigInt(lineState.capturedNetMinor * requestedQuantityToRefund, lineState.capturedQuantity, roundingMode);
 
   const rawRefundTax = isFinalLineRefund
     ? remainingTax
-    : divRoundHalfEven(lineState.capturedTaxMinor * requestedQuantityToRefund, lineState.capturedQuantity);
+    : divRoundBigInt(lineState.capturedTaxMinor * requestedQuantityToRefund, lineState.capturedQuantity, roundingMode);
 
-  // Clamp to remaining refundable balance so cumulative partial refunds can never exceed captured amount
   const refundNetMinor = rawRefundNet > remainingNet ? remainingNet : rawRefundNet < 0n ? 0n : rawRefundNet;
   const refundTaxMinor = rawRefundTax > remainingTax ? remainingTax : rawRefundTax < 0n ? 0n : rawRefundTax;
 
@@ -439,12 +476,10 @@ export function calculatePartialRefundCreditNote(
 
 ---
 
-## 3. Cryptographic ID, Token, OTP & Complex Generation Engines
+## 4. Cryptographic ID, Token, & Atomic One-Time OTP Engine (With Attempt Throttling)
 
 ```typescript
 import crypto from 'node:crypto';
-
-const UNAMBIGUOUS_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ'; // Excludes 0, O, 1, I, L
 
 export function generateUuidV7(nowMs: number = Date.now()): string {
   const bytes = crypto.randomBytes(16);
@@ -464,19 +499,12 @@ export function generateUuidV7(nowMs: number = Date.now()): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
-export function generateScopedApiKey(prefix: 'sk_live' | 'sk_test' | 'pk_live' | 'whsec'): {
-  plaintextKey: string;
-  keyHash: string;
-  displayHint: string;
-} {
-  const entropy = crypto.randomBytes(32).toString('base64url');
-  const plaintextKey = `${prefix}_${entropy}`;
-  const keyHash = crypto.createHash('sha256').update(plaintextKey).digest('hex');
-  const displayHint = `${prefix}_...${entropy.slice(-4)}`;
-  return { plaintextKey, keyHash, displayHint };
-}
-
-export function generateOtpCode(digits: 6 | 8 = 6, pepperSecret: string, contextId: string): {
+export function generateOtpCode(
+  digits: 6 | 8 = 6,
+  pepperSecret: string,
+  contextId: string,
+  ttlMs: number = 5 * 60 * 1000
+): {
   code: string;
   hmacDigest: string;
   expiresAt: Date;
@@ -487,6 +515,9 @@ export function generateOtpCode(digits: 6 | 8 = 6, pepperSecret: string, context
   if (!contextId || contextId.trim().length === 0) {
     throw new Error('OTP_CONFIG_ERROR: contextId must be non-empty to bind OTP to purpose/user');
   }
+  if (!Number.isInteger(ttlMs) || ttlMs <= 0 || ttlMs > 15 * 60 * 1000) {
+    throw new Error('OTP_CONFIG_ERROR: ttlMs must be between 1ms and 900,000ms (15 minutes)');
+  }
   const max = 10 ** digits;
   const rawInt = crypto.randomInt(0, max);
   const code = rawInt.toString().padStart(digits, '0');
@@ -494,24 +525,34 @@ export function generateOtpCode(digits: 6 | 8 = 6, pepperSecret: string, context
     .createHmac('sha256', pepperSecret)
     .update(`${contextId}:${code}`)
     .digest('hex');
-  const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
+  const expiresAt = new Date(Date.now() + ttlMs);
   return { code, hmacDigest, expiresAt };
 }
 
+/**
+ * Pure Constant-Time OTP Digest Verifier:
+ * - expiresAt is MANDATORY (never optional).
+ * - Explicitly rejects Invalid Date (where Number.isNaN(expiresAt.getTime()) is true!).
+ */
 export function verifyOtpCodeConstantTime(
   submittedCode: string,
   expectedHmacHex: string,
   pepperSecret: string,
   contextId: string,
-  expiresAt?: Date
+  expiresAt: Date,
+  nowMs: number = Date.now()
 ): boolean {
-  if (pepperSecret.length < 32) {
+  if (!pepperSecret || pepperSecret.length < 32) {
     throw new Error('OTP_CONFIG_ERROR: pepperSecret must be at least 32 characters');
   }
   if (!contextId || contextId.trim().length === 0) {
     return false;
   }
-  if (expiresAt && Date.now() > expiresAt.getTime()) {
+  // CRITICAL: Reject missing Date or Invalid Date (NaN timestamp would make nowMs > NaN evaluate to false!)
+  if (!(expiresAt instanceof Date) || Number.isNaN(expiresAt.getTime())) {
+    return false;
+  }
+  if (nowMs >= expiresAt.getTime()) {
     return false;
   }
   if (!/^\d{6,8}$/.test(submittedCode) || !/^[0-9a-fA-F]{64}$/.test(expectedHmacHex)) {
@@ -526,42 +567,108 @@ export function verifyOtpCodeConstantTime(
   return crypto.timingSafeEqual(actualHmac, expectedBuffer);
 }
 
-export function generateHumanReferenceCode(prefix: string, bodyLength = 8): string {
-  let body = '';
-  for (let i = 0; i < bodyLength; i++) {
-    const idx = crypto.randomInt(0, UNAMBIGUOUS_ALPHABET.length);
-    body += UNAMBIGUOUS_ALPHABET[idx];
-  }
-  const checkChar = computeLuhnModN(body, UNAMBIGUOUS_ALPHABET);
-  return `${prefix}-${body}-${checkChar}`;
+export interface StoredOtpChallengeRecord {
+  challengeId: string;
+  contextId: string; // e.g., "tenant_1:user_1:password_reset"
+  hmacDigest: string;
+  expiresAt: Date;
+  status: 'ACTIVE' | 'CONSUMED' | 'LOCKED_MAX_ATTEMPTS';
+  failedAttempts: number;
+  maxAttempts: number;
 }
 
-function computeLuhnModN(input: string, alphabet: string): string {
-  const n = alphabet.length;
-  let factor = 2;
-  let sum = 0;
-  for (let i = input.length - 1; i >= 0; i--) {
-    const codePoint = alphabet.indexOf(input[i]);
-    if (codePoint === -1) throw new Error(`Invalid character in code: ${input[i]}`);
-    let addend = factor * codePoint;
-    factor = factor === 2 ? 1 : 2;
-    addend = Math.floor(addend / n) + (addend % n);
-    sum += addend;
+export interface OtpChallengeStore {
+  /**
+   * Executes inside a single database transaction with FOR UPDATE row lock on challengeId.
+   */
+  withLockedChallenge<T>(
+    challengeId: string,
+    fn: (
+      record: StoredOtpChallengeRecord | null,
+      updateRecord: (patch: Partial<Pick<StoredOtpChallengeRecord, 'status' | 'failedAttempts'>>) => Promise<void>
+    ) => Promise<T>
+  ): Promise<T>;
+}
+
+/**
+ * Atomic OTP Verification, Brute-Force Attempt Throttling & Single-Use Consumption:
+ * Prevents OTP replay and concurrent race conditions by locking the challenge row,
+ * enforcing maxAttempts, and marking status = 'CONSUMED' in the same transaction.
+ */
+export async function verifyAndConsumeOtpAtomically(params: {
+  challengeId: string;
+  expectedContextId: string;
+  submittedCode: string;
+  pepperSecret: string;
+  store: OtpChallengeStore;
+  nowMs?: number;
+}): Promise<
+  | { verified: true }
+  | {
+      verified: false;
+      reason:
+        | 'CHALLENGE_NOT_FOUND'
+        | 'ALREADY_CONSUMED_REPLAY_BLOCKED'
+        | 'LOCKED_MAX_ATTEMPTS'
+        | 'CONTEXT_MISMATCH'
+        | 'EXPIRED_OR_INVALID_DATE'
+        | 'INVALID_CODE';
+    }
+> {
+  if (!params.pepperSecret || params.pepperSecret.length < 32) {
+    throw new Error('OTP_CONFIG_ERROR: pepperSecret must be at least 32 characters');
   }
-  const remainder = sum % n;
-  const checkCodePoint = (n - remainder) % n;
-  return alphabet[checkCodePoint];
+  const nowMs = params.nowMs ?? Date.now();
+
+  return params.store.withLockedChallenge(params.challengeId, async (record, updateRecord) => {
+    if (!record) {
+      return { verified: false, reason: 'CHALLENGE_NOT_FOUND' };
+    }
+    if (record.status === 'CONSUMED') {
+      return { verified: false, reason: 'ALREADY_CONSUMED_REPLAY_BLOCKED' };
+    }
+    if (record.status === 'LOCKED_MAX_ATTEMPTS' || record.failedAttempts >= record.maxAttempts) {
+      return { verified: false, reason: 'LOCKED_MAX_ATTEMPTS' };
+    }
+    if (record.contextId !== params.expectedContextId) {
+      return { verified: false, reason: 'CONTEXT_MISMATCH' };
+    }
+    if (!(record.expiresAt instanceof Date) || Number.isNaN(record.expiresAt.getTime()) || nowMs >= record.expiresAt.getTime()) {
+      return { verified: false, reason: 'EXPIRED_OR_INVALID_DATE' };
+    }
+
+    const matched = verifyOtpCodeConstantTime(
+      params.submittedCode,
+      record.hmacDigest,
+      params.pepperSecret,
+      params.expectedContextId,
+      record.expiresAt,
+      nowMs
+    );
+
+    if (!matched) {
+      const nextFailed = record.failedAttempts + 1;
+      const nextStatus = nextFailed >= record.maxAttempts ? 'LOCKED_MAX_ATTEMPTS' : 'ACTIVE';
+      await updateRecord({ failedAttempts: nextFailed, status: nextStatus });
+      return {
+        verified: false,
+        reason: nextStatus === 'LOCKED_MAX_ATTEMPTS' ? 'LOCKED_MAX_ATTEMPTS' : 'INVALID_CODE',
+      };
+    }
+
+    // Atomically consume the OTP so a second replay or concurrent request fails with ALREADY_CONSUMED_REPLAY_BLOCKED
+    await updateRecord({ status: 'CONSUMED' });
+    return { verified: true };
+  });
 }
 ```
 
 ---
 
-## 4. Composable Business Logic Engine: State Machines, Double-Entry Ledgers & Domain Rule Pipelines
+## 5. Composable Business Logic Engine: State Machines & Atomic Double-Entry Ledgers
 
-A backend is only as secure as its domain invariants. Even when SQL injection and JWT forgery are blocked, attackers exploit **Business Logic Flaws** (illegal state transitions like refunding an unpaid or cancelled order, unbalanced ledger postings that create money out of thin air, or bypassing multi-condition eligibility rules).
-
-### A. Deterministic Finite State Machine Engine with Optimistic Concurrency & Guard Predicates
-Never mutate status columns with ad-hoc `UPDATE orders SET status = $1` statements. Enforce a strict transition graph with role checks, domain invariant guards, and monotonic `version` increment:
+### A. Deterministic Finite State Machine with Server-Resolved Roles & Optimistic Concurrency
+Never trust `actorRoles` supplied in a client payload; resolve roles from the authoritative server-side membership store before evaluating transition rules:
 
 ```typescript
 export interface StateTransitionRule<TState extends string, TContext> {
@@ -571,29 +678,34 @@ export interface StateTransitionRule<TState extends string, TContext> {
   guard?: (ctx: TContext) => { ok: boolean; reason?: string };
 }
 
-export function executeDomainStateTransition<TState extends string, TContext>(params: {
+export async function executeDomainStateTransition<TState extends string, TContext>(params: {
+  tenantId: string;
+  actorUserId: string;
+  resolveVerifiedActorRoles: (tenantId: string, actorUserId: string) => Promise<readonly string[]>;
   entityName: string;
   entityId: string;
   currentState: TState;
   targetState: TState;
   currentVersion: number;
   expectedVersion: number;
-  actorRoles: readonly string[];
   context: TContext;
   rules: readonly StateTransitionRule<TState, TContext>[];
-}): {
+}): Promise<{
   nextState: TState;
   nextVersion: number;
   auditEvent: string;
-} {
-  // 1. Optimistic Concurrency Control (prevents lost updates & race conditions)
+}> {
   if (params.currentVersion !== params.expectedVersion) {
     throw new Error(
       `STATE_CONFLICT_STALE_VERSION: ${params.entityName} (${params.entityId}) expected v${params.expectedVersion}, found v${params.currentVersion}`
     );
   }
 
-  // 2. Locate matching transition rule
+  const verifiedRoles = await params.resolveVerifiedActorRoles(params.tenantId, params.actorUserId);
+  if (verifiedRoles.length === 0) {
+    throw new Error('TRANSITION_ROLE_DENIED: Actor has no active roles in tenant');
+  }
+
   const matchingRule = params.rules.find(
     (r) => r.to === params.targetState && r.from.includes(params.currentState)
   );
@@ -603,21 +715,17 @@ export function executeDomainStateTransition<TState extends string, TContext>(pa
     );
   }
 
-  // 3. Verify actor role authorization for this specific state transition
-  const hasRole = params.actorRoles.some((role) => matchingRule.allowedRoles.includes(role));
+  const hasRole = verifiedRoles.some((role) => matchingRule.allowedRoles.includes(role));
   if (!hasRole) {
     throw new Error(
-      `TRANSITION_ROLE_DENIED: Actor roles [${params.actorRoles.join(',')}] cannot transition ${params.entityName} to "${params.targetState}"`
+      `TRANSITION_ROLE_DENIED: Verified actor roles [${verifiedRoles.join(',')}] cannot transition ${params.entityName} to "${params.targetState}"`
     );
   }
 
-  // 4. Evaluate business invariant guard predicate
   if (matchingRule.guard) {
     const verdict = matchingRule.guard(params.context);
     if (!verdict.ok) {
-      throw new Error(
-        `BUSINESS_INVARIANT_REJECTED: ${verdict.reason ?? 'Guard predicate failed'}`
-      );
+      throw new Error(`BUSINESS_INVARIANT_REJECTED: ${verdict.reason ?? 'Guard predicate failed'}`);
     }
   }
 
@@ -629,8 +737,10 @@ export function executeDomainStateTransition<TState extends string, TContext>(pa
 }
 ```
 
-### B. Zero-Discrepancy Double-Entry Accounting Journal Validator
-Never update wallet or account balances without recording a balanced double-entry journal (`SUM(DEBIT) === SUM(CREDIT)` per currency within the same ACID transaction):
+### B. Strict Double-Entry Accounting Journal Validator & Atomic Persistence Engine
+1. **Explicit Direction Validation**: Reject any posting whose `direction` is not strictly `'DEBIT'` or `'CREDIT'` (never use `if (dir === 'DEBIT') ... else` which silently treats invalid strings as `'CREDIT'`).
+2. **PostgreSQL `BIGINT` Bounds**: Validate every line's `amountMinor` and the cumulative `totalDebitMinor`/`totalCreditMinor` against `assertPgBigIntRange`.
+3. **Tenant-Account Ownership & Atomic Persistence**: Lock all referenced accounts in deterministic lexicographical order (`ORDER BY account_id FOR UPDATE`), verify that every account belongs to `params.tenantId`, uses `currencyCode`, and is `'ACTIVE'`, enforce idempotency uniqueness (`UNIQUE (tenant_id, idempotency_key)`), and commit the journal header, posting lines, and account balance updates in a single ACID transaction.
 
 ```typescript
 export interface JournalPostingLine {
@@ -649,18 +759,20 @@ export function validateBalancedDoubleEntryJournal(params: {
   currencyCode: string;
   totalDebitMinor: bigint;
   totalCreditMinor: bigint;
+  sortedAccountIds: string[];
 } {
-  if (!params.idempotencyKey || params.idempotencyKey.trim().length < 8) {
-    throw new Error('LEDGER_REJECTED: idempotencyKey (>= 8 chars) is mandatory');
+  if (!params.tenantId || params.tenantId.trim().length === 0) {
+    throw new Error('LEDGER_REJECTED: tenantId is mandatory');
   }
-  if (params.postings.length < 2) {
-    throw new Error('LEDGER_REJECTED: Double-entry journal requires at least 2 posting lines');
+  if (!params.idempotencyKey || !/^[a-zA-Z0-9_.:-]{8,128}$/.test(params.idempotencyKey)) {
+    throw new Error('LEDGER_REJECTED: idempotencyKey (8..128 safe chars) is mandatory');
+  }
+  if (params.postings.length < 2 || params.postings.length > 500) {
+    throw new Error('LEDGER_REJECTED: Double-entry journal requires between 2 and 500 posting lines');
   }
 
   const currencyCode = params.postings[0].currencyCode;
-  if (!(currencyCode in CURRENCY_EXPONENTS)) {
-    throw new Error(`LEDGER_REJECTED: Unsupported currency "${currencyCode}"`);
-  }
+  getCurrencyExponentStrict(currencyCode);
 
   let totalDebitMinor = 0n;
   let totalCreditMinor = 0n;
@@ -671,22 +783,29 @@ export function validateBalancedDoubleEntryJournal(params: {
     if (line.currencyCode !== currencyCode) {
       throw new Error('LEDGER_REJECTED: Cross-currency postings require an explicit FX clearing pair');
     }
-    if (line.amountMinor <= 0n) {
-      throw new Error(`LEDGER_REJECTED: Posting amount for account "${line.accountId}" must be > 0n`);
-    }
     if (!line.accountId || line.accountId.trim().length === 0) {
       throw new Error('LEDGER_REJECTED: accountId cannot be empty');
     }
-    if (line.direction === 'DEBIT') {
+    if (line.amountMinor <= 0n) {
+      throw new Error(`LEDGER_REJECTED: Posting amount for account "${line.accountId}" must be > 0n`);
+    }
+    assertPgBigIntRange(line.amountMinor, `posting[${line.accountId}].amountMinor`, { maxSafeInput: true });
+
+    // CRITICAL: Explicitly validate 'DEBIT' vs 'CREDIT' (never treat unknown strings as 'CREDIT'!)
+    const rawDirection: string = line.direction;
+    if (rawDirection === 'DEBIT') {
       totalDebitMinor += line.amountMinor;
+      assertPgBigIntRange(totalDebitMinor, 'totalDebitMinor');
       debitAccounts.add(line.accountId);
-    } else {
+    } else if (rawDirection === 'CREDIT') {
       totalCreditMinor += line.amountMinor;
+      assertPgBigIntRange(totalCreditMinor, 'totalCreditMinor');
       creditAccounts.add(line.accountId);
+    } else {
+      throw new Error(`LEDGER_REJECTED: Invalid posting direction "${String(rawDirection)}"`);
     }
   }
 
-  // Prevent self-transfer no-op loops (debiting and crediting the exact same account in a 2-line transfer)
   for (const acc of debitAccounts) {
     if (creditAccounts.has(acc)) {
       throw new Error(`LEDGER_REJECTED: Account "${acc}" cannot be both debited and credited in the same journal`);
@@ -699,7 +818,152 @@ export function validateBalancedDoubleEntryJournal(params: {
     );
   }
 
-  return { currencyCode, totalDebitMinor, totalCreditMinor };
+  const sortedAccountIds = Array.from(new Set([...debitAccounts, ...creditAccounts])).sort();
+  return { currencyCode, totalDebitMinor, totalCreditMinor, sortedAccountIds };
+}
+
+export interface LedgerAccountRow {
+  accountId: string;
+  tenantId: string;
+  currencyCode: string;
+  status: 'ACTIVE' | 'FROZEN' | 'CLOSED';
+  balanceMinor: bigint;
+  allowNegativeBalance: boolean;
+}
+
+export interface LedgerTransactionPort {
+  runInTransaction<T>(
+    fn: (tx: {
+      findJournalByIdempotencyKey: (
+        tenantId: string,
+        idempotencyKey: string
+      ) => Promise<{ journalId: string; totalDebitMinor: bigint; currencyCode: string } | null>;
+      lockAccountsSortedForUpdate: (sortedAccountIds: readonly string[]) => Promise<LedgerAccountRow[]>;
+      insertJournalAndUpdateBalances: (data: {
+        journalId: string;
+        tenantId: string;
+        idempotencyKey: string;
+        currencyCode: string;
+        totalDebitMinor: bigint;
+        postings: readonly JournalPostingLine[];
+        updatedBalances: ReadonlyMap<string, bigint>;
+      }) => Promise<void>;
+    }) => Promise<T>
+  ): Promise<T>;
+}
+
+/**
+ * Atomic Double-Entry Journal Persistence with Tenant-Account Ownership & Idempotency Enforcement
+ */
+export async function persistBalancedJournalAtomically(params: {
+  journalId: string;
+  tenantId: string;
+  idempotencyKey: string;
+  postings: readonly JournalPostingLine[];
+  ledgerPort: LedgerTransactionPort;
+}): Promise<{
+  journalId: string;
+  currencyCode: string;
+  totalDebitMinor: bigint;
+  replayedIdempotent: boolean;
+}> {
+  const validated = validateBalancedDoubleEntryJournal(params);
+
+  return params.ledgerPort.runInTransaction(async (tx) => {
+    // 1. Check unique (tenant_id, idempotency_key) inside the transaction
+    const existing = await tx.findJournalByIdempotencyKey(params.tenantId, params.idempotencyKey);
+    if (existing) {
+      return {
+        journalId: existing.journalId,
+        currencyCode: existing.currencyCode,
+        totalDebitMinor: existing.totalDebitMinor,
+        replayedIdempotent: true,
+      };
+    }
+
+    // 2. Lock all referenced accounts in deterministic lexicographical order (prevents deadlocks)
+    const lockedAccounts = await tx.lockAccountsSortedForUpdate(validated.sortedAccountIds);
+    const accountMap = new Map<string, LedgerAccountRow>();
+    for (const acc of lockedAccounts) {
+      accountMap.set(acc.accountId, acc);
+    }
+
+    // 3. Enforce tenant ownership, currency match, and active status on every single account
+    for (const accountId of validated.sortedAccountIds) {
+      const acc = accountMap.get(accountId);
+      if (!acc) {
+        throw new Error(`LEDGER_ACCOUNT_NOT_FOUND: Account "${accountId}" does not exist`);
+      }
+      if (acc.tenantId !== params.tenantId) {
+        throw new Error(
+          `LEDGER_CROSS_TENANT_ACCOUNT_DENIED: Account "${accountId}" does not belong to tenant "${params.tenantId}"`
+        );
+      }
+      if (acc.currencyCode !== validated.currencyCode) {
+        throw new Error(
+          `LEDGER_CURRENCY_MISMATCH: Account "${accountId}" currency (${acc.currencyCode}) !== journal currency (${validated.currencyCode})`
+        );
+      }
+      if (acc.status !== 'ACTIVE') {
+        throw new Error(`LEDGER_ACCOUNT_INACTIVE: Account "${accountId}" is ${acc.status}`);
+      }
+    }
+
+    // 4. Compute new account balances and enforce overdraft / PostgreSQL BIGINT bounds
+    const updatedBalances = new Map<string, bigint>();
+    for (const acc of lockedAccounts) {
+      updatedBalances.set(acc.accountId, acc.balanceMinor);
+    }
+
+    for (const line of params.postings) {
+      const currentBal = updatedBalances.get(line.accountId)!;
+      const delta = line.direction === 'DEBIT' ? -line.amountMinor : line.amountMinor;
+      const nextBal = currentBal + delta;
+      assertPgBigIntRange(nextBal, `account[${line.accountId}].balanceMinor`, { allowNegative: true });
+
+      const accMeta = accountMap.get(line.accountId)!;
+      if (!accMeta.allowNegativeBalance && nextBal < 0n) {
+        throw new Error(`LEDGER_INSUFFICIENT_FUNDS: Account "${line.accountId}" balance would become negative (${nextBal})`);
+      }
+      updatedBalances.set(line.accountId, nextBal);
+    }
+
+    // 5. Atomically insert journal header, posting lines, and updated balances
+    await tx.insertJournalAndUpdateBalances({
+      journalId: params.journalId,
+      tenantId: params.tenantId,
+      idempotencyKey: params.idempotencyKey,
+      currencyCode: validated.currencyCode,
+      totalDebitMinor: validated.totalDebitMinor,
+      postings: params.postings,
+      updatedBalances,
+    });
+
+    return {
+      journalId: params.journalId,
+      currencyCode: validated.currencyCode,
+      totalDebitMinor: validated.totalDebitMinor,
+      replayedIdempotent: false,
+    };
+  });
 }
 ```
 
+---
+
+## 6. Verification & Test Requirements
+
+1. **Prototype Currency Bypass Test**: Assert that `getCurrencyExponentStrict('toString')`, `getCurrencyExponentStrict('constructor')`, and `FieldSchemas.currencyCode.safeParse('valueOf')` fail closed.
+2. **PostgreSQL `BIGINT` Overflow Test**: Assert that `assertPgBigIntRange(9_223_372_036_854_775_808n, 'amount')` and `calculateOrderTotals` with overflowing quantities throw `PG_BIGINT_RANGE_ERROR`.
+3. **OTP Replay, Invalid Date & Brute-Force Lockout Test (`TEST-05`, `TEST-06`)**:
+   - Assert that `verifyOtpCodeConstantTime(..., new Date('invalid'))` returns `false`.
+   - Assert that submitting a valid OTP twice to `verifyAndConsumeOtpAtomically` succeeds on the first call and returns `ALREADY_CONSUMED_REPLAY_BLOCKED` on the second call.
+   - Assert that 5 failed OTP attempts transition the challenge to `LOCKED_MAX_ATTEMPTS`, rejecting a subsequent 6th attempt even with the correct OTP code.
+4. **Journal Direction, Cross-Tenant Account & Idempotency Test**:
+   - Assert that passing `direction: 'INVALID' as any` throws `LEDGER_REJECTED: Invalid posting direction`.
+   - Assert that referencing an `accountId` owned by `tenant_B` inside `persistBalancedJournalAtomically` for `tenant_A` throws `LEDGER_CROSS_TENANT_ACCOUNT_DENIED`.
+
+### Authoritative References
+- **ISO 4217 Currency Codes & Minor Unit Exponents**: https://www.iso.org/iso-4217-currency-codes.html
+- **PostgreSQL 16 Numeric Types (`bigint` 8-byte signed range)**: https://www.postgresql.org/docs/current/datatype-numeric.html
+- **RFC 9562 — Universally Unique IDentifiers (UUIDv7)**: https://datatracker.ietf.org/doc/html/rfc9562
