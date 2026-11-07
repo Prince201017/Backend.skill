@@ -2,28 +2,25 @@
 
 ## 1. Scope & Threat Model
 
-This module remediates **CRITICAL 2.A (Tenant Transaction Security — `withTenantTransaction()`)** and **HIGH Production Readiness (Secret Scanning & Coordinated Graceful Shutdown)**.
+This module remediates **CRITICAL 2.A & DEVIL-01 (Tenant Transaction Security — `withTenantTransaction()`, `tenant_members` Bootstrap Paradox, Role Bypass Verification, and Transaction-Bound Context Signing)** and **HIGH Production Readiness (Secret Scanning & Coordinated Graceful Shutdown)**.
 
 ### Trust Boundaries & Failure Modes
 1. **Tenant Transaction Security (`withTenantTransaction()`)**:
    - *Vulnerabilities Fixed*:
-     1. **UUID validation is not authorization**: Validating ` UUID_V4_OR_V7_REGEX.test(tenantId)` only checks string syntax; an attacker can pass any valid tenant UUID they do not belong to.
+     1. **UUID validation is not authorization**: Validating `UUID_V4_OR_V7_REGEX.test(tenantId)` only checks string syntax; an attacker can pass any valid tenant UUID they do not belong to.
      2. **Caller-provided tenant IDs are untrusted**: A header (`X-Tenant-Id`), path param, or request body `tenantId` is a *target hint*, never proof of membership.
      3. **Pre-authorization `set_config` injection**: Calling `SELECT set_config('app.current_tenant_id', $1, true)` *before* verifying active membership sets the PostgreSQL RLS session GUC to the victim tenant's ID, allowing subsequent queries in the transaction to read victim rows!
-     4. **Transaction-local GUCs are not authentication**: `app.current_tenant_id` and `app.current_user_id` must only be populated *after* the server verifies the caller's cryptographic identity, active tenant status, active membership status, and action permission inside the transaction.
-   - *Enforcement*:
-     - Step 1: Verify the caller's cryptographic server-side identity token (`verifyServerIdentity`), rejecting missing, expired, or forged identities before checking out a DB connection.
-     - Step 2: Acquire a dedicated pooled client (`pool.connect()`), execute `BEGIN`, and query the authoritative `tenants` and `tenant_members` tables (`FOR SHARE`) using the verified `userId` and target `requestedTenantId`.
-     - Step 3: Reject if the tenant is not `'ACTIVE'`, the membership does not exist or is `'SUSPENDED'` / `'DISABLED'` / `'REVOKED'`, or the member's server-resolved role lacks `requiredPermission`.
-     - Step 4: Only *after* authorization succeeds, execute `SELECT set_config('app.current_tenant_id', $1, true)` and `SELECT set_config('app.current_user_id', $1, true)` (`is_local = true`).
-     - Step 5: Execute all application queries on that exact checked-out `txClient`, followed by `COMMIT` (or `ROLLBACK` on any error) and `client.release()` in `finally`. Because `set_config(..., true)` scopes settings to the current transaction (`SET LOCAL`), `COMMIT` or `ROLLBACK` automatically clears both GUCs before the connection returns to the pool.
+     4. **`tenant_members` Bootstrap Paradox & `BYPASSRLS` / `SUPERUSER` Check (`DEVIL-01`)**:
+        - If `tenant_members` has RLS enabled, querying `tenant_members` before setting `app.current_user_id` fails to return the user's membership row. Setting `app.current_user_id` **after** cryptographic server identity verification (while keeping `app.current_tenant_id` unset until membership + permission checks succeed!) cleanly allows `tenant_members` RLS (`user_id = current_setting('app.current_user_id', true)::uuid`) to read only the authenticated user's membership row.
+        - If the database connection uses a role with `rolsuper = true` or `rolbypassrls = true`, PostgreSQL silently bypasses all RLS policies. `verifyDatabaseRoleRlsEnforcement()` verifies at startup that the runtime role cannot bypass RLS.
+        - Additionally, `withTenantTransaction()` binds a transaction-local HMAC (`app.current_tenant_mac`) when `gucHmacSecret` is configured, preventing mid-transaction `set_config('app.current_tenant_id', ...)` tampering if an application query suffers from SQL injection.
 
 ---
 
-## 2. Remediated `withTenantTransaction()` Implementation (CRITICAL 2.A)
+## 2. Remediated `withTenantTransaction()` Implementation (CRITICAL 2.A + DEVIL-01)
 
 ```typescript
-// Executable TypeScript — Verified Server-Side Identity + Post-Authorization RLS Context
+// Executable TypeScript — Verified Server-Side Identity + Role RLS Verification + Post-Authorization RLS Context
 import { createHmac, timingSafeEqual } from 'node:crypto';
 
 export type TenantStatus = 'ACTIVE' | 'SUSPENDED' | 'DISABLED';
@@ -122,10 +119,30 @@ const UUID_SYNTAX_REGEX =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 /**
+ * Startup & Pool Guard (DEVIL-01):
+ * Verifies that the PostgreSQL connection role is NOT a superuser and does NOT have BYPASSRLS.
+ * If either flag is true, PostgreSQL ignores all RLS policies even with FORCE ROW LEVEL SECURITY!
+ */
+export async function verifyDatabaseRoleRlsEnforcement(client: PooledDbClient): Promise<void> {
+  const res = await client.query<{ rolname: string; rolsuper: boolean; rolbypassrls: boolean }>(
+    `SELECT rolname, rolsuper, rolbypassrls FROM pg_catalog.pg_roles WHERE rolname = current_user`
+  );
+  const role = res.rows[0];
+  if (!role) {
+    throw new Error('DB_ROLE_VERIFICATION_FAILED: Could not inspect current_user in pg_roles');
+  }
+  if (role.rolsuper || role.rolbypassrls) {
+    throw new Error(
+      `DB_RLS_BYPASS_HAZARD: Runtime role "${role.rolname}" has rolsuper=${String(role.rolsuper)} or rolbypassrls=${String(role.rolbypassrls)}; RLS policies would be silently bypassed!`
+    );
+  }
+}
+
+/**
  * Remediated withTenantTransaction():
  * 1. Verifies server-side identity first.
  * 2. Validates UUID syntax only as an input hygiene filter (never as authorization).
- * 3. Starts transaction (`BEGIN`) and queries authoritative membership (`FOR SHARE`).
+ * 3. Starts transaction (`BEGIN`), clears any stale `app.current_tenant_id`, and queries authoritative membership (`FOR SHARE`).
  * 4. Verifies active tenant status, active membership status, and required permission.
  * 5. Populates `app.current_tenant_id` and `app.current_user_id` (`is_local = true`) ONLY AFTER authorization.
  * 6. Runs all queries on `txClient` and guarantees `COMMIT`/`ROLLBACK` cleanup before pool release.
@@ -156,7 +173,7 @@ export async function withTenantTransaction<T>(params: {
     await client.query('BEGIN');
 
     // Step 3: Query authoritative tenant + membership status inside the transaction (FOR SHARE lock)
-    // Note: tenant_members lookup runs BEFORE app.current_tenant_id is set.
+    // CRITICAL: app.current_tenant_id is NOT set yet!
     const membershipRes = await client.query<{
       tenant_id: string;
       tenant_status: TenantStatus;

@@ -827,6 +827,7 @@ export interface LedgerAccountRow {
   tenantId: string;
   currencyCode: string;
   status: 'ACTIVE' | 'FROZEN' | 'CLOSED';
+  normalBalance?: 'DEBIT' | 'CREDIT'; // Defaults to 'CREDIT' (Liability/Wallet); 'DEBIT' for Asset/Cash accounts
   balanceMinor: bigint;
   allowNegativeBalance: boolean;
 }
@@ -853,7 +854,9 @@ export interface LedgerTransactionPort {
 }
 
 /**
- * Atomic Double-Entry Journal Persistence with Tenant-Account Ownership & Idempotency Enforcement
+ * Atomic Double-Entry Journal Persistence with Tenant-Account Ownership,
+ * Normal-Balance Sign Enforcement (Asset DEBIT-normal vs Liability CREDIT-normal),
+ * and Idempotency Enforcement.
  */
 export async function persistBalancedJournalAtomically(params: {
   journalId: string;
@@ -909,7 +912,8 @@ export async function persistBalancedJournalAtomically(params: {
       }
     }
 
-    // 4. Compute new account balances and enforce overdraft / PostgreSQL BIGINT bounds
+    // 4. Compute new account balances respecting each account's normalBalance ('DEBIT' vs 'CREDIT')
+    // and enforce overdraft / PostgreSQL BIGINT bounds
     const updatedBalances = new Map<string, bigint>();
     for (const acc of lockedAccounts) {
       updatedBalances.set(acc.accountId, acc.balanceMinor);
@@ -917,11 +921,13 @@ export async function persistBalancedJournalAtomically(params: {
 
     for (const line of params.postings) {
       const currentBal = updatedBalances.get(line.accountId)!;
-      const delta = line.direction === 'DEBIT' ? -line.amountMinor : line.amountMinor;
+      const accMeta = accountMap.get(line.accountId)!;
+      const normalSide = accMeta.normalBalance ?? 'CREDIT';
+      // A posting matching the account's normal balance side increases its balance; the opposite side decreases it
+      const delta = line.direction === normalSide ? line.amountMinor : -line.amountMinor;
       const nextBal = currentBal + delta;
       assertPgBigIntRange(nextBal, `account[${line.accountId}].balanceMinor`, { allowNegative: true });
 
-      const accMeta = accountMap.get(line.accountId)!;
       if (!accMeta.allowNegativeBalance && nextBal < 0n) {
         throw new Error(`LEDGER_INSUFFICIENT_FUNDS: Account "${line.accountId}" balance would become negative (${nextBal})`);
       }
@@ -947,6 +953,30 @@ export async function persistBalancedJournalAtomically(params: {
     };
   });
 }
+```
+
+### C. Authoritative Database-Level Ledger Immutability & Balance Integrity DDL
+TypeScript validation alone does not protect the database if a bug or compromised query attempts to `UPDATE` or `DELETE` historical ledger rows. Enforce append-only immutability in PostgreSQL:
+
+```sql
+CREATE OR REPLACE FUNCTION public.prevent_ledger_mutation()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, public
+AS $$
+BEGIN
+  RAISE EXCEPTION 'LEDGER_IMMUTABLE_VIOLATION: Updates and deletes are forbidden on table %', TG_TABLE_NAME
+    USING ERRCODE = '55000';
+END;
+$$;
+
+CREATE TRIGGER trg_journal_entries_immutable
+  BEFORE UPDATE OR DELETE ON public.journal_entries
+  FOR EACH ROW EXECUTE FUNCTION public.prevent_ledger_mutation();
+
+CREATE TRIGGER trg_journal_postings_immutable
+  BEFORE UPDATE OR DELETE ON public.journal_postings
+  FOR EACH ROW EXECUTE FUNCTION public.prevent_ledger_mutation();
 ```
 
 ---

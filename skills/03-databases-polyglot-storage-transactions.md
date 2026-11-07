@@ -64,6 +64,8 @@ CREATE TABLE inbox_processed_events (
 **Critical Consumer Invariant**: `applySideEffectInTx(txClient)` **MUST** receive and use the exact same pinned `TransactionalDbClient` (`txClient`) that opened `BEGIN` and executed `INSERT INTO inbox_processed_events`. Never run `applySideEffectInTx()` against a separate connection pool!
 
 ```typescript
+import crypto from 'node:crypto';
+
 export interface OutboxRecord {
   event_id: string;
   tenant_id: string;
@@ -72,6 +74,7 @@ export interface OutboxRecord {
   event_type: string;
   payload: Record<string, unknown>;
   traceparent: string | null;
+  event_hmac?: string;
 }
 
 export interface TransactionalDbClient {
@@ -84,6 +87,16 @@ export interface TransactionalDbClient {
 
 export interface TransactionalDbPool {
   connect(): Promise<TransactionalDbClient>;
+}
+
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+export function computeOutboxEventHmac(
+  event: Pick<OutboxRecord, 'event_id' | 'tenant_id' | 'aggregate_type' | 'aggregate_id' | 'event_type' | 'payload'>,
+  outboxHmacSecret: string
+): string {
+  const canonical = `${event.event_id}|${event.tenant_id}|${event.aggregate_type}|${event.aggregate_id}|${event.event_type}|${JSON.stringify(event.payload)}`;
+  return crypto.createHmac('sha256', outboxHmacSecret).update(canonical, 'utf8').digest('hex');
 }
 
 export async function runCommittedOutboxRelayBatch(
@@ -133,8 +146,12 @@ export async function runCommittedOutboxRelayBatch(
     try {
       await brokerPublish(record);
       publishedIds.push(record.event_id);
-    } catch {
-      // Failed row remains unprocessed and will retry after leased_until expires
+    } catch (err) {
+      // Persist last_error on failed relay attempt so operators have diagnostic visibility on DLQ rows
+      const errMsg = err instanceof Error ? err.message.slice(0, 500) : 'BROKER_PUBLISH_ERROR';
+      await dbClient
+        .query(`UPDATE outbox_events SET last_error = $2 WHERE event_id = $1`, [record.event_id, errMsg])
+        .catch(() => undefined);
     }
   }
 
@@ -153,23 +170,43 @@ export async function runCommittedOutboxRelayBatch(
 }
 
 /**
- * Consumer Inbox Pattern with Strict Single-Connection Transaction Consistency:
- * Checks out a dedicated client from the pool, sets transaction-local tenant context,
- * inserts (consumer_group, event_id) into inbox_processed_events, and passes the
- * EXACT SAME txClient to applySideEffectInTx(txClient) before COMMIT.
+ * Consumer Inbox Pattern with Strict Single-Connection Transaction Consistency
+ * AND Broker Event Authenticity / Tenant-ID Verification (DEVIL-05 Remediation):
+ * - Validates UUID syntax of event.tenant_id and event.event_id.
+ * - Verifies optional event_hmac when outboxHmacSecret is provided (blocking forged broker messages from spoofing tenant_id).
+ * - Verifies that the target tenant is ACTIVE before setting app.current_tenant_id.
  */
 export async function consumeEventIdempotently(params: {
   pool: TransactionalDbPool;
   consumerGroup: string;
   event: OutboxRecord;
+  outboxHmacSecret?: string;
   applySideEffectInTx: (txClient: TransactionalDbClient) => Promise<void>;
 }): Promise<'PROCESSED' | 'DUPLICATE_SKIPPED'> {
+  if (!UUID_REGEX.test(params.event.tenant_id) || !UUID_REGEX.test(params.event.event_id)) {
+    throw new Error('INBOX_EVENT_REJECTED: Invalid tenant_id or event_id UUID format');
+  }
+
+  if (params.outboxHmacSecret) {
+    if (!params.event.event_hmac || !/^[0-9a-fA-F]{64}$/.test(params.event.event_hmac)) {
+      throw new Error('INBOX_EVENT_REJECTED: Missing or malformed event_hmac signature');
+    }
+    const expectedHmac = Buffer.from(
+      computeOutboxEventHmac(params.event, params.outboxHmacSecret),
+      'hex'
+    );
+    const actualHmac = Buffer.from(params.event.event_hmac, 'hex');
+    if (
+      expectedHmac.length !== actualHmac.length ||
+      !crypto.timingSafeEqual(expectedHmac, actualHmac)
+    ) {
+      throw new Error('INBOX_EVENT_REJECTED: Broker event HMAC signature mismatch (tenant spoofing blocked)');
+    }
+  }
+
   const txClient = await params.pool.connect();
   try {
     await txClient.query('BEGIN ISOLATION LEVEL READ COMMITTED');
-    await txClient.query(`SELECT set_config('app.current_tenant_id', $1, true)`, [
-      params.event.tenant_id,
-    ]);
 
     const insertInbox = await txClient.query(
       `INSERT INTO inbox_processed_events (consumer_group, event_id, tenant_id)
@@ -182,6 +219,11 @@ export async function consumeEventIdempotently(params: {
       await txClient.query('COMMIT');
       return 'DUPLICATE_SKIPPED';
     }
+
+    // Establish transaction-local tenant context only after verifying event authenticity & deduplication
+    await txClient.query(`SELECT set_config('app.current_tenant_id', $1, true)`, [
+      params.event.tenant_id,
+    ]);
 
     // Execute business side effects on the EXACT SAME txClient connection!
     await params.applySideEffectInTx(txClient);
@@ -198,16 +240,36 @@ export async function consumeEventIdempotently(params: {
 
 ---
 
-## 4. Authorized, Tenant-Scoped Redis Caching & Deterministic Cache Invalidation
+## 4. Authorized, Tenant-Scoped Redis Caching, `BigInt`-Safe Serialization & Deterministic Invalidation
 
 ### Critical Cache Security Rule
 **Tenant Key Namespacing Is NOT Per-User Authorization!**
 Constructing `tenant:${tenantId}:${resourceKey}` prevents Tenant B from reading Tenant A's cache keys, but it does **not** prevent a regular member in Tenant A from reading another user's private resource within Tenant A if the endpoint returns cached objects before checking authorization.
-1. **Mandatory Pre-Return Authorization (`authorizeCachedValue`)**: Always verify that the calling subject is authorized to read the cached resource (or scope user-private projections with `tenant:${tenantId}:user:${actorUserId}:${resourceKey}`).
-2. **Deterministic Invalidation**: Invalidate or version-bump cache keys (`del` on mutation commit or outbox consumer) in addition to jittered TTLs.
+1. **Mandatory Pre-Return Authorization (`authorizeResource`)**: Always verify that the calling subject is authorized to read the cached resource (or scope user-private projections with `tenant:${tenantId}:user:${actorUserId}:${resourceKey}`).
+2. **`BigInt`-Safe JSON Serialization**: Financial domain models in Module 01 use `bigint` for minor units (`amountMinor`). Standard `JSON.stringify` throws `TypeError: Do not know how to serialize a BigInt`. Use `serializeCacheValueBigIntSafe` / `deserializeCacheValueBigIntSafe`.
 
 ```typescript
 const inFlightLocalPromises = new Map<string, Promise<unknown>>();
+
+export function serializeCacheValueBigIntSafe(value: unknown): string {
+  return JSON.stringify(value, (_key, val) =>
+    typeof val === 'bigint' ? { __bigint_val__: val.toString() } : val
+  );
+}
+
+export function deserializeCacheValueBigIntSafe<T>(raw: string): T {
+  return JSON.parse(raw, (_key, val) => {
+    if (
+      val !== null &&
+      typeof val === 'object' &&
+      '__bigint_val__' in val &&
+      typeof (val as { __bigint_val__: unknown }).__bigint_val__ === 'string'
+    ) {
+      return BigInt((val as { __bigint_val__: string }).__bigint_val__);
+    }
+    return val;
+  }) as T;
+}
 
 export async function getOrComputeAuthorizedCachedSingleFlight<T>(
   redis: {
@@ -243,7 +305,7 @@ export async function getOrComputeAuthorizedCachedSingleFlight<T>(
   const cached = await redis.get(scopedCacheKey);
   if (cached !== null) {
     if (cached === '__NULL__') return null;
-    const parsed = JSON.parse(cached) as T;
+    const parsed = deserializeCacheValueBigIntSafe<T>(cached);
     // CRITICAL: Verify per-user authorization even on a cache hit!
     const allowed = await authorizeResource(parsed, {
       tenantId: params.tenantId,
@@ -265,7 +327,7 @@ export async function getOrComputeAuthorizedCachedSingleFlight<T>(
           return null;
         }
         const jitteredTtl = Math.max(1, Math.floor(params.ttlSeconds * (0.9 + Math.random() * 0.2)));
-        await redis.set(scopedCacheKey, JSON.stringify(fresh), 'EX', jitteredTtl);
+        await redis.set(scopedCacheKey, serializeCacheValueBigIntSafe(fresh), 'EX', jitteredTtl);
         return fresh;
       } finally {
         inFlightLocalPromises.delete(scopedCacheKey);

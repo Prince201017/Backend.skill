@@ -326,7 +326,10 @@ export function redactSensitiveFields(
   if (depth > 8 || obj === null || obj === undefined) return obj;
   if (typeof obj === 'string') {
     return obj
-      .replace(/Bearer\s+[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+/gi, 'Bearer [REDACTED_JWT]')
+      // Strip ANSI terminal escape sequences and control chars to block log/terminal injection (DEVIL-11)
+      .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
+      .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '')
+      .replace(/Bearer\s+[A-Za-z0-9\-._~+/]+=*/gi, 'Bearer [REDACTED_JWT]')
       .replace(/Basic\s+[A-Za-z0-9+/=]{8,}/gi, 'Basic [REDACTED_BASIC_AUTH]')
       .replace(/\b(sk_live_|sk_test_|rk_live_|whsec_)[A-Za-z0-9_]+/g, '[REDACTED_KEY]')
       .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, '[REDACTED_PEM_KEY]');
@@ -357,13 +360,14 @@ export class StructuredLogger {
   ) {}
 
   private write(level: 'INFO' | 'WARN' | 'ERROR', message: string, context: Record<string, unknown>) {
+    const cleanMessage = String(redactSensitiveFields(message));
     const entry = {
       timestamp: new Date().toISOString(),
       level,
       service: this.serviceName,
       env: this.environment,
       version: this.version,
-      message,
+      message: cleanMessage,
       ...(redactSensitiveFields(context) as Record<string, unknown>),
     };
     process.stdout.write(JSON.stringify(entry) + '\n');

@@ -221,6 +221,8 @@ export async function resolveAndPinSafeTarget(
   const httpsAgent = new https.Agent({
     keepAlive: false,
     servername: cleanHost,
+    rejectUnauthorized: true,
+    minVersion: 'TLSv1.2',
     lookup: pinnedLookup,
   });
 
@@ -235,9 +237,15 @@ const SENSITIVE_OUTBOUND_HEADERS = new Set([
   'x-apigateway-api-userinfo',
 ]);
 
+const SAFE_CROSS_ORIGIN_REDIRECT_HEADERS = new Set([
+  'accept',
+  'accept-language',
+  'user-agent',
+]);
+
 /**
  * Transport-Matched, DNS-Pinned Safe HTTPS Fetcher with Hop-by-Hop Redirect Re-Validation,
- * Header Stripping, Hard Timeouts, and Streaming Response-Size Cutoff.
+ * Cross-Origin Redirect Header Stripping, Hard Timeouts, and Streaming Response-Size Cutoff.
  *
  * Why this uses `https.request` with `httpsAgent` instead of `globalThis.fetch(url, { agent })`:
  * Node's built-in `fetch()` uses Undici and silently ignores `https.Agent`! Using `https.request`
@@ -268,14 +276,19 @@ export async function executePinnedSafeHttpsRequest(params: {
   const timeoutMs = params.timeoutMs ?? 5_000;
   const maxResponseBytes = params.maxResponseBytes ?? 2 * 1024 * 1024; // 2MB max response
 
-  // Never forward Authorization, Cookie, or internal gateway headers to untrusted external URLs
-  const safeHeaders: Record<string, string> = {};
+  // Never forward Authorization, Cookie, or internal gateway headers to untrusted external URLs,
+  // and reject any header key/value containing CR, LF, or Null bytes (CRLF injection guard).
+  let currentSafeHeaders: Record<string, string> = {};
   for (const [k, v] of Object.entries(params.headers ?? {})) {
+    if (/[\r\n\0]/.test(k) || /[\r\n\0]/.test(v)) {
+      throw new Error('SSRF_HEADER_INJECTION_BLOCKED: Outbound header contains CR/LF/Null');
+    }
     if (!SENSITIVE_OUTBOUND_HEADERS.has(k.toLowerCase())) {
-      safeHeaders[k] = v;
+      currentSafeHeaders[k] = v;
     }
   }
 
+  const initialOrigin = new URL(params.url).origin;
   let currentUrl = params.url;
   let currentMethod = params.method ?? 'GET';
   let currentBody = params.bodyBuffer;
@@ -286,8 +299,19 @@ export async function executePinnedSafeHttpsRequest(params: {
       dnsResolver: params.dnsResolver,
     });
 
+    // DEVIL-09 Guard: If a redirect crossed to a different origin, strip all custom/application headers!
+    if (pinned.parsedUrl.origin !== initialOrigin) {
+      const strippedHeaders: Record<string, string> = {};
+      for (const [hk, hv] of Object.entries(currentSafeHeaders)) {
+        if (SAFE_CROSS_ORIGIN_REDIRECT_HEADERS.has(hk.toLowerCase())) {
+          strippedHeaders[hk] = hv;
+        }
+      }
+      currentSafeHeaders = strippedHeaders;
+    }
+
     const requestHeaders: Record<string, string> = {
-      ...safeHeaders,
+      ...currentSafeHeaders,
       Host: pinned.parsedUrl.host,
     };
 
@@ -366,8 +390,8 @@ export async function executePinnedSafeHttpsRequest(params: {
         throw new Error(`SSRF_MAX_REDIRECTS_EXCEEDED: Exceeded ${maxRedirects} redirects`);
       }
       const locationHeader = hopResponse.headers['location'] ?? hopResponse.headers['Location'];
-      if (!locationHeader) {
-        throw new Error('SSRF_REDIRECT_ERROR: Redirect response missing Location header');
+      if (!locationHeader || /[\r\n\0]/.test(locationHeader)) {
+        throw new Error('SSRF_REDIRECT_ERROR: Redirect response missing or invalid Location header');
       }
       const nextUrl = new URL(locationHeader, pinned.parsedUrl).toString();
       currentUrl = nextUrl;
@@ -500,7 +524,7 @@ export function extractTrustedClientIpByCidr(params: {
 
 ---
 
-## 4. Anti-Prototype-Pollution Input Sanitizer & Keyed HMAC Audit Chain
+## 4. Anti-Prototype-Pollution Input Sanitizer & Serialized Keyed HMAC Audit Chain (`DEVIL-11` Hardened)
 
 ```typescript
 import crypto from 'node:crypto';
@@ -554,6 +578,7 @@ export function sanitizeUntrustedJsonInput(
 
 export function computeAuditChainHash(params: {
   auditHmacSecret: string;
+  sequenceNumber: bigint;
   prevHashHex: string;
   tenantId: string;
   actorId: string;
@@ -567,6 +592,7 @@ export function computeAuditChainHash(params: {
     throw new Error('AUDIT_CHAIN_ERROR: auditHmacSecret must be at least 32 characters');
   }
   const fields = [
+    params.sequenceNumber.toString(),
     params.prevHashHex,
     params.tenantId,
     params.actorId,

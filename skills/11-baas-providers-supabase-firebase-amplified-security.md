@@ -2,7 +2,7 @@
 
 ## 1. Scope & Threat Model
 
-Backend-as-a-Service (BaaS) platforms expose database query engines (PostgREST, Firestore client SDKs) directly to browser and mobile clients. Any missing Row-Level Security (RLS) policy, unverified JWT claim, or overly permissive document rule allows immediate cross-tenant data exfiltration or unauthorized business state manipulation.
+Backend-as-a-Service (BaaS) platforms expose database query engines (PostgREST, Firestore client SDKs), storage buckets, and Realtime WebSocket channels directly to browser and mobile clients. Any missing Row-Level Security (RLS) policy, unverified JWT claim, `service_role` confused-deputy usage, or overly permissive document rule allows immediate cross-tenant data exfiltration or unauthorized business state manipulation.
 
 ### Trust Boundaries & Failure Modes
 1. **Firebase Firestore Rules Cross-Tenant & State-Machine Bypass**:
@@ -11,10 +11,11 @@ Backend-as-a-Service (BaaS) platforms expose database query engines (PostgREST, 
      - Every multi-tenant Firestore document MUST carry an immutable `tenantId`.
      - Rules MUST verify `isActiveTenantMember(tenantId)` by reading `/databases/$(database)/documents/tenants/$(tenantId)/members/$(request.auth.uid)` and checking `data.status == 'ACTIVE'`.
      - Restricted terminal/privileged states (`'COMPLETED'`, `'APPROVED'`, `'SETTLED'`) MUST only be written by the backend Firebase Admin SDK (which bypasses client rules inside server-side transactions) — client writes are strictly constrained to initial `'DRAFT'` creation and `'DRAFT' -> 'ACTIVE'` transitions.
-2. **Supabase PostgREST & RLS Hardening**:
+2. **Supabase PostgREST, Storage, Realtime & Edge Function Hardening (`DEVIL-12`)**:
    - Revoke all default privileges from the `anon` role on private tables (`REVOKE ALL ON TABLE ... FROM anon`).
    - Never use `user_metadata` inside RLS policies (`auth.jwt() -> 'user_metadata'`), because authenticated users can mutate their own `user_metadata` via `supabase.auth.updateUser()`. Always join against an authoritative `public.tenant_members` table with `status = 'ACTIVE'`.
-   - Never expose `SUPABASE_SERVICE_ROLE_KEY` outside trusted server environments.
+   - **Edge Function `SUPABASE_SERVICE_ROLE_KEY` Confused-Deputy Trap**: Never use a `SUPABASE_SERVICE_ROLE_KEY` client to execute user-parameterized queries in an Edge Function without explicit tenant/role checks; prefer forwarding the caller's `Authorization` header to an `ANON_KEY` client so PostgreSQL RLS policies remain enforced.
+   - **Realtime & Storage RLS**: Enforce explicit RLS on `realtime.messages` and `storage.objects` so clients cannot snoop on another tenant's Realtime Broadcast/Presence channel or bypass Module 05's quarantine malware pipeline.
 
 ---
 
@@ -123,8 +124,6 @@ service cloud.firestore {
 ---
 
 ## 3. Executable Firestore Rule Policy Evaluator & Negative Test Harness
-
-To allow deterministic unit verification in Node.js CI pipelines alongside the Firebase Emulator Suite (`@firebase/rules-unit-testing`), the exact rule predicates are codified below and tested against cross-tenant and unauthorized state-transition attacks:
 
 ```typescript
 // Executable TypeScript — Deterministic Evaluator for /projects/{projectId} Security Policy
@@ -251,10 +250,10 @@ export function evaluateFirestoreProjectRule(params: {
 
 ---
 
-## 4. Supabase RLS Policy Standard (Active Tenant Membership & Role Enforcement)
+## 4. Supabase RLS Policy Standard: Tables, Realtime Channels & Storage (`DEVIL-12` Hardened)
 
 ```sql
--- Authoritative Supabase RLS Policy on public.projects
+-- 1. Authoritative Supabase RLS Policy on public.projects
 ALTER TABLE public.projects ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.projects FORCE ROW LEVEL SECURITY;
 REVOKE ALL ON TABLE public.projects FROM anon;
@@ -291,5 +290,45 @@ CREATE POLICY tenant_active_editor_update_projects
   WITH CHECK (
     -- Clients can never transition a project directly to 'COMPLETED' via PostgREST
     projects.status IN ('DRAFT', 'ACTIVE')
+  );
+
+-- 2. Supabase Realtime Channel Authorization (realtime.messages)
+-- Blocks cross-tenant WebSocket channel snooping on Broadcast/Presence topics ("tenant:<uuid>:events")
+ALTER TABLE realtime.messages ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_realtime_channel_isolation
+  ON realtime.messages
+  FOR SELECT
+  TO authenticated
+  USING (
+    realtime.topic() LIKE 'tenant:%'
+    AND EXISTS (
+      SELECT 1
+      FROM public.tenant_members tm
+      WHERE tm.tenant_id = NULLIF(split_part(realtime.topic(), ':', 2), '')::uuid
+        AND tm.user_id = auth.uid()
+        AND tm.status = 'ACTIVE'
+    )
+  );
+
+-- 3. Supabase Storage RLS (storage.objects)
+-- Never allow direct client downloads from the 'quarantine' bucket; only allow reading 'approved' bucket objects
+-- when the corresponding public.uploads record is in 'APPROVED' state and caller is an ACTIVE tenant member.
+CREATE POLICY storage_approved_objects_only
+  ON storage.objects
+  FOR SELECT
+  TO authenticated
+  USING (
+    bucket_id = 'production'
+    AND EXISTS (
+      SELECT 1
+      FROM public.uploads u
+      INNER JOIN public.tenant_members tm
+        ON tm.tenant_id = u.tenant_id
+      WHERE u.safe_storage_key = storage.objects.name
+        AND u.status = 'APPROVED'
+        AND tm.user_id = auth.uid()
+        AND tm.status = 'ACTIVE'
+    )
   );
 ```

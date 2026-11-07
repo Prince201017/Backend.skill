@@ -409,7 +409,7 @@ export async function authorizeActionFromTrustedStore(params: {
 
 ## 4. Penetration-Hardened Credential, JWT, Refresh Token Family & Gateway Identity Verification
 
-### A. Timing-Safe Login Verification
+### A. Timing-Safe Login Verification with Threadpool Starvation Semaphore
 ```typescript
 import crypto from 'node:crypto';
 import { promisify } from 'node:util';
@@ -426,10 +426,19 @@ const DUMMY_DERIVED_HEX = crypto
   .scryptSync('dummy-penetration-defense-secret', Buffer.from(DUMMY_SALT_HEX, 'hex'), 64)
   .toString('hex');
 
+let activeScryptWorkers = 0;
+const DEFAULT_MAX_CONCURRENT_SCRYPT = 8;
+
 export async function verifyPasswordTimingSafe(
   candidatePassword: string,
-  userHashRecord: PasswordHashRecord | null
+  userHashRecord: PasswordHashRecord | null,
+  maxConcurrentHashes = DEFAULT_MAX_CONCURRENT_SCRYPT
 ): Promise<boolean> {
+  // Defeat libuv threadpool starvation DoS: shed load before queuing unbounded scrypt jobs
+  if (activeScryptWorkers >= maxConcurrentHashes) {
+    throw new Error('AUTH_HASH_CONCURRENCY_LIMIT_EXCEEDED: Too many concurrent password verifications');
+  }
+
   const normalizedPassword = candidatePassword.normalize('NFKC');
   if (Buffer.byteLength(normalizedPassword, 'utf8') > 1024) {
     return false;
@@ -437,20 +446,28 @@ export async function verifyPasswordTimingSafe(
 
   const targetSaltHex = userHashRecord ? userHashRecord.saltHex : DUMMY_SALT_HEX;
   const targetKeyHex = userHashRecord ? userHashRecord.derivedKeyHex : DUMMY_DERIVED_HEX;
-
-  const derivedBuffer = (await scryptAsync(
-    normalizedPassword,
-    Buffer.from(targetSaltHex, 'hex'),
-    64
-  )) as Buffer;
-
-  const expectedBuffer = Buffer.from(targetKeyHex, 'hex');
-  if (derivedBuffer.length !== expectedBuffer.length) {
-    return false;
+  if (!/^[0-9a-fA-F]{32,128}$/.test(targetSaltHex) || !/^[0-9a-fA-F]{128}$/.test(targetKeyHex)) {
+    throw new Error('AUTH_INVALID_STORED_HASH_FORMAT');
   }
 
-  const hashesMatch = crypto.timingSafeEqual(derivedBuffer, expectedBuffer);
-  return userHashRecord !== null && hashesMatch;
+  activeScryptWorkers += 1;
+  try {
+    const derivedBuffer = (await scryptAsync(
+      normalizedPassword,
+      Buffer.from(targetSaltHex, 'hex'),
+      64
+    )) as Buffer;
+
+    const expectedBuffer = Buffer.from(targetKeyHex, 'hex');
+    if (derivedBuffer.length !== expectedBuffer.length) {
+      return false;
+    }
+
+    const hashesMatch = crypto.timingSafeEqual(derivedBuffer, expectedBuffer);
+    return userHashRecord !== null && hashesMatch;
+  } finally {
+    activeScryptWorkers = Math.max(0, activeScryptWorkers - 1);
+  }
 }
 ```
 
@@ -462,6 +479,7 @@ export interface HardenedJwtVerifyOptions {
   publicKeyRing: Readonly<Record<string, crypto.KeyObject>>;
   expectedIssuer: string;
   expectedAudience: string;
+  expectedTyp?: ReadonlySet<string>; // RFC 8725 §3.11 explicit typing (prevents cross-JWT confusion)
   expectedSessionBindingCookie?: string;
   maxTokenLifetimeSeconds?: number;
   isJtiRevoked?: (jti: string) => boolean;
@@ -510,6 +528,18 @@ export function verifyJwtPenetrationSafe(opts: HardenedJwtVerifyOptions): Verifi
   }
   if ('jku' in header || 'x5u' in header || 'jwk' in header || 'x5c' in header) {
     throw new Error('JWT_REJECTED: Dynamic key headers (jku/x5u/jwk/x5c) are forbidden');
+  }
+  // RFC 7515 §4.1.11: Reject any JWT containing unrecognized Critical ('crit') header parameters
+  if ('crit' in header) {
+    throw new Error('JWT_REJECTED: Unsupported critical (crit) header extension');
+  }
+  // RFC 8725 §3.11: Explicit JWT 'typ' verification to block cross-token confusion (e.g. refresh_token as access_token)
+  if (opts.expectedTyp) {
+    const rawTyp = typeof header.typ === 'string' ? header.typ.toLowerCase() : '';
+    const normalizedAllowed = new Set(Array.from(opts.expectedTyp).map((t) => t.toLowerCase()));
+    if (!normalizedAllowed.has(rawTyp)) {
+      throw new Error(`JWT_REJECTED: Unexpected token typ "${String(header.typ)}"`);
+    }
   }
 
   const kid = header.kid;

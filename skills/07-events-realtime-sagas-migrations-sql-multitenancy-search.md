@@ -315,17 +315,47 @@ export async function runOrResumeDurableSaga<TContext>(params: {
 
 ---
 
-## 5. Multi-Tenancy PostgreSQL RLS Template
+## 5. Multi-Tenancy PostgreSQL RLS Architecture, Threat Model & Limitations (`DEVIL-01` Hardened)
+
+### Explicit Threat Model & Limitations of PostgreSQL RLS
+1. **What RLS Protects Against**: Accidental omission of `WHERE tenant_id = $1` in application queries executed by a non-superuser, `NOBYPASSRLS` application database role (`app_runtime`) after `withTenantTransaction()` has verified membership and set the transaction-local context.
+2. **What Naive `current_setting('app.current_tenant_id')` Does NOT Protect Against**:
+   - **SQL Injection Inside `app_runtime`**: In PostgreSQL, any role can call `SELECT set_config('app.current_tenant_id', '<victim_uuid>', true)`. If an application query has a SQL injection vulnerability allowing stacked queries or function calls, an attacker can overwrite `app.current_tenant_id` mid-transaction unless the GUC is paired with a transaction-bound cryptographic MAC (`app.current_tenant_mac`) verified against `txid_current()`!
+   - **Compromised Database Credentials**: Since a shared connection pool uses a single `app_runtime` credential for all tenants, an attacker who steals the `DATABASE_URL` password can connect directly and set any `app.current_tenant_id` unless tenant context activation is gated through a `SECURITY DEFINER` function or per-transaction HMAC.
+   - **Table Owner / `BYPASSRLS` / `SUPERUSER`**: Even with `ENABLE ROW LEVEL SECURITY`, the table owner bypasses RLS unless `FORCE ROW LEVEL SECURITY` is enabled on **every** table, and `SUPERUSER` / `BYPASSRLS` roles always bypass RLS even when `FORCE ROW LEVEL SECURITY` is set!
 
 ```sql
+-- 1. Dedicated Migration Owner vs. Least-Privilege Runtime Role
+CREATE ROLE db_migrator NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
 CREATE ROLE app_runtime LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
 
-ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
-ALTER TABLE orders FORCE ROW LEVEL SECURITY;
+REVOKE ALL ON SCHEMA public FROM PUBLIC;
+GRANT USAGE ON SCHEMA public TO app_runtime;
 
-CREATE POLICY tenant_isolation_policy ON orders
-    USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)
-    WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
+-- 2. Solve the tenant_members Bootstrap Paradox:
+-- Allow withTenantTransaction() to read the caller's own membership row during authorization
+-- BEFORE app.current_tenant_id is populated!
+ALTER TABLE public.tenant_members ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.tenant_members FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_members_self_or_active_tenant_policy ON public.tenant_members
+  FOR SELECT
+  TO app_runtime
+  USING (
+    user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid
+    OR tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid
+  );
+
+-- 3. Strict Tenant Isolation Policy on Domain Tables (Fail-Closed on NULL/Empty GUC)
+ALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.orders FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_isolation_policy ON public.orders
+  AS RESTRICTIVE
+  FOR ALL
+  TO app_runtime
+  USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)
+  WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
 ```
 
 ---

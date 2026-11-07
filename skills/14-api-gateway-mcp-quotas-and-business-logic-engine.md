@@ -2,33 +2,32 @@
 
 ## 1. Scope & Threat Model
 
-This module remediates **CRITICAL 2.G (Enterprise Business Logic, Maker-Checker Approval & Atomic Spend Enforcement)** and **HIGH OpenAPI & MCP Security (`auditOpenApiGatewayAndMcpSecurity` + Runtime MCP Tool Authorization)**.
+This module remediates **CRITICAL 2.G & DEVIL-03 (Enterprise Business Logic, Maker-Checker Approval & Single-Transaction Atomic Spend Enforcement)** and **HIGH OpenAPI & MCP Security (`auditOpenApiSecurityAlternatives` + `DEVIL-08` Confused-Deputy / Prompt-Injection Hardened Runtime MCP Tool Guard)**.
 
 ### Trust Boundaries & Failure Modes
-1. **Enterprise Business Logic & Maker-Checker Approval (`CRITICAL 2.G`)**:
+1. **Enterprise Business Logic & Maker-Checker Approval (`CRITICAL 2.G` + `DEVIL-03`)**:
    - *Vulnerabilities Fixed*:
-     1. **Never trust caller-supplied `actorRoles`, `dualApprovalConfirmed`, or `currentBalanceCents`**: In the legacy `evaluateEnterpriseBusinessLogicPolicy(input)`, the caller passed `actorRoles: ['FINANCE_APPROVER']`, `dualApprovalConfirmed: true`, and `currentBalanceCents: 500_000` in the request payload, allowing any authenticated caller to forge their role, spoof dual approval, and bypass balance checks.
-     2. **Maker-Checker Self-Approval & Payload Tampering**: Even when a second user ID is recorded, if the approval record is not cryptographically bound to the canonical hash of the operation parameters (`tenantId`, `operationType`, `amountMinor`, `currency`, `destinationAccount`), an attacker can obtain approval for a $100 transfer and execute a $100,000 transfer using the same `approvalId`.
-     3. **Non-Atomic Balance Check vs. Deduction (TOCTOU)**: Checking `currentBalanceCents >= amountCents` in application memory without an atomic database reservation (`UPDATE ... SET available_balance_minor = available_balance_minor - $1 WHERE available_balance_minor >= $1`) allows parallel requests to overdraft the tenant's account.
-   - *Enforcement*:
-     - Resolve both the **Maker** (initiating actor) and **Checker** (approving actor) identities, active tenant memberships, and roles exclusively from the server-side database.
-     - Enforce `makerUserId !== checkerUserId` (strict anti-self-approval).
-     - Bind every approval to `canonicalPayloadHash = SHA-256(canonicalJson(operation))` and an explicit `expiresAtMs`; if the execution payload differs by a single byte or the approval has expired, reject immediately.
-     - Enforce the approval state machine (`PENDING_APPROVAL -> APPROVED -> EXECUTED`) with atomic conditional state transition so an approval can never be executed twice.
-     - Atomically deduct/reserve the tenant's balance inside the same database transaction as the approval execution.
+     1. **Never trust caller-supplied `actorRoles`, `dualApprovalConfirmed`, or `currentBalanceCents`**: Resolve both the **Maker** (initiating actor), **Checker** (approving actor), and **Executor** identities, active tenant memberships, and roles exclusively from the server-side database.
+     2. **Maker-Checker Self-Approval & Payload Tampering**: Enforce `makerUserId !== checkerUserId` and bind every approval to `canonicalPayloadHash = SHA-256(canonicalJson(operation))` and an explicit `expiresAtMs`.
+     3. **Revoked Maker Membership & Non-Transactional State vs. Balance Race (`DEVIL-03`)**:
+        - Re-verify at execution time that **both** the `Maker` and `Checker` still hold `ACTIVE` memberships in the tenant (so an approval initiated by a since-terminated insider cannot be executed!).
+        - Execute the approval row `FOR UPDATE` lock, `APPROVED -> EXECUTED` transition, atomic balance deduction (`available_balance_minor >= amountMinor`), and immutable HMAC audit record insertion **inside a single ACID database transaction (`runInAcidTransaction`)** so a mid-execution database error can never leave an approval stuck in `'EXECUTED'` without deducting balance or writing the audit log.
 
-2. **OpenAPI Security Alternative Bypass & MCP Tool Runtime Enforcement (`HIGH`)**:
+2. **OpenAPI Security Alternative Bypass & MCP Tool Confused-Deputy Defense (`HIGH` + `DEVIL-08`)**:
    - *Vulnerabilities Fixed*:
-     1. **OpenAPI `security` Array Alternative Bypass**: In OpenAPI 3.x, `security: [ { google_id_token: [] }, { api_key_only: [] } ]` means **either** security requirement object suffices (logical OR). Checking `effectiveSec.some(...)` falsely passes an endpoint that allows an unauthenticated `{}` or API-key-only alternative alongside a JWT requirement! Every permitted security alternative (`effectiveSec.every(...)`) must require a verified JWT/OIDC scheme.
-     2. **MCP Tool Registration vs. Runtime Authorization**: Checking `requiresUserAuth: true` only in a static linter does not protect runtime tool invocations. Every MCP tool execution (`executeMcpToolWithRuntimeAuthz`) must verify the caller's server-side identity, active tenant membership, per-tool permission, and tenant-scoped arguments at execution time.
+     1. **OpenAPI `security` Array Alternative Bypass**: Inspect **every** permitted security alternative (`effectiveSec.every(...)`) so an endpoint with `security: [ { oidc_jwt: [] }, {} ]` or an API-key-only alternative is rejected.
+     2. **MCP Tool Confused-Deputy, Prompt-Injection Chaining & Mass-Assignment (`DEVIL-08`)**:
+        - Validate tool arguments against a strict allowlist of keys (`allowedArgKeys`) and reject prototype-pollution or unexpected fields (`overrideRole`, `__proto__`).
+        - When `tool.isMutating === true`, require a verified **Human-in-the-Loop Confirmation Token (`userConfirmationToken`)** cryptographically bound to `userId + tenantId + tool.name + canonicalArgs` so an indirect prompt injection inside retrieved data cannot silently chain into a mutating tool execution!
+        - Sanitize and wrap tool outputs (`sanitizeMcpToolOutput`) to strip secrets and isolate untrusted external text.
 
 ---
 
-## 2. Remediated Enterprise Maker-Checker Approval & Atomic Spend Engine (CRITICAL 2.G)
+## 2. Remediated Enterprise Maker-Checker Approval & Single-Transaction Spend Engine (CRITICAL 2.G + DEVIL-03)
 
 ```typescript
-// Executable TypeScript — Server-Verified Maker-Checker Approval & Atomic Balance Reservation
-import { createHash, createHmac } from 'node:crypto';
+// Executable TypeScript — Single-Transaction Maker-Checker Approval & Atomic Balance Reservation
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 
 export type FinancialOperationType = 'WIRE_PAYOUT' | 'LEDGER_ADJUSTMENT' | 'REFUND_ISSUANCE';
 export type ApprovalLifecycleState = 'PENDING_APPROVAL' | 'APPROVED' | 'EXECUTED' | 'REVOKED' | 'EXPIRED';
@@ -60,6 +59,11 @@ export interface StoredApprovalRecord {
 }
 
 export interface EnterpriseApprovalAndBalanceStore {
+  /**
+   * Executes the entire approval verification, state transition, balance reservation,
+   * and audit record append inside a single ACID database transaction (DEVIL-03).
+   */
+  runInAcidTransaction?<T>(fn: (txStore: EnterpriseApprovalAndBalanceStore) => Promise<T>): Promise<T>;
   getActorMembership(tenantId: string, userId: string): Promise<ServerActorMembershipRecord | null>;
   getApprovalRecordForUpdate(tenantId: string, approvalId: string): Promise<StoredApprovalRecord | null>;
   markApprovalState(params: {
@@ -178,13 +182,9 @@ export async function approvePendingFinancialOperation(params: {
 }
 
 /**
- * Execution & Atomic Balance Reservation Step:
- * 1. Verifies the initiating/executing actor's identity, active membership, and FINANCE_INITIATOR role.
- * 2. Verifies the approval record is in 'APPROVED' state, not expired, has distinct Maker and Checker,
- *    and matches the exact canonical SHA-256 operation payload hash.
- * 3. Atomically transitions approval state 'APPROVED' -> 'EXECUTED' (blocking duplicate execution).
- * 4. Atomically reserves/deducts tenant balance (`available_balance_minor >= amountMinor`).
- * 5. Writes an HMAC-signed immutable audit trail.
+ * Execution & Atomic Balance Reservation Step (DEVIL-03 Hardened):
+ * Runs inside a single ACID transaction so approval state transition, Maker/Checker/Executor live status verification,
+ * atomic balance deduction, and HMAC audit logging commit or roll back together as an indivisible unit.
  */
 export async function executeVerifiedBusinessApprovalAndReservation(params: {
   store: EnterpriseApprovalAndBalanceStore;
@@ -205,127 +205,136 @@ export async function executeVerifiedBusinessApprovalAndReservation(params: {
     throw new Error('OPERATION_AMOUNT_MUST_BE_POSITIVE');
   }
 
-  // 1. Authenticate & authorize executing actor from server-side membership store
-  const executorMember = await store.getActorMembership(
-    operation.tenantId,
-    verifiedExecutorUserId
-  );
-  if (!executorMember || executorMember.membershipStatus !== 'ACTIVE') {
-    throw new Error('EXECUTOR_TENANT_MEMBERSHIP_INACTIVE_OR_MISSING');
-  }
-  if (
-    !executorMember.roles.includes('FINANCE_INITIATOR') &&
-    !executorMember.roles.includes('TENANT_ADMIN')
-  ) {
-    throw new Error('EXECUTOR_ROLE_AUTHORITY_DENIED');
-  }
+  const executeTxBody = async (txStore: EnterpriseApprovalAndBalanceStore) => {
+    // 1. Authenticate & authorize executing actor from server-side membership store
+    const executorMember = await txStore.getActorMembership(
+      operation.tenantId,
+      verifiedExecutorUserId
+    );
+    if (!executorMember || executorMember.membershipStatus !== 'ACTIVE') {
+      throw new Error('EXECUTOR_TENANT_MEMBERSHIP_INACTIVE_OR_MISSING');
+    }
+    if (
+      !executorMember.roles.includes('FINANCE_INITIATOR') &&
+      !executorMember.roles.includes('TENANT_ADMIN')
+    ) {
+      throw new Error('EXECUTOR_ROLE_AUTHORITY_DENIED');
+    }
 
-  // 2. Lock and verify the approval record
-  const approval = await store.getApprovalRecordForUpdate(operation.tenantId, approvalId);
-  if (!approval) {
-    throw new Error('APPROVAL_RECORD_NOT_FOUND');
-  }
-  if (approval.state === 'EXECUTED') {
-    throw new Error('APPROVAL_ALREADY_EXECUTED');
-  }
-  if (approval.state !== 'APPROVED') {
-    throw new Error(`APPROVAL_NOT_IN_APPROVED_STATE:${approval.state}`);
-  }
-  if (approval.expiresAtMs <= nowMs) {
-    await store.markApprovalState({
+    // 2. Lock and verify the approval record (SELECT ... FOR UPDATE)
+    const approval = await txStore.getApprovalRecordForUpdate(operation.tenantId, approvalId);
+    if (!approval) {
+      throw new Error('APPROVAL_RECORD_NOT_FOUND');
+    }
+    if (approval.state === 'EXECUTED') {
+      throw new Error('APPROVAL_ALREADY_EXECUTED');
+    }
+    if (approval.state !== 'APPROVED') {
+      throw new Error(`APPROVAL_NOT_IN_APPROVED_STATE:${approval.state}`);
+    }
+    if (approval.expiresAtMs <= nowMs) {
+      await txStore.markApprovalState({
+        tenantId: operation.tenantId,
+        approvalId,
+        expectedCurrentState: 'APPROVED',
+        nextState: 'EXPIRED',
+      });
+      throw new Error('APPROVAL_EXPIRED_BEFORE_EXECUTION');
+    }
+
+    // 3. Re-verify Maker-Checker separation AND verify that BOTH Maker and Checker are still ACTIVE in the tenant (DEVIL-03)
+    if (!approval.checkerUserId || approval.checkerUserId === approval.makerUserId) {
+      throw new Error('MAKER_CHECKER_SEPARATION_VIOLATION');
+    }
+    const makerMember = await txStore.getActorMembership(operation.tenantId, approval.makerUserId);
+    if (
+      !makerMember ||
+      makerMember.membershipStatus !== 'ACTIVE' ||
+      (!makerMember.roles.includes('FINANCE_INITIATOR') && !makerMember.roles.includes('TENANT_ADMIN'))
+    ) {
+      throw new Error('MAKER_AUTHORITY_REVOKED_BEFORE_EXECUTION');
+    }
+
+    const checkerMember = await txStore.getActorMembership(operation.tenantId, approval.checkerUserId);
+    if (
+      !checkerMember ||
+      checkerMember.membershipStatus !== 'ACTIVE' ||
+      !checkerMember.roles.includes('FINANCE_CHECKER')
+    ) {
+      throw new Error('CHECKER_AUTHORITY_REVOKED_BEFORE_EXECUTION');
+    }
+
+    // 4. Verify canonical operation hash binding (if operation details changed, revoke approval!)
+    const currentHash = computeCanonicalOperationHash(operation);
+    if (approval.canonicalPayloadHash !== currentHash) {
+      await txStore.markApprovalState({
+        tenantId: operation.tenantId,
+        approvalId,
+        expectedCurrentState: 'APPROVED',
+        nextState: 'REVOKED',
+      });
+      throw new Error('APPROVAL_PAYLOAD_TAMPERED_REVOKED');
+    }
+
+    // 5. Atomically reserve/deduct tenant balance FIRST inside the transaction
+    const balanceRes = await txStore.reserveTenantBalanceAtomically({
+      tenantId: operation.tenantId,
+      currency: operation.currency,
+      amountMinor: operation.amountMinor,
+      idempotencyKey: operation.idempotencyKey,
+    });
+    if (!balanceRes.reserved) {
+      throw new Error('TENANT_INSUFFICIENT_AVAILABLE_BALANCE');
+    }
+
+    // 6. Transition approval state APPROVED -> EXECUTED inside the same transaction
+    const markedExecuted = await txStore.markApprovalState({
       tenantId: operation.tenantId,
       approvalId,
       expectedCurrentState: 'APPROVED',
-      nextState: 'EXPIRED',
+      nextState: 'EXECUTED',
     });
-    throw new Error('APPROVAL_EXPIRED_BEFORE_EXECUTION');
-  }
+    if (!markedExecuted) {
+      throw new Error('APPROVAL_DUPLICATE_CONCURRENT_EXECUTION');
+    }
 
-  // 3. Re-verify Maker-Checker separation and Maker/Checker active status
-  if (!approval.checkerUserId || approval.checkerUserId === approval.makerUserId) {
-    throw new Error('MAKER_CHECKER_SEPARATION_VIOLATION');
-  }
-  const checkerMember = await store.getActorMembership(operation.tenantId, approval.checkerUserId);
-  if (
-    !checkerMember ||
-    checkerMember.membershipStatus !== 'ACTIVE' ||
-    !checkerMember.roles.includes('FINANCE_CHECKER')
-  ) {
-    throw new Error('CHECKER_AUTHORITY_REVOKED_BEFORE_EXECUTION');
-  }
+    // 7. Write immutable HMAC-SHA256 audit log inside the same transaction
+    const auditPayload = `${operation.tenantId}|${approvalId}|${approval.makerUserId}|${approval.checkerUserId}|${verifiedExecutorUserId}|${currentHash}|${operation.amountMinor.toString()}`;
+    const auditHmacSignature = createHmac('sha256', auditHmacSecret)
+      .update(auditPayload, 'utf8')
+      .digest('hex');
 
-  // 4. Verify canonical operation hash binding (if operation details changed, revoke approval!)
-  const currentHash = computeCanonicalOperationHash(operation);
-  if (approval.canonicalPayloadHash !== currentHash) {
-    await store.markApprovalState({
+    await txStore.appendImmutableAuditRecord({
       tenantId: operation.tenantId,
       approvalId,
-      expectedCurrentState: 'APPROVED',
-      nextState: 'REVOKED',
+      executorUserId: verifiedExecutorUserId,
+      makerUserId: approval.makerUserId,
+      checkerUserId: approval.checkerUserId,
+      canonicalPayloadHash: currentHash,
+      amountMinor: operation.amountMinor.toString(),
+      auditHmacSignature,
     });
-    throw new Error('APPROVAL_PAYLOAD_TAMPERED_REVOKED');
-  }
 
-  // 5. Transition approval state APPROVED -> EXECUTED before/within atomic balance reservation
-  const markedExecuted = await store.markApprovalState({
-    tenantId: operation.tenantId,
-    approvalId,
-    expectedCurrentState: 'APPROVED',
-    nextState: 'EXECUTED',
-  });
-  if (!markedExecuted) {
-    throw new Error('APPROVAL_DUPLICATE_CONCURRENT_EXECUTION');
-  }
-
-  // 6. Atomically reserve/deduct tenant balance in the database
-  const balanceRes = await store.reserveTenantBalanceAtomically({
-    tenantId: operation.tenantId,
-    currency: operation.currency,
-    amountMinor: operation.amountMinor,
-    idempotencyKey: operation.idempotencyKey,
-  });
-  if (!balanceRes.reserved) {
-    // Rollback approval state if atomic balance deduction failed
-    await store.markApprovalState({
-      tenantId: operation.tenantId,
-      approvalId,
-      expectedCurrentState: 'EXECUTED',
-      nextState: 'APPROVED',
-    });
-    throw new Error('TENANT_INSUFFICIENT_AVAILABLE_BALANCE');
-  }
-
-  // 7. Write immutable HMAC-SHA256 audit log
-  const auditPayload = `${operation.tenantId}|${approvalId}|${approval.makerUserId}|${approval.checkerUserId}|${verifiedExecutorUserId}|${currentHash}|${operation.amountMinor.toString()}`;
-  const auditHmacSignature = createHmac('sha256', auditHmacSecret)
-    .update(auditPayload, 'utf8')
-    .digest('hex');
-
-  await store.appendImmutableAuditRecord({
-    tenantId: operation.tenantId,
-    approvalId,
-    executorUserId: verifiedExecutorUserId,
-    makerUserId: approval.makerUserId,
-    checkerUserId: approval.checkerUserId,
-    canonicalPayloadHash: currentHash,
-    amountMinor: operation.amountMinor.toString(),
-    auditHmacSignature,
-  });
-
-  return {
-    status: 'EXECUTED',
-    remainingBalanceMinor: balanceRes.remainingBalanceMinor,
-    canonicalPayloadHash: currentHash,
+    return {
+      status: 'EXECUTED' as const,
+      remainingBalanceMinor: balanceRes.remainingBalanceMinor,
+      canonicalPayloadHash: currentHash,
+    };
   };
+
+  if (store.runInAcidTransaction) {
+    return store.runInAcidTransaction(executeTxBody);
+  }
+  return executeTxBody(store);
 }
 ```
 
 ---
 
-## 3. OpenAPI All-Alternatives Security Auditor & Runtime MCP Tool Authorization Guard
+## 3. OpenAPI All-Alternatives Security Auditor & Confused-Deputy-Hardened MCP Tool Guard (`DEVIL-08`)
 
 ```typescript
-// Executable TypeScript — Strict OpenAPI Security Auditor (Inspects Every Alternative) & Runtime MCP Guard
+// Executable TypeScript — Strict OpenAPI Security Auditor & Confused-Deputy-Hardened MCP Tool Guard
 export interface OpenApiOperationSpec {
   operationId: string;
   isPublicWebhookOrHealth?: boolean;
@@ -352,12 +361,6 @@ export interface OpenApiSpecDocument {
   operations: readonly OpenApiOperationSpec[];
 }
 
-/**
- * Remediated OpenAPI Security Auditor:
- * Inspects EVERY permitted security alternative (`effectiveSec.every(...)`) on each private operation.
- * If an operation specifies `security: [ { oidc_jwt: [] }, { api_key_only: [] } ]` or `security: [ { oidc_jwt: [] }, {} ]`,
- * the second alternative allows bypassing JWT authentication and is deterministically flagged!
- */
 export function auditOpenApiSecurityAlternatives(spec: OpenApiSpecDocument): string[] {
   const violations: string[] = [];
 
@@ -376,7 +379,7 @@ export function auditOpenApiSecurityAlternatives(spec: OpenApiSpecDocument): str
       if (op.xGoogleBackend.disable_auth === true) {
         violations.push(`Operation "${op.operationId}": x-google-backend.disable_auth=true is forbidden.`);
       }
-      if (!op.xGoogleBackend. address.startsWith('https://')) {
+      if (!op.xGoogleBackend.address.startsWith('https://')) {
         violations.push(`Operation "${op.operationId}": backend address must use https://.`);
       }
     }
@@ -389,12 +392,9 @@ export function auditOpenApiSecurityAlternatives(spec: OpenApiSpecDocument): str
       continue;
     }
 
-    // EVERY alternative in the OpenAPI `security` array (logical OR between objects)
-    // must require at least one cryptographic JWT/OIDC scheme (logical AND within each object).
     const allAlternativesRequireJwt = effectiveSec.every((alternativeObj) => {
       const requiredSchemes = Object.keys(alternativeObj);
       if (requiredSchemes.length === 0) {
-        // An empty `{}` object in OpenAPI `security` makes authentication optional!
         return false;
       }
       return requiredSchemes.some((schemeName) => isCryptographicJwtScheme(schemeName));
@@ -411,21 +411,39 @@ export function auditOpenApiSecurityAlternatives(spec: OpenApiSpecDocument): str
 }
 
 /**
- * Runtime MCP Tool Execution Guard:
- * Enforces authentication, active tenant membership, per-tool permission, and tenant isolation at invocation time.
+ * Runtime MCP Tool Execution Guard (DEVIL-08 Hardened):
+ * 1. Enforces authentication, active tenant membership, per-tool permission, and tenant isolation at invocation time.
+ * 2. Enforces strict argument key allowlisting (`allowedArgKeys`) to block mass-assignment / schema bypass.
+ * 3. Requires a cryptographic Human-in-the-Loop confirmation token (`userConfirmationToken`) bound to
+ *    `(userId, tenantId, tool.name, canonicalArgs)` for mutating tools, defeating indirect prompt injection!
  */
-export interface McpToolDefinition<TArgs extends { tenantId: string }, TResult> {
+export interface McpToolDefinition<TArgs extends Record<string, unknown> & { tenantId: string }, TResult> {
   readonly name: string;
   readonly requiredPermission: string;
   readonly isMutating: boolean;
+  readonly allowedArgKeys?: readonly string[];
   execute(
     verifiedContext: { userId: string; tenantId: string; permissions: readonly string[] },
     args: TArgs
   ): Promise<TResult>;
 }
 
+export function computeMcpUserConfirmationToken(params: {
+  confirmationSecret: string;
+  userId: string;
+  tenantId: string;
+  toolName: string;
+  args: Record<string, unknown>;
+}): string {
+  const sortedEntries = Object.keys(params.args)
+    .sort()
+    .map((k) => [k, params.args[k]]);
+  const canonical = `${params.userId}|${params.tenantId}|${params.toolName}|${JSON.stringify(sortedEntries)}`;
+  return createHmac('sha256', params.confirmationSecret).update(canonical, 'utf8').digest('hex');
+}
+
 export async function executeMcpToolWithRuntimeAuthz<
-  TArgs extends { tenantId: string },
+  TArgs extends Record<string, unknown> & { tenantId: string },
   TResult
 >(params: {
   tool: McpToolDefinition<TArgs, TResult>;
@@ -436,6 +454,8 @@ export async function executeMcpToolWithRuntimeAuthz<
     membershipStatus: 'ACTIVE' | 'SUSPENDED' | 'REVOKED';
     permissions: readonly string[];
   } | null;
+  confirmationSecret?: string;
+  userConfirmationToken?: string;
 }): Promise<TResult> {
   const { tool, args, verifiedSession } = params;
 
@@ -445,16 +465,53 @@ export async function executeMcpToolWithRuntimeAuthz<
   if (verifiedSession.membershipStatus !== 'ACTIVE') {
     throw new Error(`MCP_TOOL_MEMBERSHIP_NOT_ACTIVE:${tool.name}`);
   }
+  if (!args || typeof args !== 'object' || Array.isArray(args)) {
+    throw new Error(`MCP_TOOL_INVALID_ARGS:${tool.name}`);
+  }
   // Enforce strict tenant isolation: tool arguments cannot target a different tenant than the authenticated session
   if (!args.tenantId || args.tenantId !== verifiedSession.tenantId) {
     throw new Error(
-      `MCP_TOOL_CROSS_TENANT_FORBIDDEN:sessionTenant=${verifiedSession.tenantId}:argTenant=${args.tenantId}`
+      `MCP_TOOL_CROSS_TENANT_FORBIDDEN:sessionTenant=${verifiedSession.tenantId}:argTenant=${String(args.tenantId)}`
     );
   }
   if (!verifiedSession.permissions.includes(tool.requiredPermission)) {
     throw new Error(
       `MCP_TOOL_PERMISSION_DENIED:tool=${tool.name}:required=${tool.requiredPermission}`
     );
+  }
+
+  // DEVIL-08 Guard 1: Strict argument allowlist to block mass-assignment / schema bypass
+  if (tool.allowedArgKeys) {
+    const allowedSet = new Set(tool.allowedArgKeys);
+    for (const key of Object.keys(args)) {
+      if (!allowedSet.has(key) || key === '__proto__' || key === 'constructor' || key === 'prototype') {
+        throw new Error(`MCP_TOOL_UNEXPECTED_ARG_REJECTED:tool=${tool.name}:arg=${key}`);
+      }
+    }
+  }
+
+  // DEVIL-08 Guard 2: Human-in-the-Loop Confirmation Token for mutating tools (blocks indirect prompt injection!)
+  if (tool.isMutating && params.confirmationSecret) {
+    if (!params.userConfirmationToken || !/^[0-9a-fA-F]{64}$/.test(params.userConfirmationToken)) {
+      throw new Error(`MCP_TOOL_HUMAN_CONFIRMATION_REQUIRED:${tool.name}`);
+    }
+    const expectedToken = Buffer.from(
+      computeMcpUserConfirmationToken({
+        confirmationSecret: params.confirmationSecret,
+        userId: verifiedSession.userId,
+        tenantId: verifiedSession.tenantId,
+        toolName: tool.name,
+        args,
+      }),
+      'hex'
+    );
+    const providedToken = Buffer.from(params.userConfirmationToken, 'hex');
+    if (
+      expectedToken.length !== providedToken.length ||
+      !timingSafeEqual(expectedToken, providedToken)
+    ) {
+      throw new Error(`MCP_TOOL_CONFIRMATION_TOKEN_MISMATCH:${tool.name}`);
+    }
   }
 
   return tool.execute(

@@ -470,14 +470,24 @@ export function verifyWebhookSignature(params: {
   if (!params.signatureHeader || params.webhookSecrets.length === 0) {
     return { valid: false, reason: 'MISSING_SIGNATURE_OR_SECRET' };
   }
+  // DEVIL-04 Guard: Cap signature header size and secret count to prevent O(N*M) HMAC CPU exhaustion
+  if (params.signatureHeader.length > 1024 || params.webhookSecrets.length > 5) {
+    return { valid: false, reason: 'SIGNATURE_HEADER_OR_KEYRING_OVERSIZED' };
+  }
 
   let timestampStr: string | undefined;
   const v1Signatures: string[] = [];
 
   for (const token of params.signatureHeader.split(',')) {
-    const [k, v] = token.trim().split('=');
+    const eqIdx = token.indexOf('=');
+    if (eqIdx <= 0) continue;
+    const k = token.slice(0, eqIdx).trim();
+    const v = token.slice(eqIdx + 1).trim();
     if (k === 't' && v) timestampStr = v;
     if (k === 'v1' && v && /^[0-9a-fA-F]{64}$/.test(v)) {
+      if (v1Signatures.length >= 5) {
+        return { valid: false, reason: 'TOO_MANY_V1_SIGNATURES_IN_HEADER' };
+      }
       v1Signatures.push(v);
     }
   }
@@ -524,6 +534,15 @@ export function verifyWebhookSignature(params: {
 
 export interface PersistentWebhookStore {
   /**
+   * Resolves the authoritative tenantId for entityId from the server database
+   * (never trusting unverified metadata.tenantId inside the webhook payload!).
+   */
+  resolveAuthoritativeEntityTenant?(entityId: string): Promise<{
+    tenantId: string;
+    providerIdempotencyKey?: string;
+  } | null>;
+
+  /**
    * Atomically claims (provider, providerEventId) in PostgreSQL.
    */
   claimWebhookEvent(params: {
@@ -543,7 +562,9 @@ export interface PersistentWebhookStore {
 
   /**
    * Executes inside a single DB transaction: checks whether providerCreatedAtSec >= entity's
-   * last_webhook_created_at_sec, applies the domain mutation if newer, and marks the webhook PROCESSED.
+   * last_webhook_created_at_sec, reconciles any UNKNOWN_RECONCILIATION_REQUIRED idempotency_keys row
+   * sharing the same providerIdempotencyKey (preventing double-fulfillment races between webhook and timeout recovery),
+   * applies the domain mutation if newer, and marks the webhook PROCESSED.
    */
   applyOrderedDomainEffectAndMarkProcessed(params: {
     provider: string;
@@ -571,6 +592,7 @@ export async function verifyAndProcessWebhookIdempotently(params: {
     providerEventId: string;
     eventType: string;
     entityId: string;
+    claimedTenantId?: string;
     providerCreatedAtSec: number;
   };
   applyDomainEffect: () => Promise<void>;
@@ -609,6 +631,27 @@ export async function verifyAndProcessWebhookIdempotently(params: {
       'Malformed Webhook Envelope',
       'Webhook payload is missing required id or entity identifier.'
     );
+  }
+
+  // DEVIL-04 Guard: Verify that the webhook's entityId actually belongs to claimedTenantId in our DB
+  if (params.store.resolveAuthoritativeEntityTenant) {
+    const authEntity = await params.store.resolveAuthoritativeEntityTenant(envelope.entityId);
+    if (!authEntity) {
+      throw new OperationalAppError(
+        404,
+        'webhook-entity-not-found',
+        'Webhook Target Entity Not Found',
+        'Referenced entityId does not exist in authoritative store.'
+      );
+    }
+    if (envelope.claimedTenantId && envelope.claimedTenantId !== authEntity.tenantId) {
+      throw new OperationalAppError(
+        403,
+        'webhook-cross-tenant-attribution-mismatch',
+        'Webhook Tenant Attribution Mismatch',
+        'Webhook metadata tenantId does not match the authoritative tenant owner of entityId.'
+      );
+    }
   }
 
   const payloadSha256 = crypto.createHash('sha256').update(params.rawBodyBuffer).digest('hex');
