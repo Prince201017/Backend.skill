@@ -14,7 +14,9 @@ description: >
   malware scanning, lease-based background job workers, observability, testing,
   zero-downtime migrations, advanced SQL, multi-tenancy, search, SSRF/CSRF/BOLA API
   security, KMS/Vault secrets, PITR/DR, networking, microservices, AI gateways,
-  and data governance.
+  data governance, omnichannel notifications/email/SMS/OTP/push/chat delivery,
+  complete BaaS provider architectures (Supabase, Firebase, Convex, Appwrite, Amplify,
+  PocketBase), and incoming/outgoing request I/O tracing with correlated log telemetry.
 ---
 
 # Advanced Backend Development Skill (Zero-Loss Architecture & Execution Constitution)
@@ -34,7 +36,11 @@ Load the modular reference specifications in `references/` according to the arch
 - `references/06-async-queues-observability-testing-devops.md` — **Lease-Safe Job Queues, Observability, Testing & DevOps**: Atomic job acquisition, lease ownership (`workerInstanceId`), heartbeat lease renewal, `IN_PROGRESS` duplicate prevention, stalled-job crash recovery, DLQ replay procedures, structured JSON logging, Prometheus metrics, OpenTelemetry tracing, Unit/Integration/E2E testing, and Docker/Kubernetes/CI-CD.
 - `references/07-events-realtime-sagas-migrations-sql-multitenancy-search.md` — **Events, WebSockets, SSE, Sagas, Zero-Downtime Migrations, Advanced SQL, Multi-Tenancy & Search**: Kafka/RabbitMQ/NATS, WebSocket rooms/heartbeats, SSE `Last-Event-ID`, Saga orchestration/compensation, Expand-and-Contract migrations, partitioning/window functions/EXPLAIN, RLS/schema/database multi-tenancy, and Elasticsearch/OpenSearch/Meilisearch/pgvector.
 - `references/08-api-security-secrets-dr-networking-microservices-ai-governance.md` — **API Security, KMS/Vault, Disaster Recovery, Networking, Microservices, AI Infrastructure & Data Governance**: SSRF/CSRF/XSS/CORS/SQLi/BOLA defense, KMS/Vault key rotation, PITR/RPO/RTO disaster recovery, DNS/L4-L7 proxies/service discovery, DDD microservices, AI model gateways & streaming inference queues, and PII retention/crypto-shredding/audit trails.
-- `references/09-adversarial-security-audit-and-verification-harness.md` — **Adversarial Security Audit & Defensive Verification Harness**: Complete penetration/vulnerability audit report of all skill primitives (SSRF DNS-rebinding TOCTOU pinning, IPv6 NAT64/6to4/hex-mapped filters, PDF `#XX` hex-escape polyglot stream blocking, fail-closed `NULLIF` RLS, Saga compensation retries, multi-signature webhook rotation, and executable CI security verification suite).
+- `references/09-adversarial-security-audit-and-verification-harness.md` — **Adversarial Security Audit & Defensive Verification Harness**: Complete penetration/vulnerability audit report of all skill primitives (SSRF DNS-rebinding TOCTOU pinning, IPv6 NAT64/6to4/hex-mapped filters, PDF `#XX` hex-escape polyglot stream blocking, fail-closed `NULLIF` RLS, Saga compensation retries, multi-signature webhook rotation, Messaging/BaaS hardening vectors, and executable CI security verification suite).
+- `references/10-omnichannel-notifications-email-messaging-security.md` — **Omnichannel Notifications, Email, SMS/WhatsApp/OTP, Push & Chat Delivery Architecture**: Priority queue isolation (`P0_CRITICAL`..`P3_BULK`), Definitive-vs-Ambiguous multi-provider failover, SMTP CRLF & SSTI sanitization, DKIM/SPF/DMARC/ARC + RFC 8058 one-click unsubscribe, SMS toll-fraud & country-prefix cost caps, and HMAC-SHA256 OTP brute-force protection.
+- `references/11-baas-providers-supabase-firebase-amplified-security.md` — **Complete BaaS Provider Architecture & Security Hardening (Supabase, Firebase, Convex, Appwrite, AWS Amplify, PocketBase)**: Supabase PostgreSQL RLS (`auth.jwt() -> 'app_metadata'`), PostgREST schema lockdown, `SECURITY DEFINER` search_path hardening, Firebase 8-Pillar `firestore.rules` fortress, `firebase-blueprint.json` IR sync, `handleFirestoreError`, App Check, and Hexagonal Anti-Lock-In Repository Adapters.
+- `references/12-request-io-tracing-service-visualization-and-log-correlation.md` — **Incoming/Outgoing Request I/O Tracing, Service Dependency Visualization & Correlated Log Telemetry**: W3C `traceparent` propagation, PII-scrubbed I/O envelope snapshots, 5-stage service hop DAG capture (`Ingress -> Auth/RBA -> BaaS/DB -> Outbox/Queue -> Outbound Provider`), and correlated structured JSON log telemetry.
+- `references/13-critical-risk-audit-reliability-and-production-readiness.md` — **12-Domain Critical Risk Audit, Database Constraints, API Boundary Guards & Production Reliability**: Pre-deployment audit matrix (AuthN, AuthZ, DB Constraints, Secrets/AAD Encryption, Input Validation, Multi-Tenancy, Uploads, Rate Limiting, Transactions, Safe Error Boundary, Supply-Chain Dependencies, Testing/Reliability), composite tenant foreign keys, `withTenantTransaction` (`SET LOCAL`), `assertNoSecretsExposedToFrontendEnv`, CORS/CSRF guards, `/healthz` + `/readyz` probes, and `SIGTERM` graceful shutdown draining.
 
 ---
 
@@ -177,4 +183,27 @@ Every backend created using this skill MUST enforce these 12 penetration-testing
 | **10. Webhook Replay & Secret-Rotation Signature Bypass** | Verify raw request bytes against all active/retiring secrets and all `v1=` signatures in constant time (`crypto.timingSafeEqual`), enforce a $\pm 300\text{s}$ timestamp window, and deduplicate `event_id` in `inbox_processed_events`. |
 | **11. Duplicate Background Worker Execution & Zombie Leases** | Handle `ALREADY_COMPLETED` and `IN_PROGRESS` explicitly in workers, increment a monotonic `fencing_token` on every lease acquisition, renew leases via heartbeat, and reject stale worker writes whose `fencing_token` no longer matches. |
 | **12. GraphQL Batching / Alias Brute-Force Amplification** | Enforce max query depth ($\le 8$), max aliases per document ($\le 15$), max mutation batch size ($\le 1$), query cost limits, and per-resolver rate limiting. |
+
+---
+
+## 9. Omnichannel Notification, Email, SMS/OTP, Push & Chat Delivery (`Module 10`)
+
+1. **4-Lane Priority Queue Isolation**: Separate `P0_CRITICAL` (OTP / security alerts), `P1_TRANSACTIONAL` (receipts / password resets), `P2_COLLABORATIVE` (mentions / assignments), and `P3_BULK` (marketing campaigns) so bulk jobs never delay critical OTPs.
+2. **Definitive vs. Ambiguous Multi-Provider Failover**: Only trigger automatic secondary provider failover (e.g., AWS SES -> Postmark, Twilio -> Vonage) on `DEFINITIVE_PRE_ACCEPTANCE` errors (`CONNECT_TIMEOUT`, `HTTP_502/503/504`, `HTTP_429`). Hold `AMBIGUOUS_POST_WRITE` timeouts in `PENDING_RECONCILIATION` to prevent duplicate delivery.
+3. **Anti-Abuse, SMTP CRLF Guard & SMS Toll-Fraud Prevention**: Reject `\r`/`\n` in all email headers, compile strictly logic-less pre-registered template ASTs, enforce country-prefix risk-tier SMS budgets (`TIER_1`..`TIER_3_HIGH_RISK`), and never bypass transport-level `HARD_BOUNCE` or `SPAM_COMPLAINT` suppressions (use Cross-Channel Fallback instead).
+
+---
+
+## 10. Complete BaaS Provider Architecture & Hardening (`Module 11`)
+
+1. **Supabase**: Enforce RLS on every `public` table using `auth.jwt() -> 'app_metadata'` (never client-writable `user_metadata`), isolate `service_role` strictly on the server, lock down `SET search_path = public, pg_temp` on `SECURITY DEFINER` functions, and scope Storage RLS to `storage.foldername(name)[1] = auth.uid()::text`.
+2. **Firebase**: Enforce the 8-Pillar `firestore.rules` Fortress (`rules_version = '2'`, default deny, `isValid[Entity]` schema/size bounds, `affectedKeys().hasOnly()`, immutable ownership, Query Enforcer `allow list`), keep `firebase-blueprint.json` in sync, and wrap client SDK calls with `handleFirestoreError`.
+3. **Hexagonal Anti-Lock-In Adapters**: Wrap BaaS SDKs (Supabase, Firebase, Convex, Appwrite, Amplify, PocketBase) behind domain repository and auth verifier interfaces (`ITenantDocumentRepository`, `IBaaSAuthVerifier`) so business logic remains portable.
+
+---
+
+## 11. Request I/O Tracing, Service Topology & Correlated Logs (`Module 12`)
+
+1. **End-to-End W3C `traceparent` Correlation**: Mint or propagate `trace_id` and `span_id` across every hop (`INGRESS_GATEWAY` -> `AUTH_RBA_ENGINE` -> `BAAS_DATA_PLANE` -> `ASYNC_OUTBOX_RELAY` -> `EGRESS_EXTERNAL_PROVIDER`).
+2. **PII-Scrubbed I/O Envelopes**: Redact secrets, tokens, PANs, and OTPs (`scrubIoPayload`) and enforce byte-size caps before recording request/response snapshots or emitting structured JSON logs.
 

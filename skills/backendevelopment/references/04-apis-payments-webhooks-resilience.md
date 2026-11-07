@@ -38,12 +38,86 @@ Never return inconsistent `{ error: "..." }` or `{ message: "..." }` shapes. Sta
 }
 ```
 
+### Safe Error Boundary Serializer (Zero Stack-Trace or SQL Constraint Leakage)
+Never serialize raw `Error.stack`, database error codes/table names (`duplicate key value violates unique constraint "users_email_key"`), or internal file paths in HTTP responses. Only expose operational `AppError` details; mask all unexpected/internal exceptions as generic `500 Internal Server Error` while logging the full stack internally with `traceId`:
+
+```typescript
+export class OperationalAppError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly typeSlug: string,
+    public readonly title: string,
+    public readonly detail: string,
+    public readonly fieldErrors?: Array<{ field: string; code: string; message: string }>
+  ) {
+    super(detail);
+  }
+}
+
+export function toSafeProblemDetailsResponse(params: {
+  error: unknown;
+  instancePath: string;
+  requestId: string;
+  traceId: string;
+  logInternalError: (err: unknown, meta: { requestId: string; traceId: string }) => void;
+}): { status: number; headers: Record<string, string>; body: Record<string, unknown> } {
+  const timestamp = new Date().toISOString();
+  const headers = {
+    'Content-Type': 'application/problem+json; charset=utf-8',
+    'X-Content-Type-Options': 'nosniff',
+    'Cache-Control': 'no-store',
+    'X-Request-Id': params.requestId,
+    'X-Trace-Id': params.traceId,
+  };
+
+  if (params.error instanceof OperationalAppError) {
+    return {
+      status: params.error.status,
+      headers,
+      body: {
+        type: `https://api.example.com/errors/${params.error.typeSlug}`,
+        title: params.error.title,
+        status: params.error.status,
+        detail: params.error.detail,
+        instance: params.instancePath,
+        requestId: params.requestId,
+        traceId: params.traceId,
+        timestamp,
+        ...(params.error.fieldErrors ? { errors: params.error.fieldErrors } : {}),
+      },
+    };
+  }
+
+  // Unexpected/internal error (e.g., PostgreSQL syntax/constraint error, Redis timeout, TypeError):
+  // Log full stack & DB metadata internally, but return an opaque 500 response to the client!
+  params.logInternalError(params.error, {
+    requestId: params.requestId,
+    traceId: params.traceId,
+  });
+
+  return {
+    status: 500,
+    headers,
+    body: {
+      type: 'https://api.example.com/errors/internal-server-error',
+      title: 'Internal Server Error',
+      status: 500,
+      detail: 'An unexpected internal error occurred. Reference traceId for support.',
+      instance: params.instancePath,
+      requestId: params.requestId,
+      traceId: params.traceId,
+      timestamp,
+    },
+  };
+}
+```
+
 ---
 
-## 2. Payment Endpoints, Idempotency Keys & Signed Webhook Verification
+## 2. Payment Endpoints, Atomic Idempotency State Machine & Signed Webhook Verification
 
-### Idempotency Middleware State Machine
-Every mutating financial or order endpoint (`POST /api/v1/payments/intents`, `POST /api/v1/refunds`) MUST enforce an `Idempotency-Key` header:
+### Atomic Idempotency Middleware State Machine
+Every mutating financial or order endpoint (`POST /api/v1/payments/intents`, `POST /api/v1/refunds`, `POST /api/v1/orders`) MUST enforce an `Idempotency-Key` header using a single atomic `INSERT ... ON CONFLICT` state transition (never a race-prone `SELECT`-then-`INSERT`):
 
 ```sql
 CREATE TABLE idempotency_keys (
@@ -60,15 +134,108 @@ CREATE TABLE idempotency_keys (
 );
 ```
 
-- If `(tenant_id, idempotency_key)` exists:
-  - If `request_hash` differs from the current payload: return `422 Unprocessable Entity` (`IDEMPOTENCY_KEY_PAYLOAD_MISMATCH`).
-  - If `status === 'IN_PROGRESS'` and `locked_until > NOW()`: return `409 Conflict` (`REQUEST_IN_FLIGHT`) with `Retry-After: 2`.
-  - If `status === 'COMPLETED'`: return the stored `response_status` and `response_body` with header `Idempotent-Replayed: true`.
-
-### Cryptographic Payment Webhook Verification (Anti-Replay + Constant-Time HMAC)
 ```typescript
 import crypto from 'node:crypto';
 
+export interface IdempotencyRow {
+  request_hash: string;
+  status: 'IN_PROGRESS' | 'COMPLETED' | 'FAILED';
+  response_status: number | null;
+  response_body: Record<string, unknown> | null;
+  is_lock_expired: boolean;
+}
+
+export async function executeWithIdempotencyLock(params: {
+  tenantId: string;
+  idempotencyKey: string;
+  endpoint: string;
+  canonicalRequestBody: string;
+  lockTtlSeconds?: number;
+  db: {
+    tryAcquireLock: (
+      tenantId: string,
+      key: string,
+      endpoint: string,
+      reqHash: string,
+      ttlSec: number
+    ) => Promise<{ acquired: boolean; existing?: IdempotencyRow }>;
+    completeLock: (
+      tenantId: string,
+      key: string,
+      status: number,
+      body: Record<string, unknown>
+    ) => Promise<void>;
+    releaseFailedLock: (tenantId: string, key: string) => Promise<void>;
+  };
+  handler: () => Promise<{ status: number; body: Record<string, unknown> }>;
+}): Promise<{ status: number; body: Record<string, unknown>; replayed: boolean }> {
+  if (!params.idempotencyKey || !/^[a-zA-Z0-9_.:-]{8,128}$/.test(params.idempotencyKey)) {
+    throw new OperationalAppError(
+      400,
+      'invalid-idempotency-key',
+      'Invalid Idempotency-Key Header',
+      'Idempotency-Key must be 8..128 alphanumeric/safe characters.'
+    );
+  }
+
+  const reqHash = crypto
+    .createHash('sha256')
+    .update(`${params.endpoint}:${params.canonicalRequestBody}`, 'utf8')
+    .digest('hex');
+
+  const lockRes = await params.db.tryAcquireLock(
+    params.tenantId,
+    params.idempotencyKey,
+    params.endpoint,
+    reqHash,
+    params.lockTtlSeconds ?? 60
+  );
+
+  if (!lockRes.acquired && lockRes.existing) {
+    const ex = lockRes.existing;
+    if (ex.request_hash !== reqHash) {
+      throw new OperationalAppError(
+        422,
+        'idempotency-payload-mismatch',
+        'Idempotency Key Payload Mismatch',
+        'The same Idempotency-Key was reused with different request parameters.'
+      );
+    }
+    if (ex.status === 'COMPLETED' && ex.response_status !== null && ex.response_body !== null) {
+      return {
+        status: ex.response_status,
+        body: ex.response_body,
+        replayed: true,
+      };
+    }
+    if (ex.status === 'IN_PROGRESS' && !ex.is_lock_expired) {
+      throw new OperationalAppError(
+        409,
+        'request-in-flight',
+        'Concurrent Request In Flight',
+        'A request with this Idempotency-Key is currently being processed. Retry after 2 seconds.'
+      );
+    }
+  }
+
+  try {
+    const result = await params.handler();
+    await params.db.completeLock(
+      params.tenantId,
+      params.idempotencyKey,
+      result.status,
+      result.body
+    );
+    return { ...result, replayed: false };
+  } catch (err) {
+    await params.db.releaseFailedLock(params.tenantId, params.idempotencyKey);
+    throw err;
+  }
+}
+```
+
+### Cryptographic Payment Webhook Verification (Anti-Replay + Constant-Time HMAC)
+```typescript
 export function verifyWebhookSignature(params: {
   rawBodyBuffer: Buffer;
   signatureHeader: string; // Supports multiple v1 signatures during secret rotation: "t=1762388805,v1=sig1,v1=sig2"
@@ -136,12 +303,12 @@ export function verifyWebhookSignature(params: {
 
 ## 3. Distributed Rate Limiting & Throttling (Atomic Redis Token Bucket Lua Script)
 
-Never implement rate limiting with separate `GET` and `SET` calls (race conditions allow bursts under concurrency). Execute an atomic Redis Lua script:
+Never implement rate limiting with separate `GET` and `SET` calls (race conditions allow bursts under concurrency). Execute an atomic Redis Lua script with strict input bounds:
 
 ```lua
 -- KEYS[1] = rate limit bucket key (e.g., "rl:login:ip:203.0.113.5")
 -- ARGV[1] = capacity (max burst tokens, e.g., 10)
--- ARGV[2] = refill_rate_per_ms (tokens added per millisecond)
+-- ARGV[2] = refill_rate_per_ms (tokens added per millisecond, MUST be > 0)
 -- ARGV[3] = now_ms (current timestamp in milliseconds)
 -- ARGV[4] = requested_tokens (usually 1)
 
@@ -150,6 +317,10 @@ local capacity = tonumber(ARGV[1])
 local refill_rate = tonumber(ARGV[2])
 local now_ms = tonumber(ARGV[3])
 local requested = tonumber(ARGV[4])
+
+if not capacity or capacity <= 0 or not refill_rate or refill_rate <= 0 or not requested or requested <= 0 then
+  return redis.error_reply("ERR_INVALID_RATE_LIMIT_ARGUMENTS")
+end
 
 local data = redis.call("HMGET", key, "tokens", "last_refill")
 local tokens = tonumber(data[1])
@@ -174,7 +345,7 @@ else
   retry_after_ms = math.ceil((requested - tokens) / refill_rate)
 end
 
-local ttl_ms = math.ceil((capacity / refill_rate) * 2)
+local ttl_ms = math.max(1000, math.ceil((capacity / refill_rate) * 2))
 redis.call("HMSET", key, "tokens", tokens, "last_refill", last_refill)
 redis.call("PEXPIRE", key, ttl_ms)
 

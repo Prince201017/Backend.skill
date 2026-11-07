@@ -41,6 +41,7 @@ CREATE TABLE outbox_events (
     payload JSONB NOT NULL,
     traceparent VARCHAR(128) NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    leased_until TIMESTAMPTZ NULL,
     processed_at TIMESTAMPTZ NULL,
     relay_attempts INT NOT NULL DEFAULT 0,
     last_error TEXT NULL
@@ -59,7 +60,12 @@ CREATE TABLE inbox_processed_events (
 );
 ```
 
-### Committed Outbox Relay & Idempotent Consumer Implementation
+### Committed Outbox Relay (2-Phase Lease Claim — Zero DB Locks Held Across Network I/O) & Idempotent Consumer
+Never hold a PostgreSQL `BEGIN ... FOR UPDATE` transaction open while awaiting external broker network I/O (which exhausts connection pools and rolls back all 100 rows if row 99 fails to publish). Instead:
+1. **Phase 1 (Short DB Transaction)**: Atomically claim a batch of committed rows using `FOR UPDATE SKIP LOCKED` and set `leased_until = clock_timestamp() + interval '30 seconds'`, then `COMMIT` immediately.
+2. **Phase 2 (Network I/O Outside DB Transaction)**: Publish each claimed event to the broker and collect the subset of `publishedIds` that succeeded.
+3. **Phase 3 (Short DB Update)**: Mark `processed_at = clock_timestamp()` for all `publishedIds` that succeeded. Any failed rows automatically become eligible again after `leased_until` expires.
+
 ```typescript
 export interface OutboxRecord {
   event_id: string;
@@ -71,50 +77,59 @@ export interface OutboxRecord {
 }
 
 /**
- * Step 5 & 6: Relay polls ONLY committed rows using READ COMMITTED + FOR UPDATE SKIP LOCKED.
+ * Step 5 & 6: Relay claims committed rows with a short lease, releases the DB transaction,
+ * publishes over the network, and marks succeeded rows as processed.
  */
 export async function runCommittedOutboxRelayBatch(
   dbClient: { query: (sql: string, params?: unknown[]) => Promise<{ rows: OutboxRecord[]; rowCount: number }> },
   brokerPublish: (record: OutboxRecord) => Promise<void>,
   batchSize = 100
 ): Promise<number> {
-  await dbClient.query('BEGIN ISOLATION LEVEL READ COMMITTED');
-  try {
-    // PostgreSQL FOR UPDATE SKIP LOCKED only locks committed rows that are not locked by another relay worker
-    const { rows } = await dbClient.query(
-      `SELECT event_id, aggregate_type, aggregate_id, event_type, payload, traceparent
+  // Phase 1: Claim committed rows atomically and release DB locks immediately
+  const { rows } = await dbClient.query(
+    `UPDATE outbox_events
+     SET leased_until = clock_timestamp() + interval '30 seconds',
+         relay_attempts = relay_attempts + 1
+     WHERE event_id IN (
+       SELECT event_id
        FROM outbox_events
        WHERE processed_at IS NULL
+         AND (leased_until IS NULL OR leased_until < clock_timestamp())
        ORDER BY created_at ASC
        LIMIT $1
-       FOR UPDATE SKIP LOCKED`,
-      [batchSize]
-    );
+       FOR UPDATE SKIP LOCKED
+     )
+     RETURNING event_id, aggregate_type, aggregate_id, event_type, payload, traceparent`,
+    [batchSize]
+  );
 
-    if (rows.length === 0) {
-      await dbClient.query('COMMIT');
-      return 0;
-    }
+  if (rows.length === 0) {
+    return 0;
+  }
 
-    const publishedIds: string[] = [];
-    for (const record of rows) {
+  // Phase 2: Publish outside the DB transaction so network latency never holds DB locks
+  const publishedIds: string[] = [];
+  for (const record of rows) {
+    try {
       await brokerPublish(record);
       publishedIds.push(record.event_id);
+    } catch {
+      // Individual failed row remains unprocessed and will retry after leased_until expires
     }
+  }
 
+  // Phase 3: Mark only the successfully published events as processed
+  if (publishedIds.length > 0) {
     await dbClient.query(
       `UPDATE outbox_events
-       SET processed_at = clock_timestamp()
+       SET processed_at = clock_timestamp(),
+           leased_until = NULL
        WHERE event_id = ANY($1::uuid[])`,
       [publishedIds]
     );
-
-    await dbClient.query('COMMIT');
-    return publishedIds.length;
-  } catch (err) {
-    await dbClient.query('ROLLBACK');
-    throw err;
   }
+
+  return publishedIds.length;
 }
 
 /**
@@ -162,7 +177,9 @@ When scaling with Primary + Read Replicas:
 
 ---
 
-## 4. Redis Caching with Single-Flight Stampede Protection & Jitter
+## 4. Tenant-Scoped Redis Caching with Single-Flight Stampede Protection & Jitter
+
+**Critical Multi-Tenancy Rule**: Never allow un-namespaced cache keys in a multi-tenant system. Require `tenantId` as an explicit parameter and construct `tenant:{tenantId}:{cacheNamespace}:{resourceKey}` so Tenant B can never read Tenant A's cached objects.
 
 ```typescript
 const inFlightLocalPromises = new Map<string, Promise<unknown>>();
@@ -172,17 +189,25 @@ export async function getOrComputeCachedSingleFlight<T>(
     get: (k: string) => Promise<string | null>;
     set: (k: string, v: string, mode: 'EX', ttlSec: number) => Promise<unknown>;
   },
-  cacheKey: string,
-  ttlSeconds: number,
+  params: {
+    tenantId: string;
+    resourceKey: string;
+    ttlSeconds: number;
+  },
   fetcher: () => Promise<T | null>
 ): Promise<T | null> {
-  const cached = await redis.get(cacheKey);
+  if (!/^[a-zA-Z0-9_-]{1,64}$/.test(params.tenantId)) {
+    throw new Error('CACHE_REJECTED: Invalid tenantId format');
+  }
+  const scopedCacheKey = `tenant:${params.tenantId}:${params.resourceKey}`;
+
+  const cached = await redis.get(scopedCacheKey);
   if (cached !== null) {
     return cached === '__NULL__' ? null : (JSON.parse(cached) as T);
   }
 
   // Coalesce concurrent cache misses within the same process (Single-Flight)
-  const existingPromise = inFlightLocalPromises.get(cacheKey) as Promise<T | null> | undefined;
+  const existingPromise = inFlightLocalPromises.get(scopedCacheKey) as Promise<T | null> | undefined;
   if (existingPromise) {
     return existingPromise;
   }
@@ -191,18 +216,19 @@ export async function getOrComputeCachedSingleFlight<T>(
     try {
       const fresh = await fetcher();
       if (fresh === null) {
-        await redis.set(cacheKey, '__NULL__', 'EX', 45);
+        await redis.set(scopedCacheKey, '__NULL__', 'EX', 45);
         return null;
       }
-      const jitteredTtl = Math.max(1, Math.floor(ttlSeconds * (0.9 + Math.random() * 0.2)));
-      await redis.set(cacheKey, JSON.stringify(fresh), 'EX', jitteredTtl);
+      const jitteredTtl = Math.max(1, Math.floor(params.ttlSeconds * (0.9 + Math.random() * 0.2)));
+      await redis.set(scopedCacheKey, JSON.stringify(fresh), 'EX', jitteredTtl);
       return fresh;
     } finally {
-      inFlightLocalPromises.delete(cacheKey);
+      inFlightLocalPromises.delete(scopedCacheKey);
     }
   })();
 
-  inFlightLocalPromises.set(cacheKey, computePromise);
+  inFlightLocalPromises.set(scopedCacheKey, computePromise);
   return computePromise;
 }
 ```
+

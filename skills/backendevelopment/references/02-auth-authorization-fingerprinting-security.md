@@ -216,22 +216,33 @@ export function authorizeAction(
     return { allowed: false, reason: 'CROSS_TENANT_ACCESS_DENIED' };
   }
 
-  // 2. RBAC + ReBAC Check
-  const hasRolePerm = subject.roles.some((r) => ROLE_PERMISSIONS[r]?.includes(action));
-  const hasRebacOverride =
-    action === 'order:read' &&
-    (resource.relationship === 'owner' || resource.relationship === 'editor' || resource.relationship === 'viewer');
+  // 2. Intra-Tenant Horizontal BOLA / IDOR Guard:
+  // Non-privileged roles ('member', 'viewer') may only access resources they own or have an explicit ReBAC relation to.
+  const isTenantPrivileged = subject.roles.some((r) => r === 'owner' || r === 'admin' || r === 'finance');
+  const isResourceOwner = resource.ownerId !== undefined && resource.ownerId === subject.userId;
+  const hasExplicitRebacRelation =
+    resource.relationship === 'owner' ||
+    (action === 'order:read' && (resource.relationship === 'editor' || resource.relationship === 'viewer'));
 
-  if (!hasRolePerm && !hasRebacOverride) {
+  if (!isTenantPrivileged && action !== 'order:create' && action !== 'file:upload') {
+    if (!isResourceOwner && !hasExplicitRebacRelation) {
+      return { allowed: false, reason: 'BOLA_HORIZONTAL_OWNERSHIP_DENIED' };
+    }
+  }
+
+  // 3. RBAC + ReBAC Permission Check
+  const hasRolePerm = subject.roles.some((r) => ROLE_PERMISSIONS[r]?.includes(action));
+
+  if (!hasRolePerm && !hasExplicitRebacRelation) {
     return { allowed: false, reason: 'INSUFFICIENT_PERMISSION' };
   }
 
-  // 3. Identity Verification Gate for financial exports/refunds
+  // 4. Identity Verification Gate for financial exports/refunds
   if ((action === 'order:refund' || action === 'ledger:export') && subject.identityVerificationLevel !== 'KYC_FULL') {
     return { allowed: false, reason: 'KYC_IDENTITY_VERIFICATION_REQUIRED' };
   }
 
-  // 4. ABAC Contextual Policy Rules
+  // 5. ABAC Contextual Policy Rules
   if (resource.isLocked && action !== 'order:read') {
     return { allowed: false, reason: 'RESOURCE_IS_LOCKED' };
   }
@@ -239,7 +250,7 @@ export function authorizeAction(
     return { allowed: false, reason: 'CLEARANCE_LEVEL_TOO_LOW' };
   }
 
-  // 5. Step-Up MFA enforcement for high-value refunds (> $1,000.00 = 100_000 cents) or ledger exports
+  // 6. Step-Up MFA enforcement for high-value refunds (> $1,000.00 = 100_000 cents) or ledger exports
   const requiresFreshMfa =
     action === 'ledger:export' ||
     (action === 'order:refund' && (resource.amountMinor ?? 0n) >= 100_000n);
@@ -257,7 +268,7 @@ export function authorizeAction(
 
 ---
 
-## 4. Penetration-Hardened Credential & JWT Verification (Anti-Enumeration & Anti-Forgery)
+## 4. Penetration-Hardened Credential, Refresh Token Family & JWT Verification
 
 ### A. Timing-Safe Login Verification (Defeating Account Enumeration Oracles)
 During penetration testing, attackers measure response latency on `POST /api/v1/auth/login` to distinguish valid emails (`~120ms` Argon2id/scrypt CPU work) from non-existent emails (`~1ms` early return).
@@ -321,6 +332,8 @@ export interface HardenedJwtVerifyOptions {
   publicKeyRing: Readonly<Record<string, crypto.KeyObject>>; // Keyed by strict kid
   expectedIssuer: string;
   expectedAudience: string;
+  expectedSessionBindingCookie?: string; // Optional __Host-sid value to verify cnf.sidHash
+  isJtiRevoked?: (jti: string) => boolean;
   clockToleranceSeconds?: number;
 }
 
@@ -337,6 +350,9 @@ export interface VerifiedJwtClaims {
 }
 
 export function verifyJwtPenetrationSafe(opts: HardenedJwtVerifyOptions): VerifiedJwtClaims {
+  if (!opts.token || opts.token.length > 8192) {
+    throw new Error('JWT_REJECTED: Token missing or exceeds 8KB maximum size');
+  }
   const parts = opts.token.split('.');
   if (parts.length !== 3) {
     throw new Error('JWT_REJECTED: Token must have exactly 3 segments');
@@ -347,8 +363,13 @@ export function verifyJwtPenetrationSafe(opts: HardenedJwtVerifyOptions): Verifi
     throw new Error('JWT_REJECTED: Empty signature (alg:none attack blocked)');
   }
 
-  const headerJson = Buffer.from(headerB64, 'base64url').toString('utf8');
-  const header = JSON.parse(headerJson) as Record<string, unknown>;
+  let header: Record<string, unknown>;
+  try {
+    const headerJson = Buffer.from(headerB64, 'base64url').toString('utf8');
+    header = JSON.parse(headerJson) as Record<string, unknown>;
+  } catch {
+    throw new Error('JWT_REJECTED: Malformed JWT header JSON');
+  }
 
   // 1. Strict Algorithm Pinning (blocks alg:none and RS256->HS256 confusion)
   if (header.alg !== opts.allowedAlgorithm) {
@@ -382,7 +403,13 @@ export function verifyJwtPenetrationSafe(opts: HardenedJwtVerifyOptions): Verifi
   }
 
   // 5. Parse and validate standard temporal & identity claims
-  const claims = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8')) as VerifiedJwtClaims;
+  let claims: VerifiedJwtClaims;
+  try {
+    claims = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8')) as VerifiedJwtClaims;
+  } catch {
+    throw new Error('JWT_REJECTED: Malformed JWT payload JSON');
+  }
+
   const nowSec = Math.floor(Date.now() / 1000);
   const leeway = opts.clockToleranceSeconds ?? 15;
 
@@ -398,13 +425,94 @@ export function verifyJwtPenetrationSafe(opts: HardenedJwtVerifyOptions): Verifi
   if (typeof claims.exp !== 'number' || nowSec >= claims.exp + leeway) {
     throw new Error('JWT_REJECTED: Token has expired');
   }
+  if (typeof claims.iat !== 'number' || claims.iat > nowSec + leeway) {
+    throw new Error('JWT_REJECTED: Token iat is in the future');
+  }
   if (claims.nbf !== undefined && (typeof claims.nbf !== 'number' || nowSec + leeway < claims.nbf)) {
     throw new Error('JWT_REJECTED: Token is not yet valid (nbf)');
   }
   if (!claims.sub || !claims.jti || !claims.tenantId) {
     throw new Error('JWT_REJECTED: Missing required sub, jti, or tenantId claim');
   }
+  if (opts.isJtiRevoked && opts.isJtiRevoked(claims.jti)) {
+    throw new Error('JWT_REJECTED: Token jti has been revoked');
+  }
+
+  // 6. Optional Cryptographic Session Binding Cookie Verification (__Host-sid)
+  if (opts.expectedSessionBindingCookie !== undefined) {
+    const expectedSidHash = crypto
+      .createHash('sha256')
+      .update(opts.expectedSessionBindingCookie, 'utf8')
+      .digest('hex');
+    if (!claims.cnf?.sidHash || claims.cnf.sidHash !== expectedSidHash) {
+      throw new Error('JWT_REJECTED: Session binding cookie hash mismatch');
+    }
+  }
 
   return claims;
 }
 ```
+
+### C. Refresh Token Rotation with Token-Family Reuse Detection
+When a refresh token is rotated, store its `family_id` (`session_id`) and `replaced_by_token_hash`. If an already-rotated refresh token is presented again (indicating either the attacker or the legitimate user replayed a stolen token), **immediately revoke the entire `family_id` session**:
+
+```typescript
+export interface RefreshTokenRecord {
+  tokenHash: string;
+  familyId: string;
+  userId: string;
+  tenantId: string;
+  status: 'ACTIVE' | 'ROTATED' | 'REVOKED';
+  expiresAtMs: number;
+}
+
+export async function rotateRefreshTokenWithReuseDetection(params: {
+  rawRefreshToken: string;
+  findTokenByHash: (tokenHash: string) => Promise<RefreshTokenRecord | null>;
+  markTokenRotatedAndInsertChild: (oldHash: string, newRecord: RefreshTokenRecord) => Promise<boolean>;
+  revokeEntireTokenFamily: (familyId: string, reason: string) => Promise<void>;
+}): Promise<{ newRawRefreshToken: string; familyId: string; userId: string; tenantId: string }> {
+  const tokenHash = crypto.createHash('sha256').update(params.rawRefreshToken, 'utf8').digest('hex');
+  const existing = await params.findTokenByHash(tokenHash);
+
+  if (!existing) {
+    throw new Error('REFRESH_TOKEN_INVALID');
+  }
+
+  // CRITICAL: If token was ALREADY rotated, a token theft replay occurred -> Revoke whole family!
+  if (existing.status === 'ROTATED' || existing.status === 'REVOKED') {
+    await params.revokeEntireTokenFamily(existing.familyId, 'REFRESH_TOKEN_REUSE_DETECTED');
+    throw new Error('REFRESH_TOKEN_COMPROMISED_FAMILY_REVOKED');
+  }
+
+  if (Date.now() >= existing.expiresAtMs) {
+    throw new Error('REFRESH_TOKEN_EXPIRED');
+  }
+
+  const newRawRefreshToken = crypto.randomBytes(32).toString('base64url');
+  const newTokenHash = crypto.createHash('sha256').update(newRawRefreshToken, 'utf8').digest('hex');
+
+  const updated = await params.markTokenRotatedAndInsertChild(tokenHash, {
+    tokenHash: newTokenHash,
+    familyId: existing.familyId,
+    userId: existing.userId,
+    tenantId: existing.tenantId,
+    status: 'ACTIVE',
+    expiresAtMs: Date.now() + 14 * 24 * 60 * 60 * 1000,
+  });
+
+  if (!updated) {
+    // Concurrent race on the same refresh token -> treat as reuse and revoke family
+    await params.revokeEntireTokenFamily(existing.familyId, 'CONCURRENT_REFRESH_RACE');
+    throw new Error('REFRESH_TOKEN_COMPROMISED_FAMILY_REVOKED');
+  }
+
+  return {
+    newRawRefreshToken,
+    familyId: existing.familyId,
+    userId: existing.userId,
+    tenantId: existing.tenantId,
+  };
+}
+```
+
