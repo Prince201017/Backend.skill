@@ -205,10 +205,10 @@ export function sanitizeUntrustedJsonInput(
  * 2. SQL LIKE Wildcard Escaper:
  * Prevents attackers from injecting "%" or "_" wildcards into search strings to cause pathological table scans.
  */
-export function escapeSqlLikePattern(rawSearch: string, escapeChar = '\\'): string {
+export function escapeSqlLikePattern(rawSearch: string): string {
   return rawSearch
     .normalize('NFKC')
-    .replace(new RegExp(`[\\${escapeChar}%_]`, 'g'), (match) => `${escapeChar}${match}`);
+    .replace(/[\\%_]/g, (match) => `\\${match}`);
 }
 
 /**
@@ -315,13 +315,14 @@ When a backend powers AI features (LLM generation, embeddings, document analysis
 - Classify every schema column (`PUBLIC`, `INTERNAL`, `CONFIDENTIAL_PII`, `RESTRICTED_FINANCIAL_HEALTH`).
 - **Crypto-Shredding for Immutable Logs/Backups**: Encrypt a user's PII fields with a per-user DEK stored in `user_encryption_keys`. When a user exercises GDPR Right to Erasure, anonymize mutable profile rows AND permanently destroy the user's DEK—rendering any historical PII in immutable backups or event logs permanently undecryptable without corrupting financial ledger integrity.
 
-### Tamper-Evident Hash-Chained Audit Trail
-For security, compliance, and admin actions, maintain an append-only hash-chained `audit_logs` table where each row signs the previous row's hash (`prev_hash`), making unauthorized database row deletion or tampering mathematically detectable:
+### Tamper-Evident Keyed HMAC Hash-Chained Audit Trail
+For security, compliance, and admin actions, maintain an append-only hash-chained `audit_logs` table where each row signs the previous row's hash (`prev_hash`) using **length-prefixed canonical encoding** (preventing delimiter-collision forgery) and a **KMS-backed HMAC secret** (preventing rogue DBAs from rewriting the hash chain):
 
 ```typescript
 import crypto from 'node:crypto';
 
 export function computeAuditChainHash(params: {
+  auditHmacSecret: string;
   prevHashHex: string;
   tenantId: string;
   actorId: string;
@@ -331,7 +332,10 @@ export function computeAuditChainHash(params: {
   payloadJson: string;
   createdAtIsoUtc: string;
 }): string {
-  const canonical = [
+  if (params.auditHmacSecret.length < 32) {
+    throw new Error('AUDIT_CHAIN_ERROR: auditHmacSecret must be at least 32 characters');
+  }
+  const fields = [
     params.prevHashHex,
     params.tenantId,
     params.actorId,
@@ -340,8 +344,15 @@ export function computeAuditChainHash(params: {
     params.resourceId,
     params.payloadJson,
     params.createdAtIsoUtc,
-  ].join('|');
+  ];
+  // Length-prefixed encoding ("len:value;") eliminates delimiter collision attacks
+  const canonical = fields
+    .map((f) => `${Buffer.byteLength(f, 'utf8')}:${f};`)
+    .join('');
 
-  return crypto.createHash('sha256').update(canonical, 'utf8').digest('hex');
+  return crypto
+    .createHmac('sha256', params.auditHmacSecret)
+    .update(canonical, 'utf8')
+    .digest('hex');
 }
 ```

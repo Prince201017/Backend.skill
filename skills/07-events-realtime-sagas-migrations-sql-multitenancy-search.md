@@ -70,14 +70,23 @@ export function formatSseFrame(params: {
   data: unknown;
   retryMs?: number;
 }): string {
+  // CRITICAL: WHATWG EventSource treats CR (\r), LF (\n), and CRLF (\r\n) as line terminators.
+  // Reject any CR/LF/Null in id or event to prevent SSE Frame Injection!
+  if (/[\r\n\0]/.test(params.id) || /[\r\n\0]/.test(params.event)) {
+    throw new Error('SSE_FRAME_INJECTION_BLOCKED: CR, LF, and Null characters are forbidden in id/event');
+  }
   const lines: string[] = [];
   lines.push(`id: ${params.id}`);
   lines.push(`event: ${params.event}`);
   if (params.retryMs !== undefined) {
+    if (!Number.isInteger(params.retryMs) || params.retryMs < 0) {
+      throw new Error('SSE_INVALID_RETRY_MS');
+    }
     lines.push(`retry: ${params.retryMs}`);
   }
-  const serialized = JSON.stringify(params.data);
-  for (const line of serialized.split('\n')) {
+  const serialized = JSON.stringify(params.data) ?? 'null';
+  // Split on all WHATWG line endings (\r\n, \r, \n) so bare \r cannot inject forged SSE fields
+  for (const line of serialized.split(/\r\n|\r|\n/)) {
     lines.push(`data: ${line}`);
   }
   return lines.join('\n') + '\n\n';

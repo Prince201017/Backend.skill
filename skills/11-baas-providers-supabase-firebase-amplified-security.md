@@ -52,6 +52,7 @@ CREATE OR REPLACE FUNCTION public.current_jwt_tenant_id()
 RETURNS UUID
 LANGUAGE sql
 STABLE
+SET search_path = public, pg_temp
 AS $$
   SELECT NULLIF(
     ((SELECT auth.jwt()) -> 'app_metadata' ->> 'tenant_id'),
@@ -89,6 +90,16 @@ CREATE POLICY projects_update_policy ON public.projects
     WITH CHECK (
         tenant_id = (SELECT public.current_jwt_tenant_id())
         AND owner_id = (SELECT auth.uid())
+    );
+
+-- DELETE Policy: Explicitly restrict deletion to unlocked rows owned by the caller in the active tenant
+CREATE POLICY projects_delete_policy ON public.projects
+    FOR DELETE
+    TO authenticated
+    USING (
+        tenant_id = (SELECT public.current_jwt_tenant_id())
+        AND owner_id = (SELECT auth.uid())
+        AND is_locked = FALSE
     );
 ```
 
@@ -135,7 +146,7 @@ service cloud.firestore {
       }
 
       allow get: if isSignedIn() && isValidId(userId);
-      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow list: if isSignedIn() && (request.auth.uid == userId || isAdmin());
 
       allow create: if isSignedIn()
         && isValidId(userId)
@@ -151,6 +162,8 @@ service cloud.firestore {
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
         && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'avatarUrl', 'updatedAt']);
+
+      allow delete: if false;
 
       // Strict Private PII Subcollection: Owner or Admin ONLY
       match /private/{docId} {
@@ -194,6 +207,8 @@ service cloud.firestore {
           (existing().ownerId == request.auth.uid
             && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'status', 'updatedAt']))
         );
+
+      allow delete: if isSignedIn() && isValidId(projectId) && existing().ownerId == request.auth.uid && existing().status == 'DRAFT';
     }
   }
 }

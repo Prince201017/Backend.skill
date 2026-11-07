@@ -126,7 +126,11 @@ const MAX_DEPTH = 8;
  * Recursively scrubs PII, credentials, and tokens from arbitrary I/O payloads
  * while enforcing strict recursion depth and string length caps.
  */
-export function scrubIoPayload(value: unknown, depth = 0): unknown {
+export function scrubIoPayload(
+  value: unknown,
+  depth = 0,
+  seen: WeakSet<object> = new WeakSet()
+): unknown {
   if (depth > MAX_DEPTH) {
     return '[TRUNCATED_MAX_DEPTH]';
   }
@@ -146,19 +150,24 @@ export function scrubIoPayload(value: unknown, depth = 0): unknown {
   if (typeof value === 'number' || typeof value === 'boolean') {
     return value;
   }
-  if (Array.isArray(value)) {
-    return value.slice(0, 50).map((item) => scrubIoPayload(item, depth + 1));
-  }
   if (typeof value === 'object') {
-    const result: Record<string, unknown> = {};
+    if (seen.has(value)) {
+      return '[CIRCULAR_REF]';
+    }
+    seen.add(value);
+    if (Array.isArray(value)) {
+      return value.slice(0, 50).map((item) => scrubIoPayload(item, depth + 1, seen));
+    }
+    const result: Record<string, unknown> = Object.create(null);
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
       if (SENSITIVE_KEY_REGEX.test(k)) {
         result[k] = '[REDACTED_SECRET]';
       } else {
-        result[k] = scrubIoPayload(v, depth + 1);
+        result[k] = scrubIoPayload(v, depth + 1, seen);
       }
     }
-    return result;
+    return { ...result };
   }
   return String(value);
 }
@@ -239,7 +248,8 @@ export function emitCorrelatedLog(params: {
 
 /**
  * Wraps any service hop (Ingress, Auth/RBA, Supabase/Firebase/DB, Outbox, Outbound API)
- * to automatically capture scrubbed input/output envelopes, execution latency, and correlated logs.
+ * to automatically capture scrubbed input/output envelopes, execution latency, and correlated logs,
+ * including uncaught error hops so failed spans are never lost.
  */
 export async function traceServiceHop<TOutput extends Record<string, unknown>>(params: {
   hopType: ServiceHopType;
@@ -305,6 +315,34 @@ export async function traceServiceHop<TOutput extends Record<string, unknown>>(p
     }
 
     return result.outputPayload;
+  } catch (err) {
+    const durationMs = Number((performance.now() - startHr).toFixed(2));
+    if (store) {
+      store.hops.push({
+        span_id: spanId,
+        parent_span_id: parentSpanId,
+        hop_index: store.hops.length + 1,
+        hop_type: params.hopType,
+        service_name: params.serviceName,
+        operation: params.operation,
+        status: 'ERROR',
+        started_at: startedAt,
+        duration_ms: durationMs,
+        policy_or_query: params.policyOrQuery,
+        input_envelope: {
+          headers: scrubbedInHeaders,
+          payload: scrubbedInput,
+          byte_size: inBytes,
+        },
+        output_envelope: {
+          status_code: 500,
+          payload: { error: 'UNHANDLED_HOP_EXCEPTION' },
+          byte_size: 36,
+        },
+        error_code: err instanceof Error ? err.name : 'UNKNOWN_ERROR',
+      });
+    }
+    throw err;
   } finally {
     if (store && parentSpanId) {
       store.activeSpanId = parentSpanId;

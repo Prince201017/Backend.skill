@@ -319,8 +319,22 @@ export function allocateProratedAmountExact(
   totalWeight: bigint,
   targetTotal: bigint
 ): bigint[] {
+  if (targetTotal < 0n || totalWeight < 0n) {
+    throw new Error('PRORATION_REJECTED: targetTotal and totalWeight must be non-negative');
+  }
   if (targetTotal === 0n || totalWeight === 0n) {
     return weights.map(() => 0n);
+  }
+
+  let verifiedWeightSum = 0n;
+  for (const w of weights) {
+    if (w < 0n) {
+      throw new Error('PRORATION_REJECTED: Individual line weight cannot be negative');
+    }
+    verifiedWeightSum += w;
+  }
+  if (verifiedWeightSum !== totalWeight) {
+    throw new Error('PRORATION_REJECTED: Sum of weights does not match totalWeight');
   }
 
   const floors: bigint[] = [];
@@ -473,8 +487,18 @@ export function verifyOtpCodeConstantTime(
   submittedCode: string,
   expectedHmacHex: string,
   pepperSecret: string,
-  contextId: string
+  contextId: string,
+  expiresAt?: Date
 ): boolean {
+  if (pepperSecret.length < 32) {
+    throw new Error('OTP_CONFIG_ERROR: pepperSecret must be at least 32 characters');
+  }
+  if (expiresAt && Date.now() > expiresAt.getTime()) {
+    return false;
+  }
+  if (!/^\d{6,8}$/.test(submittedCode) || !/^[0-9a-fA-F]{64}$/.test(expectedHmacHex)) {
+    return false;
+  }
   const actualHmac = crypto
     .createHmac('sha256', pepperSecret)
     .update(`${contextId}:${submittedCode}`)

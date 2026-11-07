@@ -150,16 +150,24 @@ export function renderSafePreRegisteredTemplate(
 }
 
 /**
- * 3. Safe Action-URL Validator for In-App & Push Notifications (Blocks javascript: / data: / Open Redirects)
+ * 3. Safe Action-URL Validator for In-App & Push Notifications (Blocks javascript: / data: / WHATWG Control-Char Open Redirects)
  */
 export function validateSafeNotificationActionUrl(
   rawUrl: string,
   allowedHttpsOrigins: ReadonlySet<string>
 ): string {
   const trimmed = rawUrl.trim();
+  // Reject control characters (\t, \r, \n, \0) and backslashes which browsers normalize into protocol-relative '//evil.com'
+  if (/[\u0000-\u001F\u007F\\]/.test(trimmed)) {
+    throw new Error('UNSAFE_ACTION_URL_BLOCKED: Control characters and backslashes are forbidden');
+  }
   // Allow strict relative paths starting with single '/' (not protocol-relative '//evil.com')
-  if (trimmed.startsWith('/') && !trimmed.startsWith('//') && !trimmed.includes('\\')) {
-    return trimmed;
+  if (trimmed.startsWith('/') && !trimmed.startsWith('//')) {
+    const verifyRelative = new URL(trimmed, 'https://relative-check.internal');
+    if (verifyRelative.origin !== 'https://relative-check.internal') {
+      throw new Error('UNSAFE_ACTION_URL_BLOCKED: Relative path resolved to external origin');
+    }
+    return `${verifyRelative.pathname}${verifyRelative.search}${verifyRelative.hash}`;
   }
   const parsed = new URL(trimmed);
   if (parsed.protocol !== 'https:' || !allowedHttpsOrigins.has(parsed.origin)) {
@@ -175,6 +183,9 @@ export function computeRecipientSuppressionHmac(rawRecipient: string, kmsPepperS
   recipientHmac: string;
   recipientMasked: string;
 } {
+  if (kmsPepperSecret.length < 32) {
+    throw new Error('SUPPRESSION_HMAC_ERROR: kmsPepperSecret must be at least 32 characters');
+  }
   const canonical = rawRecipient.normalize('NFKC').trim().toLowerCase();
   const recipientHmac = crypto
     .createHmac('sha256', kmsPepperSecret)
@@ -224,6 +235,13 @@ export async function enforceSmsTollFraudAndBudgetGuard(params: {
   incrementPrefixCounter: (key: string, ttlSeconds: number) => Promise<number>;
   incrementDailySpendMicros: (tenantId: string, costMicros: bigint) => Promise<bigint>;
 }): Promise<{ countryPrefix: string }> {
+  if (!/^[a-zA-Z0-9_-]{1,64}$/.test(params.tenantId)) {
+    throw new Error('SMS_TOLL_FRAUD_BLOCKED: Invalid tenantId format');
+  }
+  if (params.estimatedCostMicros <= 0n) {
+    throw new Error('SMS_TOLL_FRAUD_BLOCKED: estimatedCostMicros must be strictly positive');
+  }
+
   const countryPrefix = extractE164CountryPrefix(
     params.e164Phone,
     params.policy.allowedDialingPrefixes

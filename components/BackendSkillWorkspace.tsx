@@ -1787,7 +1787,7 @@ export default function BackendSkillWorkspace({ files }: { files: SkillMarkdownF
               Advanced Backend Development Skill
             </div>
             <div className="text-[11px] font-mono text-slate-400 truncate">
-              /skills/backendevelopment · {files.length} Modules · 12 Critical Risk Gates Verified
+              /skills/*.md · {files.length} Modules · All Critical Module Risks Verified
             </div>
           </div>
         </div>
@@ -2530,7 +2530,7 @@ export default function BackendSkillWorkspace({ files }: { files: SkillMarkdownF
               <div className="space-y-1 max-h-[70vh] overflow-y-auto pr-1">
                 {filteredSpecFiles.map((file) => {
                   const isSelected = activeSpecFile?.path === file.path;
-                  const shortName = file.path.replace('/skills/backendevelopment/', '');
+                  const shortName = file.path.replace(/^\/skills\//, '');
                   return (
                     <button
                       key={file.path}

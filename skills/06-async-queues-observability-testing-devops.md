@@ -42,7 +42,7 @@ Message brokers provide **at-least-once delivery**, meaning a job message can be
    UPDATE background_jobs
    SET status = 'IN_PROGRESS',
        lease_owner = $2,
-       lease_expires_at = clock_timestamp() + ($3 || ' milliseconds')::interval,
+       lease_expires_at = clock_timestamp() + ($3::bigint * interval '1 millisecond'),
        fencing_token = fencing_token + 1,
        attempt = attempt + 1
    WHERE job_id = $1
@@ -255,19 +255,35 @@ export async function executeQueueWorkerJob<TPayload>(
 ## 2. Observability: Structured JSON Logging, Metrics & Distributed Tracing
 
 ```typescript
-const SENSITIVE_KEY_REGEX = /^(password|passcode|secret|token|access_token|refresh_token|authorization|cookie|otp|cvv|pan|credit_card|ssn|api_key)$/i;
+const SENSITIVE_KEY_REGEX = /^(password|passcode|secret|token|access_token|refresh_token|authorization|cookie|otp|cvv|pan|credit_card|ssn|api_key|private_key)$/i;
 
-export function redactSensitiveFields(obj: unknown, depth = 0): unknown {
-  if (depth > 8 || obj === null || typeof obj !== 'object') return obj;
-  if (Array.isArray(obj)) return obj.map((item) => redactSensitiveFields(item, depth + 1));
+export function redactSensitiveFields(
+  obj: unknown,
+  depth = 0,
+  seen: WeakSet<object> = new WeakSet()
+): unknown {
+  if (depth > 8 || obj === null || obj === undefined) return obj;
+  if (typeof obj === 'string') {
+    return obj
+      .replace(/Bearer\s+[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+/gi, 'Bearer [REDACTED_JWT]')
+      .replace(/\b(sk_live_|rk_live_|whsec_)[A-Za-z0-9_]+/g, '[REDACTED_KEY]');
+  }
+  if (typeof obj !== 'object') return obj;
+  if (seen.has(obj)) return '[CIRCULAR_REF]';
+  seen.add(obj);
 
-  const sanitized: Record<string, unknown> = {};
+  if (Array.isArray(obj)) {
+    return obj.slice(0, 100).map((item) => redactSensitiveFields(item, depth + 1, seen));
+  }
+
+  const sanitized: Record<string, unknown> = Object.create(null);
   for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
+    if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
     sanitized[key] = SENSITIVE_KEY_REGEX.test(key)
       ? '[REDACTED]'
-      : redactSensitiveFields(value, depth + 1);
+      : redactSensitiveFields(value, depth + 1, seen);
   }
-  return sanitized;
+  return { ...sanitized };
 }
 
 export class StructuredLogger {
