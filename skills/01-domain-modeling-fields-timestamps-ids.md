@@ -322,8 +322,17 @@ export function allocateProratedAmountExact(
   if (targetTotal < 0n || totalWeight < 0n) {
     throw new Error('PRORATION_REJECTED: targetTotal and totalWeight must be non-negative');
   }
-  if (targetTotal === 0n || totalWeight === 0n) {
+  if (weights.length === 0) {
+    if (targetTotal > 0n || totalWeight > 0n) {
+      throw new Error('PRORATION_REJECTED: Cannot allocate non-zero amount across an empty weights array');
+    }
+    return [];
+  }
+  if (targetTotal === 0n) {
     return weights.map(() => 0n);
+  }
+  if (totalWeight === 0n) {
+    throw new Error('PRORATION_REJECTED: Cannot prorate positive targetTotal when totalWeight is 0');
   }
 
   let verifiedWeightSum = 0n;
@@ -472,6 +481,12 @@ export function generateOtpCode(digits: 6 | 8 = 6, pepperSecret: string, context
   hmacDigest: string;
   expiresAt: Date;
 } {
+  if (!pepperSecret || pepperSecret.length < 32) {
+    throw new Error('OTP_CONFIG_ERROR: pepperSecret must be at least 32 characters');
+  }
+  if (!contextId || contextId.trim().length === 0) {
+    throw new Error('OTP_CONFIG_ERROR: contextId must be non-empty to bind OTP to purpose/user');
+  }
   const max = 10 ** digits;
   const rawInt = crypto.randomInt(0, max);
   const code = rawInt.toString().padStart(digits, '0');
@@ -492,6 +507,9 @@ export function verifyOtpCodeConstantTime(
 ): boolean {
   if (pepperSecret.length < 32) {
     throw new Error('OTP_CONFIG_ERROR: pepperSecret must be at least 32 characters');
+  }
+  if (!contextId || contextId.trim().length === 0) {
+    return false;
   }
   if (expiresAt && Date.now() > expiresAt.getTime()) {
     return false;
@@ -535,3 +553,153 @@ function computeLuhnModN(input: string, alphabet: string): string {
   return alphabet[checkCodePoint];
 }
 ```
+
+---
+
+## 4. Composable Business Logic Engine: State Machines, Double-Entry Ledgers & Domain Rule Pipelines
+
+A backend is only as secure as its domain invariants. Even when SQL injection and JWT forgery are blocked, attackers exploit **Business Logic Flaws** (illegal state transitions like refunding an unpaid or cancelled order, unbalanced ledger postings that create money out of thin air, or bypassing multi-condition eligibility rules).
+
+### A. Deterministic Finite State Machine Engine with Optimistic Concurrency & Guard Predicates
+Never mutate status columns with ad-hoc `UPDATE orders SET status = $1` statements. Enforce a strict transition graph with role checks, domain invariant guards, and monotonic `version` increment:
+
+```typescript
+export interface StateTransitionRule<TState extends string, TContext> {
+  from: readonly TState[];
+  to: TState;
+  allowedRoles: readonly string[];
+  guard?: (ctx: TContext) => { ok: boolean; reason?: string };
+}
+
+export function executeDomainStateTransition<TState extends string, TContext>(params: {
+  entityName: string;
+  entityId: string;
+  currentState: TState;
+  targetState: TState;
+  currentVersion: number;
+  expectedVersion: number;
+  actorRoles: readonly string[];
+  context: TContext;
+  rules: readonly StateTransitionRule<TState, TContext>[];
+}): {
+  nextState: TState;
+  nextVersion: number;
+  auditEvent: string;
+} {
+  // 1. Optimistic Concurrency Control (prevents lost updates & race conditions)
+  if (params.currentVersion !== params.expectedVersion) {
+    throw new Error(
+      `STATE_CONFLICT_STALE_VERSION: ${params.entityName} (${params.entityId}) expected v${params.expectedVersion}, found v${params.currentVersion}`
+    );
+  }
+
+  // 2. Locate matching transition rule
+  const matchingRule = params.rules.find(
+    (r) => r.to === params.targetState && r.from.includes(params.currentState)
+  );
+  if (!matchingRule) {
+    throw new Error(
+      `ILLEGAL_STATE_TRANSITION: Cannot transition ${params.entityName} from "${params.currentState}" to "${params.targetState}"`
+    );
+  }
+
+  // 3. Verify actor role authorization for this specific state transition
+  const hasRole = params.actorRoles.some((role) => matchingRule.allowedRoles.includes(role));
+  if (!hasRole) {
+    throw new Error(
+      `TRANSITION_ROLE_DENIED: Actor roles [${params.actorRoles.join(',')}] cannot transition ${params.entityName} to "${params.targetState}"`
+    );
+  }
+
+  // 4. Evaluate business invariant guard predicate
+  if (matchingRule.guard) {
+    const verdict = matchingRule.guard(params.context);
+    if (!verdict.ok) {
+      throw new Error(
+        `BUSINESS_INVARIANT_REJECTED: ${verdict.reason ?? 'Guard predicate failed'}`
+      );
+    }
+  }
+
+  return {
+    nextState: params.targetState,
+    nextVersion: params.currentVersion + 1,
+    auditEvent: `${params.entityName.toLowerCase()}.transitioned.${params.currentState.toLowerCase()}_to_${params.targetState.toLowerCase()}`,
+  };
+}
+```
+
+### B. Zero-Discrepancy Double-Entry Accounting Journal Validator
+Never update wallet or account balances without recording a balanced double-entry journal (`SUM(DEBIT) === SUM(CREDIT)` per currency within the same ACID transaction):
+
+```typescript
+export interface JournalPostingLine {
+  accountId: string;
+  direction: 'DEBIT' | 'CREDIT';
+  amountMinor: bigint;
+  currencyCode: string;
+}
+
+export function validateBalancedDoubleEntryJournal(params: {
+  journalId: string;
+  tenantId: string;
+  idempotencyKey: string;
+  postings: readonly JournalPostingLine[];
+}): {
+  currencyCode: string;
+  totalDebitMinor: bigint;
+  totalCreditMinor: bigint;
+} {
+  if (!params.idempotencyKey || params.idempotencyKey.trim().length < 8) {
+    throw new Error('LEDGER_REJECTED: idempotencyKey (>= 8 chars) is mandatory');
+  }
+  if (params.postings.length < 2) {
+    throw new Error('LEDGER_REJECTED: Double-entry journal requires at least 2 posting lines');
+  }
+
+  const currencyCode = params.postings[0].currencyCode;
+  if (!(currencyCode in CURRENCY_EXPONENTS)) {
+    throw new Error(`LEDGER_REJECTED: Unsupported currency "${currencyCode}"`);
+  }
+
+  let totalDebitMinor = 0n;
+  let totalCreditMinor = 0n;
+  const debitAccounts = new Set<string>();
+  const creditAccounts = new Set<string>();
+
+  for (const line of params.postings) {
+    if (line.currencyCode !== currencyCode) {
+      throw new Error('LEDGER_REJECTED: Cross-currency postings require an explicit FX clearing pair');
+    }
+    if (line.amountMinor <= 0n) {
+      throw new Error(`LEDGER_REJECTED: Posting amount for account "${line.accountId}" must be > 0n`);
+    }
+    if (!line.accountId || line.accountId.trim().length === 0) {
+      throw new Error('LEDGER_REJECTED: accountId cannot be empty');
+    }
+    if (line.direction === 'DEBIT') {
+      totalDebitMinor += line.amountMinor;
+      debitAccounts.add(line.accountId);
+    } else {
+      totalCreditMinor += line.amountMinor;
+      creditAccounts.add(line.accountId);
+    }
+  }
+
+  // Prevent self-transfer no-op loops (debiting and crediting the exact same account in a 2-line transfer)
+  for (const acc of debitAccounts) {
+    if (creditAccounts.has(acc)) {
+      throw new Error(`LEDGER_REJECTED: Account "${acc}" cannot be both debited and credited in the same journal`);
+    }
+  }
+
+  if (totalDebitMinor !== totalCreditMinor) {
+    throw new Error(
+      `LEDGER_UNBALANCED_ERROR: Total debits (${totalDebitMinor}) !== total credits (${totalCreditMinor}) ${currencyCode}`
+    );
+  }
+
+  return { currencyCode, totalDebitMinor, totalCreditMinor };
+}
+```
+

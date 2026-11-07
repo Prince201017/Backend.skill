@@ -191,8 +191,16 @@ export async function executeWithIdempotencyLock(params: {
     params.lockTtlSeconds ?? 60
   );
 
-  if (!lockRes.acquired && lockRes.existing) {
+  if (!lockRes.acquired) {
     const ex = lockRes.existing;
+    if (!ex) {
+      throw new OperationalAppError(
+        409,
+        'idempotency-lock-contention',
+        'Idempotency Lock Contention',
+        'Could not acquire idempotency lock due to a concurrent request.'
+      );
+    }
     if (ex.request_hash !== reqHash) {
       throw new OperationalAppError(
         422,
@@ -208,14 +216,15 @@ export async function executeWithIdempotencyLock(params: {
         replayed: true,
       };
     }
-    if (ex.status === 'IN_PROGRESS' && !ex.is_lock_expired) {
-      throw new OperationalAppError(
-        409,
-        'request-in-flight',
-        'Concurrent Request In Flight',
-        'A request with this Idempotency-Key is currently being processed. Retry after 2 seconds.'
-      );
-    }
+    // CRITICAL: Never fall through to params.handler() when !lockRes.acquired!
+    // Even if an earlier lock expired or failed, the caller must atomically claim ownership inside tryAcquireLock
+    // (INSERT ... ON CONFLICT DO UPDATE ... WHERE status = 'FAILED' OR locked_until < clock_timestamp()).
+    throw new OperationalAppError(
+      409,
+      'request-in-flight',
+      'Concurrent Request In Flight',
+      'A request with this Idempotency-Key is currently being processed or being reclaimed. Retry after 2 seconds.'
+    );
   }
 
   try {
@@ -354,25 +363,27 @@ return { allowed, math.floor(tokens), retry_after_ms }
 
 ---
 
-## 4. Circuit Breaker Pattern (Preventing Cascading System Crashes)
+## 4. Circuit Breaker Pattern (With Half-Open Probe Concurrency Gate)
 
-Wrap every outbound third-party call (payment gateway, KYC provider, shipping carrier, SMS gateway) in a stateful Circuit Breaker with hard timeouts:
+Wrap every outbound third-party call (payment gateway, KYC provider, shipping carrier, SMS gateway) in a stateful Circuit Breaker with hard timeouts AND a **Half-Open Probe Concurrency Cap** (`halfOpenMaxConcurrentProbes`) so 500 concurrent requests do not stampede a recovering downstream service the instant `openCooldownMs` elapses:
 
 ```typescript
 export type CircuitState = 'CLOSED' | 'OPEN' | 'HALF_OPEN';
 
 export interface CircuitBreakerOptions {
   name: string;
-  failureThreshold: number;      // e.g., 5 consecutive failures
-  successThreshold: number;      // e.g., 2 successes in HALF_OPEN to close
-  openCooldownMs: number;        // e.g., 30_000ms (30s) before testing HALF_OPEN
-  requestTimeoutMs: number;      // e.g., 3_500ms hard timeout per call
+  failureThreshold: number;            // e.g., 5 consecutive failures
+  successThreshold: number;            // e.g., 2 successes in HALF_OPEN to close
+  openCooldownMs: number;              // e.g., 30_000ms (30s) before testing HALF_OPEN
+  requestTimeoutMs: number;            // e.g., 3_500ms hard timeout per call
+  halfOpenMaxConcurrentProbes?: number; // Default 1 (prevents Half-Open thundering herd!)
 }
 
 export class CircuitBreaker {
   private state: CircuitState = 'CLOSED';
   private failureCount = 0;
   private halfOpenSuccessCount = 0;
+  private halfOpenInFlightProbes = 0;
   private nextAttemptAtMs = 0;
 
   constructor(private readonly opts: CircuitBreakerOptions) {}
@@ -381,6 +392,7 @@ export class CircuitBreaker {
     if (this.state === 'OPEN' && Date.now() >= this.nextAttemptAtMs) {
       this.state = 'HALF_OPEN';
       this.halfOpenSuccessCount = 0;
+      this.halfOpenInFlightProbes = 0;
     }
     return this.state;
   }
@@ -391,6 +403,15 @@ export class CircuitBreaker {
       throw new Error(
         `CIRCUIT_OPEN:${this.opts.name} (retry after ${Math.max(0, this.nextAttemptAtMs - Date.now())}ms)`
       );
+    }
+
+    const maxProbes = this.opts.halfOpenMaxConcurrentProbes ?? 1;
+    const isHalfOpenProbe = currentState === 'HALF_OPEN';
+    if (isHalfOpenProbe) {
+      if (this.halfOpenInFlightProbes >= maxProbes) {
+        throw new Error(`CIRCUIT_HALF_OPEN_PROBE_LIMIT_REACHED:${this.opts.name}`);
+      }
+      this.halfOpenInFlightProbes += 1;
     }
 
     const controller = new AbortController();
@@ -405,6 +426,10 @@ export class CircuitBreaker {
       clearTimeout(timer);
       this.onFailure();
       throw error;
+    } finally {
+      if (isHalfOpenProbe) {
+        this.halfOpenInFlightProbes = Math.max(0, this.halfOpenInFlightProbes - 1);
+      }
     }
   }
 
@@ -414,6 +439,7 @@ export class CircuitBreaker {
       this.halfOpenSuccessCount += 1;
       if (this.halfOpenSuccessCount >= this.opts.successThreshold) {
         this.state = 'CLOSED';
+        this.halfOpenInFlightProbes = 0;
       }
     }
   }
@@ -422,8 +448,10 @@ export class CircuitBreaker {
     this.failureCount += 1;
     if (this.state === 'HALF_OPEN' || this.failureCount >= this.opts.failureThreshold) {
       this.state = 'OPEN';
+      this.halfOpenInFlightProbes = 0;
       this.nextAttemptAtMs = Date.now() + this.opts.openCooldownMs;
     }
   }
 }
 ```
+

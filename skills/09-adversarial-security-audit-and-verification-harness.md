@@ -19,6 +19,13 @@ This module documents the adversarial security assessment ("penetration test" re
 | **AUD-09** | **HIGH** | `Module 10` — Email Header & Suppression Gate (`assertSafeEmailHeaderValue`, `evaluateSuppressionGate`) | **SMTP CRLF Header Injection & Hard-Bounce Reputation Burn**: Injecting `\r\nBcc: victim@example.com` into email subjects/display names adds unauthorized recipients; bypassing `HARD_BOUNCE` for security alerts causes SES/Postmark account suspension. | Added strict `[\r\n\0]` rejection on all header fields and enforced Cross-Channel Fallback (`CROSS_CHANNEL_FALLBACK_REQUIRED`) when a `P0_CRITICAL` recipient's email is `HARD_BOUNCE` or `SPAM_COMPLAINT`. |
 | **AUD-10** | **CRITICAL** | `Module 11` — Supabase RLS & Firebase Security Rules | **Supabase `user_metadata` Privilege Escalation & Firebase Unchecked Partial `update`**: Using `auth.jwt() -> 'user_metadata' ->> 'role'` in PostgreSQL RLS allows any client calling `supabase.auth.updateUser({ data: { role: 'admin' } })` to escalate privileges. In Firestore, omitting `request.resource.data.diff(resource.data).affectedKeys().hasOnly(...)` allows overwriting `role` or `tenantId`. | Enforced `auth.jwt() -> 'app_metadata'` in all Supabase RLS policies and enforced the 8-Pillar `firestore.rules` architecture with strict `affectedKeys().hasOnly()` guards. |
 | **AUD-11** | **HIGH** | `Module 12` — Request I/O Envelope Tracer (`scrubIoPayload`) | **Credential Leakage in Trace Snapshots & Log Payloads**: Logging raw incoming headers (`Authorization: Bearer ...`) or JSON request bodies (`password`, `cvv`, `otp`) exposes secrets in telemetry storage. | Implemented recursive key + regex pattern scrubbing (`scrubIoPayload`) and 4KB string / depth-8 truncation before recording any I/O envelope or correlated log entry. |
+| **AUD-12** | **CRITICAL** | `Module 02 & 14` — API Gateway `X-Apigateway-Api-Userinfo` & `Authorization` Override | **Forged `X-Apigateway-Api-Userinfo` Spoofing & Direct `*.run.app` / `*.gateway.dev` Bypass**: When API Gateway backend auth is enabled, it overwrites `Authorization` with the gateway SA OIDC token and passes client claims in `X-Apigateway-Api-Userinfo`. Reading `X-Apigateway-Api-Userinfo` without verifying the gateway OIDC token (or leaving `--allow-unauthenticated` enabled) allows attackers to forge any user identity. | Implemented `extractVerifiedApiGatewayUserInfo` (requires verified gateway OIDC identity + `base64url` padding restoration + `iss`/`aud`/`exp` validation) and the 5-step zero-downtime `--no-allow-unauthenticated` lockdown sequence in `Module 14`. |
+| **AUD-13** | **CRITICAL** | `Module 14` — OpenAPI 3.x MCP `tools/list` & Header Parameter Injection | **Unauthenticated MCP Tool Enumeration & Agent Header Spoofing**: By default, MCP `tools/list` is unauthenticated (`security: {}` silently passes config creation), and OpenAPI `in: header` parameters on MCP-exposed operations are injected into backend HTTP headers from agent arguments! | Added `auditOpenApiGatewayAndMcpSecurity` in `Module 14` blocking unauthenticated/multi-scheme `tools-list.security`, enforcing root `security` for JWT schemes, and forbidding trust headers (`X-User-Id`, `X-Tenant-Id`, `X-Apigateway-Api-Userinfo`) as OpenAPI `in: header` parameters. |
+| **AUD-14** | **CRITICAL** | `Module 14` — API Gateway Whole-API Quota Metric Replacement | **Service Control `HTTP 500` Outage on Metric Rename/Removal**: `gcloud api-gateway api-configs create` immediately replaces `metrics` and `quota.limits` for the **entire API** across all gateways. Renaming/removing a metric referenced by an active gateway causes `HTTP 500: Failed to call Service Control Quota`. | Enforced Path A (Additive dual-metric transition keeping old + new metrics defined until all gateways upgrade) and automated `activeGatewayReferencedMetrics` validation in `auditOpenApiGatewayAndMcpSecurity`. |
+| **AUD-15** | **CRITICAL** | `Module 04` — Idempotency Lock & Circuit Breaker Half-Open State | **Expired Idempotency Fallthrough Double-Spend & Half-Open Thundering Herd**: Falling through to `handler()` when `!lockRes.acquired` on an expired lock allows two concurrent retries to execute simultaneously; allowing unlimited concurrent requests in `CircuitBreaker` `HALF_OPEN` state stampedes recovering services. | Hardened `executeWithIdempotencyLock` to never fall through when `!lockRes.acquired` unless `status === 'COMPLETED'`, and added `halfOpenMaxConcurrentProbes` gating to `CircuitBreaker`. |
+| **AUD-16** | **HIGH** | `Module 03` — Outbox Relay (`runCommittedOutboxRelayBatch`) | **Poison-Pill Outbox Head-of-Line Blocking**: An outbox event that repeatedly fails broker publish was retried infinitely (`ORDER BY created_at ASC LIMIT 100`), eventually filling all 100 batch slots and halting the entire outbox pipeline. | Added Phase 0 poison-pill quarantine (`dead_lettered_at = clock_timestamp() WHERE relay_attempts >= maxRelayAttempts`) before batch claiming in `Module 03`. |
+| **AUD-17** | **HIGH** | `Module 05 & 08` — PNG Pixel-Flood Decompression Bomb & IPv6 Teredo/ISATAP SSRF | **17GB RAM Image Decompression Bomb & Teredo (`2001:0000::/32`) SSRF Bypass**: A 50KB PNG with `IHDR` dimensions `65535x65535` allocates 17GB RAM on decode; Teredo (`2001:0000::/32`) and ISATAP (`::5efe`) embed internal IPv4 addresses inside IPv6. | Added on-the-fly PNG `IHDR` width/height/megapixel bounds ($\le 8192\text{px}$, $\le 33.5\text{MP}$) in `STREAM_FILE_WHITELIST`, blocked Teredo/ISATAP in `isPrivateOrReservedIp`, and added Node 20+ `options.all` support in `createPinnedSafeHttpsAgent`. |
+| **AUD-18** | **CRITICAL** | `Module 01 & 14` — Business Logic State Transitions, Double-Entry Ledgers & Maker-Checker | **Illegal State Jumps, Unbalanced Journal Postings & Self-Approval Bypass**: Ad-hoc status updates allow transitioning `CANCELLED -> SHIPPED`; unbalanced ledger postings create money; makers approving their own high-value refunds bypass four-eyes controls. | Added `executeDomainStateTransition` (OCC version + role + guard predicates), `validateBalancedDoubleEntryJournal` ($\sum \text{debit} \equiv \sum \text{credit}$, no self-transfer), and `evaluateEnterpriseBusinessLogicPolicy` (MCP agent autonomy cap + Maker-Checker separation of duties). |
 
 
 ---
@@ -70,20 +77,22 @@ export async function runBackendSkillSecurityVerificationSuite(primitives: {
 }): Promise<SecurityVerificationResult[]> {
   const results: SecurityVerificationResult[] = [];
 
-  // Vector 1: SSRF Cloud Metadata & IPv6 Tunnel Bypass Attempts
+  // Vector 1: SSRF Cloud Metadata & IPv6 Tunnel Bypass Attempts (including Teredo & ISATAP)
   {
     const maliciousTargets = [
       '127.0.0.1',
-      '169.254.169.254',           // AWS/GCP/Azure Metadata IMDS
-      '100.64.0.1',                // CGNAT internal
-      '198.18.0.1',                // Benchmarking range
-      '::1',                       // IPv6 loopback
-      '::ffff:169.254.169.254',    // Dotted IPv4-mapped IPv6
-      '::ffff:a9fe:a9fe',          // Hex-normalized IPv4-mapped IMDS!
-      '::ffff:7f00:1',             // Hex-normalized IPv4-mapped loopback!
-      '64:ff9b::a9fe:a9fe',        // NAT64 embedded IMDS!
-      '2002:7f00:0001::1',         // 6to4 embedded loopback!
-      'fd00::1234',                // IPv6 ULA
+      '169.254.169.254',                    // AWS/GCP/Azure Metadata IMDS
+      '100.64.0.1',                         // CGNAT internal
+      '198.18.0.1',                         // Benchmarking range
+      '::1',                                // IPv6 loopback
+      '::ffff:169.254.169.254',             // Dotted IPv4-mapped IPv6
+      '::ffff:a9fe:a9fe',                   // Hex-normalized IPv4-mapped IMDS!
+      '::ffff:7f00:1',                      // Hex-normalized IPv4-mapped loopback!
+      '64:ff9b::a9fe:a9fe',                 // NAT64 embedded IMDS!
+      '2002:7f00:0001::1',                  // 6to4 embedded loopback!
+      '2001:0000:4136:e378:8000:63bf:5601:5601', // Teredo tunnel!
+      'fe80::200:5efe:169.254.169.254',     // ISATAP embedded IMDS!
+      'fd00::1234',                         // IPv6 ULA
     ];
     const blockedAll = maliciousTargets.every((ip) => primitives.isPrivateOrReservedIp(ip) === true);
     const allowedPublic =
@@ -93,9 +102,9 @@ export async function runBackendSkillSecurityVerificationSuite(primitives: {
     assert.equal(blockedAll && allowedPublic, true, 'SSRF IP filter failed on bypass vector');
     results.push({
       testId: 'PEN-01',
-      category: 'SSRF & IPv6 Tunnel Evasion',
+      category: 'SSRF & IPv6 Tunnel Evasion (IMDS, NAT64, 6to4, Teredo, ISATAP)',
       passed: blockedAll && allowedPublic,
-      details: `Blocked all ${maliciousTargets.length} private/IMDS/NAT64/6to4/hex-mapped vectors and allowed public unicast IPs.`,
+      details: `Blocked all ${maliciousTargets.length} private/IMDS/NAT64/6to4/Teredo/ISATAP/hex-mapped vectors and allowed public unicast IPs.`,
     });
   }
 
@@ -289,3 +298,4 @@ export async function runBackendSkillSecurityVerificationSuite(primitives: {
   return results;
 }
 ```
+

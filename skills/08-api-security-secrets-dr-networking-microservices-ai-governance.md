@@ -89,6 +89,16 @@ export function isPrivateOrReservedIp(ip: string): boolean {
       return isReservedIpv4Octets(h[1] >> 8, h[1] & 0xff, h[2] >> 8, h[2] & 0xff);
     }
 
+    // Teredo Tunneling Prefix (2001:0000::/32) — embeds bitwise-INVERTED client IPv4 in h[6..7]!
+    if (h[0] === 0x2001 && h[1] === 0x0000) {
+      return true;
+    }
+
+    // ISATAP Interface Identifier (::0000:5efe:w.x.y.z or ::0200:5efe:w.x.y.z) embedding IPv4 in h[6..7]
+    if ((h[4] === 0x0000 || h[4] === 0x0200) && h[5] === 0x5efe) {
+      return isReservedIpv4Octets(h[6] >> 8, h[6] & 0xff, h[7] >> 8, h[7] & 0xff);
+    }
+
     if ((h[0] & 0xffc0) === 0xfe80) return true; // Link-local fe80::/10
     if ((h[0] & 0xfe00) === 0xfc00) return true; // Unique Local fc00::/7
     if (h[0] === 0x2001 && h[1] === 0x0db8) return true; // Documentation 2001:db8::/32
@@ -101,7 +111,7 @@ export function isPrivateOrReservedIp(ip: string): boolean {
 /**
  * Resolves DNS ONCE, validates all returned IPs against the SSRF blocklist,
  * and returns a pinned https.Agent that connects directly to the verified IP
- * to completely defeat DNS Rebinding (TTL=0 TOCTOU) attacks.
+ * to completely defeat DNS Rebinding (TTL=0 TOCTOU) attacks while supporting Node 20+ lookup({ all: true }).
  */
 export async function createPinnedSafeHttpsAgent(rawUrl: string): Promise<{
   parsedUrl: URL;
@@ -134,9 +144,18 @@ export async function createPinnedSafeHttpsAgent(rawUrl: string): Promise<{
   const pinnedFamily = records[0].family as 4 | 6;
 
   // Pin socket lookup to the already-validated IP so a second DNS lookup never occurs!
+  // Handles both Node 20+ `{ all: true }` array signature and single-address callback signature.
   const agent = new https.Agent({
     keepAlive: false,
-    lookup: (_hostname, _options, callback) => {
+    servername: parsedUrl.hostname,
+    lookup: (_hostname, options, callback) => {
+      if (typeof options === 'object' && options !== null && 'all' in options && options.all) {
+        (callback as unknown as (err: NodeJS.ErrnoException | null, addresses: Array<{ address: string; family: number }>) => void)(
+          null,
+          [{ address: pinnedIp, family: pinnedFamily }]
+        );
+        return;
+      }
       callback(null, pinnedIp, pinnedFamily);
     },
   });

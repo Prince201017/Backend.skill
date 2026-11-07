@@ -43,13 +43,14 @@ CREATE TABLE outbox_events (
     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     leased_until TIMESTAMPTZ NULL,
     processed_at TIMESTAMPTZ NULL,
+    dead_lettered_at TIMESTAMPTZ NULL,
     relay_attempts INT NOT NULL DEFAULT 0,
     last_error TEXT NULL
 );
 
 CREATE INDEX idx_outbox_committed_unprocessed
 ON outbox_events (created_at ASC)
-WHERE processed_at IS NULL;
+WHERE processed_at IS NULL AND dead_lettered_at IS NULL;
 
 -- Inbox Deduplication Table (Consumer Side)
 CREATE TABLE inbox_processed_events (
@@ -60,11 +61,12 @@ CREATE TABLE inbox_processed_events (
 );
 ```
 
-### Committed Outbox Relay (2-Phase Lease Claim — Zero DB Locks Held Across Network I/O) & Idempotent Consumer
-Never hold a PostgreSQL `BEGIN ... FOR UPDATE` transaction open while awaiting external broker network I/O (which exhausts connection pools and rolls back all 100 rows if row 99 fails to publish). Instead:
-1. **Phase 1 (Short DB Transaction)**: Atomically claim a batch of committed rows using `FOR UPDATE SKIP LOCKED` and set `leased_until = clock_timestamp() + interval '30 seconds'`, then `COMMIT` immediately.
-2. **Phase 2 (Network I/O Outside DB Transaction)**: Publish each claimed event to the broker and collect the subset of `publishedIds` that succeeded.
-3. **Phase 3 (Short DB Update)**: Mark `processed_at = clock_timestamp()` for all `publishedIds` that succeeded. Any failed rows automatically become eligible again after `leased_until` expires.
+### Committed Outbox Relay (3-Phase Lease Claim + Poison-Pill Quarantine — Zero DB Locks Held Across Network I/O) & Idempotent Consumer
+Never hold a PostgreSQL `BEGIN ... FOR UPDATE` transaction open while awaiting external broker network I/O (which exhausts connection pools and rolls back all 100 rows if row 99 fails to publish), and never allow a failing poison-pill event to retry infinitely and block the head of `ORDER BY created_at ASC LIMIT 100`:
+1. **Phase 0 (Poison-Pill Quarantine)**: Quarantine any unprocessed outbox row whose `relay_attempts >= maxRelayAttempts` (`SET dead_lettered_at = clock_timestamp()`) so it never starves newer events.
+2. **Phase 1 (Short DB Transaction)**: Atomically claim a batch of committed rows using `FOR UPDATE SKIP LOCKED` and set `leased_until = clock_timestamp() + interval '30 seconds'`, then release the DB lock immediately.
+3. **Phase 2 (Network I/O Outside DB Transaction)**: Publish each claimed event to the broker and collect `publishedIds`.
+4. **Phase 3 (Short DB Update)**: Mark `processed_at = clock_timestamp()` for all `publishedIds` that succeeded.
 
 ```typescript
 export interface OutboxRecord {
@@ -77,14 +79,26 @@ export interface OutboxRecord {
 }
 
 /**
- * Step 5 & 6: Relay claims committed rows with a short lease, releases the DB transaction,
- * publishes over the network, and marks succeeded rows as processed.
+ * Step 5 & 6: Quarantines poison-pill events exceeding maxRelayAttempts, claims committed rows
+ * with a short lease, releases the DB transaction, publishes over the network, and marks succeeded rows.
  */
 export async function runCommittedOutboxRelayBatch(
   dbClient: { query: (sql: string, params?: unknown[]) => Promise<{ rows: OutboxRecord[]; rowCount: number }> },
   brokerPublish: (record: OutboxRecord) => Promise<void>,
-  batchSize = 100
+  batchSize = 100,
+  maxRelayAttempts = 10
 ): Promise<number> {
+  // Phase 0: Quarantine poison-pill rows that have exhausted maxRelayAttempts (prevents head-of-line blocking!)
+  await dbClient.query(
+    `UPDATE outbox_events
+     SET dead_lettered_at = clock_timestamp(),
+         leased_until = NULL
+     WHERE processed_at IS NULL
+       AND dead_lettered_at IS NULL
+       AND relay_attempts >= $1`,
+    [maxRelayAttempts]
+  );
+
   // Phase 1: Claim committed rows atomically and release DB locks immediately
   const { rows } = await dbClient.query(
     `UPDATE outbox_events
@@ -94,13 +108,15 @@ export async function runCommittedOutboxRelayBatch(
        SELECT event_id
        FROM outbox_events
        WHERE processed_at IS NULL
+         AND dead_lettered_at IS NULL
+         AND relay_attempts < $2
          AND (leased_until IS NULL OR leased_until < clock_timestamp())
        ORDER BY created_at ASC
        LIMIT $1
        FOR UPDATE SKIP LOCKED
      )
      RETURNING event_id, aggregate_type, aggregate_id, event_type, payload, traceparent`,
-    [batchSize]
+    [batchSize, maxRelayAttempts]
   );
 
   if (rows.length === 0) {
@@ -179,7 +195,7 @@ When scaling with Primary + Read Replicas:
 
 ## 4. Tenant-Scoped Redis Caching with Single-Flight Stampede Protection & Jitter
 
-**Critical Multi-Tenancy Rule**: Never allow un-namespaced cache keys in a multi-tenant system. Require `tenantId` as an explicit parameter and construct `tenant:{tenantId}:{cacheNamespace}:{resourceKey}` so Tenant B can never read Tenant A's cached objects.
+**Critical Multi-Tenancy Rule**: Never allow un-namespaced cache keys in a multi-tenant system. Require `tenantId` and `resourceKey` to match strict format allowlists and construct `tenant:{tenantId}:{resourceKey}` so Tenant B can never read or poison Tenant A's cached objects.
 
 ```typescript
 const inFlightLocalPromises = new Map<string, Promise<unknown>>();
@@ -198,6 +214,9 @@ export async function getOrComputeCachedSingleFlight<T>(
 ): Promise<T | null> {
   if (!/^[a-zA-Z0-9_-]{1,64}$/.test(params.tenantId)) {
     throw new Error('CACHE_REJECTED: Invalid tenantId format');
+  }
+  if (!/^[a-zA-Z0-9_.:-]{1,128}$/.test(params.resourceKey)) {
+    throw new Error('CACHE_REJECTED: Invalid resourceKey format');
   }
   const scopedCacheKey = `tenant:${params.tenantId}:${params.resourceKey}`;
 
@@ -231,4 +250,5 @@ export async function getOrComputeCachedSingleFlight<T>(
   return computePromise;
 }
 ```
+
 

@@ -333,6 +333,7 @@ export interface HardenedJwtVerifyOptions {
   expectedIssuer: string;
   expectedAudience: string;
   expectedSessionBindingCookie?: string; // Optional __Host-sid value to verify cnf.sidHash
+  maxTokenLifetimeSeconds?: number;      // Default 3600s (1 hour) — blocks perpetual/100-year access tokens
   isJtiRevoked?: (jti: string) => boolean;
   clockToleranceSeconds?: number;
 }
@@ -412,6 +413,7 @@ export function verifyJwtPenetrationSafe(opts: HardenedJwtVerifyOptions): Verifi
 
   const nowSec = Math.floor(Date.now() / 1000);
   const leeway = opts.clockToleranceSeconds ?? 15;
+  const maxLifetimeSec = opts.maxTokenLifetimeSeconds ?? 3600;
 
   if (claims.iss !== opts.expectedIssuer) {
     throw new Error('JWT_REJECTED: Issuer mismatch');
@@ -427,6 +429,9 @@ export function verifyJwtPenetrationSafe(opts: HardenedJwtVerifyOptions): Verifi
   }
   if (typeof claims.iat !== 'number' || claims.iat > nowSec + leeway) {
     throw new Error('JWT_REJECTED: Token iat is in the future');
+  }
+  if (claims.exp <= claims.iat || claims.exp - claims.iat > maxLifetimeSec) {
+    throw new Error(`JWT_REJECTED: Token lifetime exceeds maximum allowed TTL (${maxLifetimeSec}s)`);
   }
   if (claims.nbf !== undefined && (typeof claims.nbf !== 'number' || nowSec + leeway < claims.nbf)) {
     throw new Error('JWT_REJECTED: Token is not yet valid (nbf)');
@@ -515,4 +520,73 @@ export async function rotateRefreshTokenWithReuseDetection(params: {
   };
 }
 ```
+
+### D. API Gateway Header Override & `X-Apigateway-Api-Userinfo` Claim Extractor
+When Google Cloud API Gateway routes a request to a backend with backend authentication enabled (`x-google-backend`), API Gateway **overrides the `Authorization` header** with the gateway's own OIDC service account ID token and places the verified client JWT payload in `X-Apigateway-Api-Userinfo`.
+- **Critical Vulnerability to Prevent**: Never read `X-Apigateway-Api-Userinfo` unless the backend has first verified that the request arrived from the authenticated API Gateway service account (`gatewayOidcVerified === true`), or an attacker reaching the backend directly could forge `X-Apigateway-Api-Userinfo`!
+
+```typescript
+export interface ApiGatewayUserInfoClaims {
+  sub: string;
+  iss: string;
+  aud: string | string[];
+  exp: number;
+  iat: number;
+  email?: string;
+  tenantId?: string;
+}
+
+export function extractVerifiedApiGatewayUserInfo(params: {
+  gatewayOidcVerified: boolean;
+  gatewayServiceAccountEmail: string;
+  expectedGatewayServiceAccountEmail: string;
+  rawUserInfoHeader: string | undefined;
+  expectedIssuers: ReadonlySet<string>;
+  expectedAudiences: ReadonlySet<string>;
+}): ApiGatewayUserInfoClaims {
+  // 1. Mandatory Gateway OIDC Service Account Proof (blocks direct X-Apigateway-Api-Userinfo spoofing)
+  if (
+    !params.gatewayOidcVerified ||
+    params.gatewayServiceAccountEmail !== params.expectedGatewayServiceAccountEmail
+  ) {
+    throw new Error('GATEWAY_AUTH_BYPASS_BLOCKED: Request lacks verified API Gateway OIDC service account identity');
+  }
+
+  if (!params.rawUserInfoHeader || params.rawUserInfoHeader.length > 8192) {
+    throw new Error('GATEWAY_USERINFO_REJECTED: Missing or oversized X-Apigateway-Api-Userinfo header');
+  }
+
+  // 2. Restore standard base64url '=' padding if required and decode JSON claims
+  const normalizedB64 = params.rawUserInfoHeader.trim();
+  if (!/^[A-Za-z0-9_-]+={0,2}$/.test(normalizedB64)) {
+    throw new Error('GATEWAY_USERINFO_REJECTED: Invalid base64url encoding');
+  }
+  const padLen = (4 - (normalizedB64.length % 4)) % 4;
+  const paddedB64 = normalizedB64 + '='.repeat(padLen);
+
+  let claims: ApiGatewayUserInfoClaims;
+  try {
+    claims = JSON.parse(Buffer.from(paddedB64, 'base64url').toString('utf8')) as ApiGatewayUserInfoClaims;
+  } catch {
+    throw new Error('GATEWAY_USERINFO_REJECTED: Malformed JSON payload in X-Apigateway-Api-Userinfo');
+  }
+
+  if (!claims.sub || !claims.iss || !params.expectedIssuers.has(claims.iss)) {
+    throw new Error('GATEWAY_USERINFO_REJECTED: Missing sub or untrusted issuer in userinfo claims');
+  }
+
+  const audList = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
+  if (!audList.some((a) => typeof a === 'string' && params.expectedAudiences.has(a))) {
+    throw new Error('GATEWAY_USERINFO_REJECTED: Audience mismatch in userinfo claims');
+  }
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (typeof claims.exp !== 'number' || nowSec >= claims.exp + 15) {
+    throw new Error('GATEWAY_USERINFO_REJECTED: End-user JWT in X-Apigateway-Api-Userinfo has expired');
+  }
+
+  return claims;
+}
+```
+
 
