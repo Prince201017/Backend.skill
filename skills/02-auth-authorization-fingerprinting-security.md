@@ -151,6 +151,31 @@ export function evaluateSessionRisk(ctx: SessionRiskContext): {
 ```typescript
 export type TenantRole = 'owner' | 'admin' | 'finance' | 'member' | 'viewer';
 
+const CANONICAL_ROLE_BRIDGE: Readonly<Record<string, TenantRole>> = {
+  owner: 'owner',
+  admin: 'admin',
+  tenant_admin: 'admin',
+  finance: 'finance',
+  billing_admin: 'finance',
+  finance_initiator: 'finance',
+  finance_checker: 'finance',
+  member: 'member',
+  editor: 'member',
+  viewer: 'viewer',
+  read_only: 'viewer',
+};
+
+/**
+ * Normalizes role identifiers across Module 02, Module 11, Module 13, and Module 14
+ * so cross-module composition never fails due to uppercase/alias role naming drift.
+ */
+export function normalizeCanonicalTenantRole(rawRole: string): TenantRole | null {
+  const key = rawRole.trim().toLowerCase();
+  return Object.prototype.hasOwnProperty.call(CANONICAL_ROLE_BRIDGE, key)
+    ? CANONICAL_ROLE_BRIDGE[key]
+    : null;
+}
+
 export type Permission =
   | 'order:read'
   | 'order:create'
@@ -427,16 +452,35 @@ const DUMMY_DERIVED_HEX = crypto
   .toString('hex');
 
 let activeScryptWorkers = 0;
+const activeScryptByCaller = new Map<string, number>();
 const DEFAULT_MAX_CONCURRENT_SCRYPT = 8;
+
+export async function hashPasswordScrypt(rawPassword: string): Promise<PasswordHashRecord> {
+  const normalized = rawPassword.normalize('NFKC');
+  if (Buffer.byteLength(normalized, 'utf8') < 8 || Buffer.byteLength(normalized, 'utf8') > 1024) {
+    throw new Error('AUTH_PASSWORD_LENGTH_INVALID: Password must be between 8 and 1024 UTF-8 bytes');
+  }
+  const saltBuf = crypto.randomBytes(16);
+  const derivedBuf = (await scryptAsync(normalized, saltBuf, 64)) as Buffer;
+  return {
+    saltHex: saltBuf.toString('hex'),
+    derivedKeyHex: derivedBuf.toString('hex'),
+  };
+}
 
 export async function verifyPasswordTimingSafe(
   candidatePassword: string,
   userHashRecord: PasswordHashRecord | null,
-  maxConcurrentHashes = DEFAULT_MAX_CONCURRENT_SCRYPT
+  maxConcurrentHashes = DEFAULT_MAX_CONCURRENT_SCRYPT,
+  callerKey?: string
 ): Promise<boolean> {
-  // Defeat libuv threadpool starvation DoS: shed load before queuing unbounded scrypt jobs
+  // Defeat libuv threadpool starvation DoS: enforce both global and per-caller concurrency limits
   if (activeScryptWorkers >= maxConcurrentHashes) {
     throw new Error('AUTH_HASH_CONCURRENCY_LIMIT_EXCEEDED: Too many concurrent password verifications');
+  }
+  const maxPerCaller = Math.max(1, Math.floor(maxConcurrentHashes / 2));
+  if (callerKey && (activeScryptByCaller.get(callerKey) ?? 0) >= maxPerCaller) {
+    throw new Error('AUTH_CALLER_HASH_CONCURRENCY_LIMIT_EXCEEDED: Caller exceeded per-source hash quota');
   }
 
   const normalizedPassword = candidatePassword.normalize('NFKC');
@@ -451,6 +495,9 @@ export async function verifyPasswordTimingSafe(
   }
 
   activeScryptWorkers += 1;
+  if (callerKey) {
+    activeScryptByCaller.set(callerKey, (activeScryptByCaller.get(callerKey) ?? 0) + 1);
+  }
   try {
     const derivedBuffer = (await scryptAsync(
       normalizedPassword,
@@ -467,6 +514,11 @@ export async function verifyPasswordTimingSafe(
     return userHashRecord !== null && hashesMatch;
   } finally {
     activeScryptWorkers = Math.max(0, activeScryptWorkers - 1);
+    if (callerKey) {
+      const nextCaller = (activeScryptByCaller.get(callerKey) ?? 1) - 1;
+      if (nextCaller <= 0) activeScryptByCaller.delete(callerKey);
+      else activeScryptByCaller.set(callerKey, nextCaller);
+    }
   }
 }
 ```

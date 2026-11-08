@@ -428,6 +428,18 @@ export interface McpToolDefinition<TArgs extends Record<string, unknown> & { ten
   ): Promise<TResult>;
 }
 
+function canonicalizeMcpArgValue(val: unknown): string {
+  if (val === null || val === undefined) return 'null';
+  if (typeof val === 'bigint') return JSON.stringify(val.toString());
+  if (typeof val !== 'object') return JSON.stringify(val);
+  if (Array.isArray(val)) return `[${val.map((v) => canonicalizeMcpArgValue(v)).join(',')}]`;
+  const obj = val as Record<string, unknown>;
+  const keys = Object.keys(obj)
+    .filter((k) => k !== '__proto__' && k !== 'constructor' && k !== 'prototype')
+    .sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalizeMcpArgValue(obj[k])}`).join(',')}}`;
+}
+
 export function computeMcpUserConfirmationToken(params: {
   confirmationSecret: string;
   userId: string;
@@ -435,10 +447,8 @@ export function computeMcpUserConfirmationToken(params: {
   toolName: string;
   args: Record<string, unknown>;
 }): string {
-  const sortedEntries = Object.keys(params.args)
-    .sort()
-    .map((k) => [k, params.args[k]]);
-  const canonical = `${params.userId}|${params.tenantId}|${params.toolName}|${JSON.stringify(sortedEntries)}`;
+  const canonicalArgs = canonicalizeMcpArgValue(params.args);
+  const canonical = `${params.userId}|${params.tenantId}|${params.toolName}|${canonicalArgs}`;
   return createHmac('sha256', params.confirmationSecret).update(canonical, 'utf8').digest('hex');
 }
 

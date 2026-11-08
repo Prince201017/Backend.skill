@@ -134,6 +134,13 @@ The table below documents the **12 new second-pass vulnerabilities and cross-mod
 | **TEST-43** | `DEVIL-07`: `scrypt` concurrency limiter sheds load when threadpool threshold exceeded | Mod 02 `verifyPasswordTimingSafe` | Executed & Passed |
 | **TEST-44** | `DEVIL-08`: Mutating MCP tool rejected without valid human confirmation token or with extra args | Mod 14 `executeMcpToolWithRuntimeAuthz` | Executed & Passed |
 | **TEST-45** | `DEVIL-09`: Cross-origin HTTPS redirect strips custom headers & blocks octal/dword loopback | Mod 08 `executePinnedSafeHttpsRequest` | Executed & Passed |
+| **TEST-46** | `PRESENT-01`: `withTenantTransaction` sets `app.current_user_id` before querying `tenant_members` & binds `app.current_tenant_mac` | Mod 13 `withTenantTransaction` | Executed & Passed |
+| **TEST-47** | `PRESENT-02/04`: Cross-module role normalization (`normalizeCanonicalTenantRole`) + `hashPasswordScrypt` & per-caller fairness | Mod 02 `normalizeCanonicalTenantRole` & `verifyPasswordTimingSafe` | Executed & Passed |
+| **TEST-48** | `PRESENT-03`: Deep recursive canonical JSON hashing (`canonicalizeJsonDeep`) prevents key-order mismatch | Mod 04 `executeWithIdempotencyLock` & Mod 14 | Executed & Passed |
+| **TEST-49** | `PRESENT-06`: Cross-origin `307`/`308` redirect with POST `bodyBuffer` blocked (`SSRF_CROSS_ORIGIN_BODY_REDIRECT_BLOCKED`) | Mod 08 `executePinnedSafeHttpsRequest` | Executed & Passed |
+| **TEST-50** | `PRESENT-08/10`: Stale SMS reservation sweeper (`reconcileStaleSmsBudgetReservations`) & circular/BigInt-safe trace redactor | Mod 10 & Mod 12 `redactTraceEnvelopeSecrets` | Executed & Passed |
+| **TEST-51** | `AI-MISTAKE-01/04`: Unpinned DB pool bypass rejected (`assertPinnedTenantTransactionClient`) & AES-256-GCM cross-tenant AAD transplant rejected | Mod 16 `assertPinnedTenantTransactionClient` & `decryptEnvelopeAes256Gcm` | Executed & Passed |
+| **TEST-52** | `AI-MISTAKE-05/06`: Revoked realtime WebSocket stream closed (`4403`) & batch BOLA/rate-limit amplification blocked | Mod 16 `verifyRealtimeStreamStillAuthorized` & `executeBoundedAuthorizedBatch` | Executed & Passed |
 
 ---
 

@@ -45,6 +45,16 @@ const FORBIDDEN_CODE_BLOCK_ANTI_PATTERNS: ReadonlyArray<{
     description: 'Firestore client update rule allowing direct transition to COMPLETED',
     regex: /request\.resource\.data\.status\s+in\s+\['DRAFT',\s*'ACTIVE',\s*'COMPLETED'\]/,
   },
+  {
+    id: 'UNDICI_FETCH_IGNORED_HTTPS_AGENT',
+    description: 'Passing Node https.Agent into globalThis.fetch(url, { agent }) which Undici silently ignores',
+    regex: /\bfetch\s*\([^)]*,\s*\{[^}]*\bagent\s*:/,
+  },
+  {
+    id: 'SESSION_SCOPED_TENANT_GUC_LEAK',
+    description: 'Session-scoped SET app.current_tenant_id (or set_config with false) leaking across pooled connections',
+    regex: /set_config\s*\(\s*'app\.current_tenant_id'\s*,\s*[^,]+,\s*false\s*\)/,
+  },
 ];
 
 export function extractFencedCodeBlocks(markdown: string): string[] {

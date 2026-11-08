@@ -153,6 +153,7 @@ export async function withTenantTransaction<T>(params: {
   identitySigningSecret: string;
   requestedTenantId: string;
   requiredPermission: TenantPermission;
+  gucHmacSecret?: string;
   nowSec?: number;
   work: (txClient: PooledDbClient, authContext: AuthorizedTenantTxContext) => Promise<T>;
 }): Promise<T> {
@@ -172,8 +173,16 @@ export async function withTenantTransaction<T>(params: {
   try {
     await client.query('BEGIN');
 
-    // Step 3: Query authoritative tenant + membership status inside the transaction (FOR SHARE lock)
-    // CRITICAL: app.current_tenant_id is NOT set yet!
+    // Step 3a: Clear any stale tenant context and set ONLY the verified user_id so that
+    // tenant_members FORCE ROW LEVEL SECURITY (user_id = current_setting('app.current_user_id'))
+    // permits reading this user's membership row BEFORE app.current_tenant_id is populated!
+    await client.query(`SELECT set_config('app.current_tenant_id', '', true)`);
+    await client.query(`SELECT set_config('app.current_user_id', $1, true)`, [
+      verifiedIdentity.userId,
+    ]);
+
+    // Step 3b: Query authoritative tenant + membership status inside the transaction (FOR SHARE lock)
+    // CRITICAL: app.current_tenant_id is still empty ('') here!
     const membershipRes = await client.query<{
       tenant_id: string;
       tenant_status: TenantStatus;
@@ -212,13 +221,17 @@ export async function withTenantTransaction<T>(params: {
       );
     }
 
-    // Step 4: Establish transaction-local RLS context ONLY AFTER authorization succeeds
+    // Step 4: Establish transaction-local RLS tenant context ONLY AFTER authorization succeeds
     await client.query(`SELECT set_config('app.current_tenant_id', $1, true)`, [
       row.tenant_id,
     ]);
-    await client.query(`SELECT set_config('app.current_user_id', $1, true)`, [
-      verifiedIdentity.userId,
-    ]);
+
+    if (params.gucHmacSecret && params.gucHmacSecret.length >= 32) {
+      const gucMac = createHmac('sha256', params.gucHmacSecret)
+        .update(`${row.tenant_id}:${verifiedIdentity.userId}`, 'utf8')
+        .digest('hex');
+      await client.query(`SELECT set_config('app.current_tenant_mac', $1, true)`, [gucMac]);
+    }
 
     const authContext: AuthorizedTenantTxContext = {
       userId: verifiedIdentity.userId,

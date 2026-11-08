@@ -312,8 +312,9 @@ CREATE POLICY tenant_realtime_channel_isolation
   );
 
 -- 3. Supabase Storage RLS (storage.objects)
--- Never allow direct client downloads from the 'quarantine' bucket; only allow reading 'approved' bucket objects
--- when the corresponding public.uploads record is in 'APPROVED' state and caller is an ACTIVE tenant member.
+-- Never allow direct client downloads from the 'quarantine' bucket; only allow reading 'production' bucket objects
+-- when the corresponding public.uploads record is in 'APPROVED' state, caller is an ACTIVE tenant member,
+-- AND caller is either the file owner or a tenant ADMIN (preventing Intra-Tenant Storage BOLA!).
 CREATE POLICY storage_approved_objects_only
   ON storage.objects
   FOR SELECT
@@ -329,6 +330,7 @@ CREATE POLICY storage_approved_objects_only
         AND u.status = 'APPROVED'
         AND tm.user_id = auth.uid()
         AND tm.status = 'ACTIVE'
+        AND (u.owner_user_id = auth.uid() OR tm.role = 'ADMIN')
     )
   );
 ```

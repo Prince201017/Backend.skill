@@ -215,11 +215,26 @@ export interface FencedIdempotencyDbPort {
   }): Promise<boolean>;
 }
 
+export function canonicalizeJsonDeep(value: unknown): string {
+  if (value === null || value === undefined) return 'null';
+  if (typeof value === 'bigint') return JSON.stringify(value.toString());
+  if (typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => canonicalizeJsonDeep(item)).join(',')}]`;
+  }
+  const obj = value as Record<string, unknown>;
+  const sortedKeys = Object.keys(obj)
+    .filter((k) => k !== '__proto__' && k !== 'constructor' && k !== 'prototype')
+    .sort();
+  const pairs = sortedKeys.map((k) => `${JSON.stringify(k)}:${canonicalizeJsonDeep(obj[k])}`);
+  return `{${pairs.join(',')}}`;
+}
+
 export async function executeWithIdempotencyLock(params: {
   tenantId: string;
   idempotencyKey: string;
   endpoint: string;
-  canonicalRequestBody: string;
+  canonicalRequestBody: string | Record<string, unknown>;
   lockTtlSeconds?: number;
   db: FencedIdempotencyDbPort;
   reconcileAmbiguousPayment?: (
@@ -245,9 +260,14 @@ export async function executeWithIdempotencyLock(params: {
     );
   }
 
+  const normalizedBody =
+    typeof params.canonicalRequestBody === 'string'
+      ? params.canonicalRequestBody
+      : canonicalizeJsonDeep(params.canonicalRequestBody);
+
   const reqHash = crypto
     .createHash('sha256')
-    .update(`${params.endpoint}:${params.canonicalRequestBody}`, 'utf8')
+    .update(`${params.endpoint}:${normalizedBody}`, 'utf8')
     .digest('hex');
 
   // Stable deterministic provider-side idempotency key bound to tenant + endpoint + client key
@@ -572,6 +592,7 @@ export interface PersistentWebhookStore {
     entityId: string;
     providerCreatedAtSec: number;
     lockOwner: string;
+    resolvedProviderIdempotencyKey?: string;
     applyEffect: () => Promise<void>;
   }): Promise<'APPLIED_AND_PROCESSED' | 'OUT_OF_ORDER_STALE_EVENT_IGNORED'>;
 
@@ -634,6 +655,7 @@ export async function verifyAndProcessWebhookIdempotently(params: {
   }
 
   // DEVIL-04 Guard: Verify that the webhook's entityId actually belongs to claimedTenantId in our DB
+  let resolvedProviderIdempotencyKey: string | undefined;
   if (params.store.resolveAuthoritativeEntityTenant) {
     const authEntity = await params.store.resolveAuthoritativeEntityTenant(envelope.entityId);
     if (!authEntity) {
@@ -652,6 +674,7 @@ export async function verifyAndProcessWebhookIdempotently(params: {
         'Webhook metadata tenantId does not match the authoritative tenant owner of entityId.'
       );
     }
+    resolvedProviderIdempotencyKey = authEntity.providerIdempotencyKey;
   }
 
   const payloadSha256 = crypto.createHash('sha256').update(params.rawBodyBuffer).digest('hex');
@@ -684,6 +707,7 @@ export async function verifyAndProcessWebhookIdempotently(params: {
       entityId: envelope.entityId,
       providerCreatedAtSec: envelope.providerCreatedAtSec,
       lockOwner,
+      resolvedProviderIdempotencyKey,
       applyEffect: params.applyDomainEffect,
     });
 

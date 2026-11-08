@@ -322,6 +322,47 @@ export async function dispatchSmsWithBudgetAndFailover(params: {
     }
   }
 }
+
+/**
+ * Orphaned SMS Budget Reservation Sweeper (PRESENT-WEAKNESS-08 Remediation):
+ * Prevents tenant SMS budgets from leaking permanently if a worker crashes while holding
+ * a BUDGET_RESERVED row or if an AMBIGUOUS_RECONCILIATION_REQUIRED row needs provider lookup.
+ */
+export async function reconcileStaleSmsBudgetReservations(params: {
+  staleRecords: readonly SmsBudgetReservationRecord[];
+  store: SmsQuotaBudgetStore;
+  queryProviderStatusByIdempotencyKey: (idempotencyKey: string) => Promise<
+    | { found: true; providerMessageSid: string }
+    | { found: false }
+    | { indeterminate: true }
+  >;
+}): Promise<{ committedCount: number; releasedCount: number; pendingCount: number }> {
+  let committedCount = 0;
+  let releasedCount = 0;
+  let pendingCount = 0;
+
+  for (const rec of params.staleRecords) {
+    const lookup = await params.queryProviderStatusByIdempotencyKey(rec.idempotencyKey);
+    if ('found' in lookup && lookup.found) {
+      await params.store.commitReservation({
+        reservationId: rec.reservationId,
+        tenantId: rec.tenantId,
+        providerMessageSid: lookup.providerMessageSid,
+      });
+      committedCount += 1;
+    } else if ('found' in lookup && !lookup.found) {
+      await params.store.releaseReservation({
+        reservationId: rec.reservationId,
+        tenantId: rec.tenantId,
+        reason: 'STALE_RESERVATION_RECONCILED_NOT_SENT',
+      });
+      releasedCount += 1;
+    } else {
+      pendingCount += 1;
+    }
+  }
+  return { committedCount, releasedCount, pendingCount };
+}
 ```
 
 ---

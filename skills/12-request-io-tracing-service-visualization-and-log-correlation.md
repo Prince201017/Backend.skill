@@ -113,9 +113,14 @@ const SECRET_STRING_PATTERNS: readonly RegExp[] = [
   /\b(?:\d[ -]*?){13,19}\b/g,
 ];
 
-export function redactTraceEnvelopeSecrets(input: unknown, depth = 0): unknown {
+export function redactTraceEnvelopeSecrets(
+  input: unknown,
+  depth = 0,
+  seen: WeakSet<object> = new WeakSet()
+): unknown {
   if (depth > 8) return '[MAX_DEPTH_TRUNCATED]';
   if (input === null || input === undefined) return input;
+  if (typeof input === 'bigint') return input.toString();
 
   if (typeof input === 'string') {
     let scrubbed = input;
@@ -126,20 +131,23 @@ export function redactTraceEnvelopeSecrets(input: unknown, depth = 0): unknown {
   }
 
   if (typeof input !== 'object') return input;
+  if (seen.has(input)) return '[CIRCULAR_REF]';
+  seen.add(input);
 
   if (Array.isArray(input)) {
-    return input.map((item) => redactTraceEnvelopeSecrets(item, depth + 1));
+    return input.slice(0, 100).map((item) => redactTraceEnvelopeSecrets(item, depth + 1, seen));
   }
 
-  const output: Record<string, unknown> = {};
+  const output: Record<string, unknown> = Object.create(null);
   for (const [key, value] of Object.entries(input as Record<string, unknown>)) {
+    if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
     if (isSensitiveTraceKey(key)) {
       output[key] = '[REDACTED]';
     } else {
-      output[key] = redactTraceEnvelopeSecrets(value, depth + 1);
+      output[key] = redactTraceEnvelopeSecrets(value, depth + 1, seen);
     }
   }
-  return output;
+  return { ...output };
 }
 
 function boundPreviewPayload(value: unknown, maxBytes: number): unknown {
@@ -182,24 +190,44 @@ export async function runInRootTraceContext<T>(
   };
 
   const startedAtMs = Date.now();
-  const result = await traceContextStorage.run(rootStore, fn);
-  const durationMs = Math.max(0, Date.now() - startedAtMs);
+  try {
+    const result = await traceContextStorage.run(rootStore, fn);
+    const durationMs = Math.max(0, Date.now() - startedAtMs);
 
-  shared.hops.unshift({
-    spanId: rootSpanId,
-    parentSpanId: null,
-    serviceName: 'api-gateway-entry',
-    operationName: params.rootOperationName,
-    direction: 'INBOUND',
-    startedAtMs,
-    durationMs,
-    statusCode: 200,
-  });
+    shared.hops.unshift({
+      spanId: rootSpanId,
+      parentSpanId: null,
+      serviceName: 'api-gateway-entry',
+      operationName: params.rootOperationName,
+      direction: 'INBOUND',
+      startedAtMs,
+      durationMs,
+      statusCode: 200,
+    });
 
-  return {
-    result,
-    envelope: exportCorrelatedTraceEnvelope(shared),
-  };
+    return {
+      result,
+      envelope: exportCorrelatedTraceEnvelope(shared),
+    };
+  } catch (err) {
+    const durationMs = Math.max(0, Date.now() - startedAtMs);
+    shared.hops.unshift({
+      spanId: rootSpanId,
+      parentSpanId: null,
+      serviceName: 'api-gateway-entry',
+      operationName: params.rootOperationName,
+      direction: 'INBOUND',
+      startedAtMs,
+      durationMs,
+      statusCode: 500,
+      errorMessage: err instanceof Error ? String(redactTraceEnvelopeSecrets(err.message)) : 'ROOT_ERROR',
+    });
+    if (err instanceof Error) {
+      (err as Error & { traceEnvelope?: CorrelatedTraceEnvelope }).traceEnvelope =
+        exportCorrelatedTraceEnvelope(shared);
+    }
+    throw err;
+  }
 }
 
 /**

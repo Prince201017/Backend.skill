@@ -393,9 +393,20 @@ export async function executePinnedSafeHttpsRequest(params: {
       if (!locationHeader || /[\r\n\0]/.test(locationHeader)) {
         throw new Error('SSRF_REDIRECT_ERROR: Redirect response missing or invalid Location header');
       }
-      const nextUrl = new URL(locationHeader, pinned.parsedUrl).toString();
+      const nextParsed = new URL(locationHeader, pinned.parsedUrl);
+      const nextUrl = nextParsed.toString();
+      if (
+        nextParsed.origin !== initialOrigin &&
+        (status === 307 || status === 308) &&
+        currentBody &&
+        currentBody.byteLength > 0
+      ) {
+        throw new Error(
+          'SSRF_CROSS_ORIGIN_BODY_REDIRECT_BLOCKED: Refusing to forward request body across cross-origin 307/308 redirect'
+        );
+      }
       currentUrl = nextUrl;
-      if (status === 301 || status === 302 || status === 303) {
+      if (status === 301 || status === 302 || status === 303 || nextParsed.origin !== initialOrigin) {
         currentMethod = 'GET';
         currentBody = undefined;
       }
