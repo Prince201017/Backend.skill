@@ -505,13 +505,15 @@ await enforceSmsTollFraudAndBudgetGuard({ tenantId: 'tnt_0195f8a0_acme', e164Pho
         durationMs: 14.5,
         spanId: 'a10167aa0ba90003',
         parentSpanId: 'a10167aa0ba90002',
-        policyTitle: 'Module 03 & 13: Pooled withTenantTransaction(SET LOCAL) + Committed Outbox',
+        policyTitle: 'Module 03 & 13: Pooled withTenantTransaction(SET LOCAL + HMAC GUC) + Committed Outbox',
         policyCode: `BEGIN ISOLATION LEVEL READ COMMITTED;
-SELECT set_config('app.current_tenant_id', '0195f8a0-0000-7000-8000-000000000001', true);
+SELECT txid_current()::text AS txid;
+SELECT set_config('app.current_tenant_id', $1, true),
+       set_config('app.current_tenant_mac', $2, true);
 INSERT INTO notification_deliveries (id, tenant_id, priority_lane, recipient_hmac, status)
-VALUES ('ntf_0195f8a9', $1, 'P0_CRITICAL_OTP', $2, 'QUEUED');
+VALUES ('ntf_0195f8a9', $1::uuid, 'P0_CRITICAL_OTP', $3, 'QUEUED');
 INSERT INTO outbox_events (event_id, aggregate_id, event_type, payload, created_at)
-VALUES ('obx_0195f8a9_e410', 'ntf_0195f8a9', 'notifications.p0.critical', $3, clock_timestamp());
+VALUES ('obx_0195f8a9_e410', 'ntf_0195f8a9', 'notifications.p0.critical', $4, clock_timestamp());
 COMMIT;`,
         inputEnvelope: {
           headers: { 'x-db-role': 'app_runtime (NOBYPASSRLS)' },
@@ -583,9 +585,9 @@ UPDATE background_jobs SET status = 'IN_PROGRESS', fencing_token = fencing_token
         spanId: 'a10167aa0ba90005',
         parentSpanId: 'a10167aa0ba90004',
         policyTitle: 'Module 10: Definitive Pre-Acceptance Failover + DKIM/RFC-8058 Headers',
-        policyCode: `// Attempt 1: AWS SES returns HTTP 503 Service Unavailable BEFORE accepting payload
+        policyCode: `// Attempt 1: AWS SES connection refused (ECONNREFUSED) BEFORE socket write
 // Classification: DEFINITIVE_PRE_ACCEPTANCE -> Safe immediate failover to Postmark!
-// (If error were AMBIGUOUS_POST_WRITE, hold in AMBIGUOUS_PENDING_RECONCILIATION to prevent duplicate send)`,
+// (Note: HTTP 503 after write is AMBIGUOUS_POST_WRITE and holds in AMBIGUOUS_PENDING_RECONCILIATION)`,
         inputEnvelope: {
           headers: {
             'x-pinned-dns-ip': '54.239.28.85 (SES) -> 50.31.156.6 (Postmark)',
@@ -600,7 +602,7 @@ UPDATE background_jobs SET status = 'IN_PROGRESS', fencing_token = fencing_token
         outputEnvelope: {
           headers: { 'x-failover-triggered': 'true' },
           payload: {
-            emailAttempt1: { provider: 'aws-ses-us-east-1', outcome: 'DEFINITIVE_PRE_ACCEPTANCE_FAILURE', httpStatus: 503 },
+            emailAttempt1: { provider: 'aws-ses-us-east-1', outcome: 'DEFINITIVE_PRE_ACCEPTANCE_FAILURE', errorCode: 'ECONNREFUSED' },
             emailAttempt2: { provider: 'postmark-transactional', outcome: 'DELIVERED', messageId: 'pm_msg_991827361' },
             smsAttempt1: { provider: 'twilio-verify-v2', outcome: 'DELIVERED', messageId: 'SM8827193847102938' },
           },
@@ -670,9 +672,9 @@ UPDATE background_jobs SET status = 'IN_PROGRESS', fencing_token = fencing_token
         hopId: 'hop-5',
         service: 'egress-provider-router',
         event: 'PRIMARY_PROVIDER_PRE_ACCEPTANCE_FAILURE',
-        message: 'AWS SES returned HTTP 503 (DEFINITIVE_PRE_ACCEPTANCE). Triggering immediate failover to Postmark.',
+        message: 'AWS SES socket refused connection (ECONNREFUSED, DEFINITIVE_PRE_ACCEPTANCE). Triggering immediate failover to Postmark.',
         durationMs: 74.1,
-        metadata: { failedProvider: 'aws-ses-us-east-1', httpStatus: 503, failoverAction: 'IMMEDIATE_SECONDARY_DISPATCH' },
+        metadata: { failedProvider: 'aws-ses-us-east-1', errorCode: 'ECONNREFUSED', failoverAction: 'IMMEDIATE_SECONDARY_DISPATCH' },
       },
       {
         id: 'log-106',
@@ -794,11 +796,11 @@ UPDATE background_jobs SET status = 'IN_PROGRESS', fencing_token = fencing_token
         durationMs: 6.4,
         spanId: 'b20167aa0ba90002',
         parentSpanId: 'b20167aa0ba90001',
-        policyTitle: 'Module 11: Enforce app_metadata (Reject Client-Writable user_metadata)',
+        policyTitle: 'Module 11: Enforce app_metadata + Authoritative Tenant Membership Re-Verification',
         policyCode: `const { data: { user } } = await supabaseUserClient.auth.getUser();
-// CRITICAL: Read tenant_id & role ONLY from app_metadata (server-controlled),
-// NEVER from user_metadata (which any user can mutate via supabase.auth.updateUser)
-const tenantId = user.app_metadata.tenant_id;`,
+// CRITICAL: Read tenant_id ONLY from app_metadata AND re-verify active membership + tenant status
+// in public.tenant_members & public.tenants (DEVIL-20 remediation):
+const verified = await verifySupabaseRequestAuthAndMembership({ authHeader, queryActiveMembership, requiredRoles: ['billing_admin'] });`,
         inputEnvelope: {
           headers: { authorization: 'Bearer [REDACTED_JWT]' },
           payload: {
@@ -830,11 +832,11 @@ const tenantId = user.app_metadata.tenant_id;`,
         durationMs: 18.2,
         spanId: 'b20167aa0ba90003',
         parentSpanId: 'b20167aa0ba90002',
-        policyTitle: 'Module 11 & 13: FORCE ROW LEVEL SECURITY + Composite Tenant FK',
+        policyTitle: 'Module 11 & 13: FORCE ROW LEVEL SECURITY + Active Membership Check',
         policyCode: `ALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.orders FORCE ROW LEVEL SECURITY;
 CREATE POLICY orders_tenant_insert ON public.orders FOR INSERT TO authenticated
-WITH CHECK (tenant_id = ((SELECT auth.jwt()) -> 'app_metadata' ->> 'tenant_id')::uuid);`,
+WITH CHECK (tenant_id = ((SELECT auth.jwt()) -> 'app_metadata' ->> 'tenant_id')::uuid AND public.is_active_tenant_member(tenant_id));`,
         inputEnvelope: {
           headers: { 'x-pg-role': 'authenticated' },
           payload: {
@@ -866,10 +868,13 @@ WITH CHECK (tenant_id = ((SELECT auth.jwt()) -> 'app_metadata' ->> 'tenant_id'):
         durationMs: 7.5,
         spanId: 'b20167aa0ba90004',
         parentSpanId: 'b20167aa0ba90003',
-        policyTitle: 'Module 04: Atomic Payment Idempotency Key Locking',
-        policyCode: `INSERT INTO idempotency_keys (tenant_id, idempotency_key, endpoint, request_hash, status, locked_until)
-VALUES ('tnt_0195f8b0_globex', 'idem_chk_0195f8b2_901a', '/checkout', $1, 'IN_PROGRESS', clock_timestamp() + interval '60s')
-ON CONFLICT (tenant_id, idempotency_key) DO NOTHING;`,
+        policyTitle: 'Module 04: Atomic Payment Idempotency Key Locking with Monotonic Fencing Token',
+        policyCode: `INSERT INTO idempotency_keys (tenant_id, idempotency_key, endpoint, request_hash, status, fencing_token, locked_until)
+VALUES ($1, $2, '/checkout', $3, 'IN_PROGRESS', 1, clock_timestamp() + interval '60 seconds')
+ON CONFLICT (tenant_id, idempotency_key) DO UPDATE
+SET status = 'IN_PROGRESS', fencing_token = idempotency_keys.fencing_token + 1
+WHERE idempotency_keys.status = 'IN_PROGRESS' AND idempotency_keys.locked_until < clock_timestamp()
+RETURNING fencing_token;`,
         inputEnvelope: {
           headers: { 'x-idempotency-key': 'idem_chk_0195f8b2_901a' },
           payload: { outboxEventId: 'obx_supa_0195f8b2', amountMinor: 217, currency: 'USD' },
@@ -893,10 +898,12 @@ ON CONFLICT (tenant_id, idempotency_key) DO NOTHING;`,
         durationMs: 107.1,
         spanId: 'b20167aa0ba90005',
         parentSpanId: 'b20167aa0ba90004',
-        policyTitle: 'Module 04 & 08: DNS-Pinned HTTPS Agent + Deterministic Stripe Idempotency',
-        policyCode: `const intent = await stripe.paymentIntents.create(
+        policyTitle: 'Module 04 & 08: DNS-Pinned HTTPS Agent + Tenant-Scoped Attempt-Invariant Stripe Key',
+        policyCode: `const { agent } = await createPinnedSafeHttpsAgent('https://api.stripe.com/v1/payment_intents');
+const stripeIdempotencyKey = deriveStripeIdempotencyKey('tnt_0195f8b0_globex', 'POST:/checkout', 'idem_chk_0195f8b2_901a', requestHash);
+const intent = await stripe.paymentIntents.create(
   { amount: 217, currency: 'usd', metadata: { orderId: 'ord_0195f8b2_f901' } },
-  { idempotencyKey: 'idem_chk_0195f8b2_901a', httpAgent: createPinnedSafeHttpsAgent('api.stripe.com') }
+  { idempotencyKey: stripeIdempotencyKey, httpAgent: agent }
 );`,
         inputEnvelope: {
           headers: {

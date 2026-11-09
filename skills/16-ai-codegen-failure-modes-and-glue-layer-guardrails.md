@@ -312,12 +312,25 @@ export function encryptEnvelopeAes256Gcm(params: {
   if (params.keyBytes32.byteLength !== 32) {
     throw new Error('CRYPTO_KEY_ERROR: AES-256-GCM requires an exact 32-byte key');
   }
-  if (!params.tenantId || !params.resourceId || !params.purpose) {
-    throw new Error('CRYPTO_AAD_ERROR: tenantId, resourceId, and purpose are mandatory for AAD binding');
+  if (!params.keyId || !params.tenantId || !params.resourceId || !params.purpose) {
+    throw new Error('CRYPTO_AAD_ERROR: keyId, tenantId, resourceId, and purpose are mandatory for AAD binding');
+  }
+  if (
+    /[|\0\r\n]/.test(params.keyId) ||
+    /[|\0\r\n]/.test(params.tenantId) ||
+    /[|\0\r\n]/.test(params.resourceId) ||
+    /[|\0\r\n]/.test(params.purpose)
+  ) {
+    throw new Error('CRYPTO_AAD_DELIMITER_REJECTED: AAD context fields cannot contain pipe or control characters');
   }
 
   const iv = crypto.randomBytes(12); // 96-bit NIST-recommended GCM IV
-  const aad = Buffer.from(`${params.tenantId}|${params.resourceId}|${params.purpose}`, 'utf8');
+  // DEVIL-65 Remediation: Bind version + keyId + tenantId + resourceId + purpose as a canonical JSON tuple
+  // to prevent delimiter collision / ambiguity across AAD fields.
+  const aad = Buffer.from(
+    JSON.stringify([1, params.keyId, params.tenantId, params.resourceId, params.purpose]),
+    'utf8'
+  );
 
   const cipher = crypto.createCipheriv('aes-256-gcm', params.keyBytes32, iv, {
     authTagLength: 16,
@@ -353,6 +366,14 @@ export function decryptEnvelopeAes256Gcm(params: {
   if (!params.expectedTenantId || !params.expectedResourceId || !params.expectedPurpose) {
     throw new Error('CRYPTO_DECRYPT_REJECTED: expectedTenantId, expectedResourceId, and expectedPurpose are mandatory');
   }
+  if (
+    /[|\0\r\n]/.test(envelope.keyId) ||
+    /[|\0\r\n]/.test(params.expectedTenantId) ||
+    /[|\0\r\n]/.test(params.expectedResourceId) ||
+    /[|\0\r\n]/.test(params.expectedPurpose)
+  ) {
+    throw new Error('CRYPTO_DECRYPT_REJECTED: AAD context fields cannot contain pipe or control characters');
+  }
   const keyBytes = Object.prototype.hasOwnProperty.call(params.keyRing, envelope.keyId)
     ? params.keyRing[envelope.keyId]
     : undefined;
@@ -369,7 +390,13 @@ export function decryptEnvelopeAes256Gcm(params: {
   }
 
   const aad = Buffer.from(
-    `${params.expectedTenantId}|${params.expectedResourceId}|${params.expectedPurpose}`,
+    JSON.stringify([
+      envelope.v,
+      envelope.keyId,
+      params.expectedTenantId,
+      params.expectedResourceId,
+      params.expectedPurpose,
+    ]),
     'utf8'
   );
 
@@ -386,7 +413,7 @@ export function decryptEnvelopeAes256Gcm(params: {
 
 ---
 
-## 6. Guardrail 5: Realtime WebSocket / SSE Active Stream Controller & Post-Revocation Seal (`AI-MISTAKE-05` & `DEVIL-16` Remediated)
+## 6. Guardrail 5: Realtime WebSocket / SSE Active Stream Controller & Post-Revocation Seal (`AI-MISTAKE-05`, `DEVIL-16` & `DEVIL-65` Remediated)
 
 ```typescript
 export async function verifyRealtimeStreamStillAuthorized(params: {
@@ -416,10 +443,10 @@ export async function verifyRealtimeStreamStillAuthorized(params: {
 }
 
 /**
- * Active Realtime Stream Controller (`DEVIL-16` Remediation):
- * Enforces continuous revalidation before delivering any outbound or queued frame,
- * and permanently seals the stream once token expiry or membership revocation occurs
- * so buffered messages can NEVER be emitted after revocation!
+ * Active Realtime Stream Controller (`DEVIL-16` & `DEVIL-65` Remediation):
+ * Enforces serialized continuous revalidation before delivering any outbound or queued frame,
+ * and permanently seals the stream once token expiry, membership revocation, or explicit close() occurs
+ * so concurrent in-flight sends or buffered messages can NEVER be emitted after closure!
  */
 export function createRevocationSafeRealtimeStreamController<TFrame>(config: {
   userId: string;
@@ -433,6 +460,7 @@ export function createRevocationSafeRealtimeStreamController<TFrame>(config: {
   closeSocketWithReason: (code: number, reason: string) => void;
 }) {
   let closed = false;
+  let operationQueue: Promise<unknown> = Promise.resolve();
 
   const terminate = (code: number, reason: string): void => {
     if (!closed) {
@@ -441,52 +469,66 @@ export function createRevocationSafeRealtimeStreamController<TFrame>(config: {
     }
   };
 
+  const enqueueSerialized = <T>(fn: () => Promise<T>): Promise<T> => {
+    const next = operationQueue.then(fn, fn);
+    operationQueue = next.then(
+      () => undefined,
+      () => undefined
+    );
+    return next;
+  };
+
   return {
     isClosed: (): boolean => closed,
-    revalidateNow: async (nowSec?: number): Promise<boolean> => {
-      if (closed) return false;
-      return verifyRealtimeStreamStillAuthorized({
-        userId: config.userId,
-        tenantId: config.tenantId,
-        tokenExpiresAtSec: config.tokenExpiresAtSec,
-        nowSec,
-        loadCurrentMembershipStatus: config.loadCurrentMembershipStatus,
-        closeStreamWithReason: terminate,
-      });
+    close: (code = 1000, reason = 'REALTIME_STREAM_CLOSED_BY_SERVER'): void => {
+      terminate(code, reason);
     },
-    sendFrameIfAuthorized: async (frame: TFrame, nowSec?: number): Promise<boolean> => {
-      if (closed) return false;
-      const authorized = await verifyRealtimeStreamStillAuthorized({
-        userId: config.userId,
-        tenantId: config.tenantId,
-        tokenExpiresAtSec: config.tokenExpiresAtSec,
-        nowSec,
-        loadCurrentMembershipStatus: config.loadCurrentMembershipStatus,
-        closeStreamWithReason: terminate,
-      });
-      if (!authorized || closed) {
-        return false;
-      }
-      config.deliverFrameToSocket(frame);
-      return true;
-    },
+    revalidateNow: (nowSec?: number): Promise<boolean> =>
+      enqueueSerialized(async () => {
+        if (closed) return false;
+        return verifyRealtimeStreamStillAuthorized({
+          userId: config.userId,
+          tenantId: config.tenantId,
+          tokenExpiresAtSec: config.tokenExpiresAtSec,
+          nowSec,
+          loadCurrentMembershipStatus: config.loadCurrentMembershipStatus,
+          closeStreamWithReason: terminate,
+        });
+      }),
+    sendFrameIfAuthorized: (frame: TFrame, nowSec?: number): Promise<boolean> =>
+      enqueueSerialized(async () => {
+        if (closed) return false;
+        const authorized = await verifyRealtimeStreamStillAuthorized({
+          userId: config.userId,
+          tenantId: config.tenantId,
+          tokenExpiresAtSec: config.tokenExpiresAtSec,
+          nowSec,
+          loadCurrentMembershipStatus: config.loadCurrentMembershipStatus,
+          closeStreamWithReason: terminate,
+        });
+        if (!authorized || closed) {
+          return false;
+        }
+        config.deliverFrameToSocket(frame);
+        return true;
+      }),
   };
 }
 ```
 
 ---
 
-## 7. Guardrail 6: Bounded, Cost-Weighted & Transactionally Authorized Batch Executor (`AI-MISTAKE-06` & `DEVIL-09` Remediated)
+## 7. Guardrail 6: Bounded, Cost-Weighted & Transactionally Authorized Batch Executor (`AI-MISTAKE-06`, `DEVIL-09` & `DEVIL-64` Remediated)
 
 ```typescript
 export const HARD_MAX_BATCH_SIZE = 50;
 
 /**
- * Bounded, Cost-Weighted & Transactionally Authorized Batch Executor (`DEVIL-09` Hardened):
+ * Bounded, Cost-Weighted & Transactionally Authorized Batch Executor (`DEVIL-09` & `DEVIL-64` Hardened):
  * 1. Enforces an un-overridable ceiling `HARD_MAX_BATCH_SIZE = 50` (rejects caller overrides > 50).
  * 2. Charges rate-limit tokens proportional to total batch item cost (`calculateItemCost`), not just request count.
- * 3. Executes per-item authorization AND mutation inside a single atomic transaction (`runInTransaction`),
- *    preventing TOCTOU between authorization check and item mutation and rolling back the entire batch on any violation.
+ * 3. Unconditionally requires `runInTransaction` (no non-transactional fallback — `DEVIL-64`) and executes per-item
+ *    authorization AND mutation inside a single atomic transaction, preventing partial batch mutations and TOCTOU races.
  */
 export async function executeBoundedAuthorizedBatch<TItem, TResult>(params: {
   items: readonly TItem[];
@@ -495,8 +537,13 @@ export async function executeBoundedAuthorizedBatch<TItem, TResult>(params: {
   consumeRateLimitTokens: (totalCostUnits: number) => Promise<boolean>;
   authorizeItem: (item: TItem) => Promise<boolean>;
   processItem: (item: TItem) => Promise<TResult>;
-  runInTransaction?: <T>(fn: () => Promise<T>) => Promise<T>;
+  runInTransaction: <T>(fn: () => Promise<T>) => Promise<T>;
 }): Promise<TResult[]> {
+  if (typeof params.runInTransaction !== 'function') {
+    throw new Error(
+      'BATCH_TRANSACTION_RUNNER_REQUIRED: executeBoundedAuthorizedBatch requires a mandatory runInTransaction wrapper to prevent partial batch mutations'
+    );
+  }
   const requestedMax = params.maxBatchSize ?? HARD_MAX_BATCH_SIZE;
   if (!Number.isInteger(requestedMax) || requestedMax < 1 || requestedMax > HARD_MAX_BATCH_SIZE) {
     throw new Error(
@@ -545,9 +592,6 @@ export async function executeBoundedAuthorizedBatch<TItem, TResult>(params: {
     return results;
   };
 
-  if (params.runInTransaction) {
-    return params.runInTransaction(executeBatchAtomically);
-  }
-  return executeBatchAtomically();
+  return params.runInTransaction(executeBatchAtomically);
 }
 ```

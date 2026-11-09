@@ -251,15 +251,25 @@ export async function consumeEventIdempotently(params: {
       return 'DUPLICATE_SKIPPED';
     }
 
-    // Bind tenant context + transaction-local HMAC to current PostgreSQL txid_current()
+    // Bind tenant + user context and transaction-local HMACs to current PostgreSQL txid_current()
+    // strictly matching Module 07 security.verify_active_user_context / verify_active_tenant_context
+    // and Module 13 withTenantTransaction (DEVIL-49 Remediation)
+    const SYSTEM_INBOX_USER_UUID = '00000000-0000-7000-8000-000000000000';
     const txidRes = await txClient.query<{ txid: string }>(`SELECT txid_current()::text AS txid`);
     const txid = txidRes.rows[0]?.txid ?? '0';
+    const userMac = crypto
+      .createHmac('sha256', params.gucHmacSecret)
+      .update(`user:${SYSTEM_INBOX_USER_UUID}:${txid}`, 'utf8')
+      .digest('hex');
     const tenantMac = crypto
       .createHmac('sha256', params.gucHmacSecret)
-      .update(`tenant|${txid}|${params.event.tenant_id}|system_inbox`, 'utf8')
+      .update(`${params.event.tenant_id}:${txid}`, 'utf8')
       .digest('hex');
 
-    await txClient.query(`SELECT set_config('app.current_user_id', 'system_inbox', true)`);
+    await txClient.query(`SELECT set_config('app.current_user_id', $1, true)`, [
+      SYSTEM_INBOX_USER_UUID,
+    ]);
+    await txClient.query(`SELECT set_config('app.current_user_mac', $1, true)`, [userMac]);
     await txClient.query(`SELECT set_config('app.current_tenant_id', $1, true)`, [
       params.event.tenant_id,
     ]);
@@ -285,11 +295,11 @@ export async function consumeEventIdempotently(params: {
 ### Critical Cache Security Rule
 **Tenant Key Namespacing Is NOT Per-User Authorization!**
 Constructing `tenant:${tenantId}:${resourceKey}` prevents Tenant B from reading Tenant A's cache keys, but it does **not** prevent a regular member in Tenant A from reading another user's private resource within Tenant A if the endpoint returns cached objects before checking authorization.
-1. **Mandatory Pre-Return Authorization (`authorizeResource`)**: Always verify that the calling subject is authorized to read the cached resource (or scope user-private projections with `tenant:${tenantId}:user:${actorUserId}:${resourceKey}`).
+1. **Mandatory Pre-Write & Pre-Return Authorization (`authorizeResource`)**: Always verify that the calling subject is authorized before populating or returning the cached resource (or scope user-private projections with `tenant:${tenantId}:user:${actorUserId}:${resourceKey}`).
 2. **`BigInt`-Safe JSON Serialization**: Financial domain models in Module 01 use `bigint` for minor units (`amountMinor`). Standard `JSON.stringify` throws `TypeError: Do not know how to serialize a BigInt`. Use `serializeCacheValueBigIntSafe` / `deserializeCacheValueBigIntSafe`.
 
 ```typescript
-const inFlightLocalPromises = new Map<string, Promise<unknown>>();
+const inFlightLocalPromises = new Map<string, Promise<string | null>>();
 
 export function serializeCacheValueBigIntSafe(value: unknown): string {
   return JSON.stringify(value, (_key, val) =>
@@ -323,6 +333,11 @@ export async function getOrComputeAuthorizedCachedSingleFlight<T>(
     visibilityScope: 'TENANT_SHARED' | 'USER_PRIVATE';
     resourceKey: string;
     ttlSeconds: number;
+    authorizeBeforeFetch?: (ctx: {
+      tenantId: string;
+      actorUserId: string;
+      resourceKey: string;
+    }) => Promise<boolean>;
   },
   fetcher: () => Promise<T | null>,
   authorizeResource: (resource: T, ctx: { tenantId: string; actorUserId: string }) => Promise<boolean>
@@ -335,6 +350,17 @@ export async function getOrComputeAuthorizedCachedSingleFlight<T>(
   }
   if (!/^[a-zA-Z0-9_.:-]{1,128}$/.test(params.resourceKey)) {
     throw new Error('CACHE_REJECTED: Invalid resourceKey format');
+  }
+
+  if (params.authorizeBeforeFetch) {
+    const preAllowed = await params.authorizeBeforeFetch({
+      tenantId: params.tenantId,
+      actorUserId: params.actorUserId,
+      resourceKey: params.resourceKey,
+    });
+    if (!preAllowed) {
+      throw new Error('CACHE_AUTHZ_DENIED: Caller is not authorized to fetch or read resource');
+    }
   }
 
   const scopedCacheKey =
@@ -357,18 +383,26 @@ export async function getOrComputeAuthorizedCachedSingleFlight<T>(
     return parsed;
   }
 
-  let computePromise = inFlightLocalPromises.get(scopedCacheKey) as Promise<T | null> | undefined;
+  let computePromise = inFlightLocalPromises.get(scopedCacheKey);
   if (!computePromise) {
-    computePromise = (async () => {
+    computePromise = (async (): Promise<string | null> => {
       try {
         const fresh = await fetcher();
         if (fresh === null) {
-          await redis.set(scopedCacheKey, '__NULL__', 'EX', 30);
           return null;
         }
-        const jitteredTtl = Math.max(1, Math.floor(params.ttlSeconds * (0.9 + Math.random() * 0.2)));
-        await redis.set(scopedCacheKey, serializeCacheValueBigIntSafe(fresh), 'EX', jitteredTtl);
-        return fresh;
+        // DEVIL-53 Fix: Verify caller authorization BEFORE writing to Redis so an unauthorized
+        // caller can never populate or warm restricted cache keys!
+        const callerAllowed = await authorizeResource(fresh, {
+          tenantId: params.tenantId,
+          actorUserId: params.actorUserId,
+        });
+        const serialized = serializeCacheValueBigIntSafe(fresh);
+        if (callerAllowed) {
+          const jitteredTtl = Math.max(1, Math.floor(params.ttlSeconds * (0.9 + Math.random() * 0.2)));
+          await redis.set(scopedCacheKey, serialized, 'EX', jitteredTtl);
+        }
+        return serialized;
       } finally {
         inFlightLocalPromises.delete(scopedCacheKey);
       }
@@ -376,9 +410,11 @@ export async function getOrComputeAuthorizedCachedSingleFlight<T>(
     inFlightLocalPromises.set(scopedCacheKey, computePromise);
   }
 
-  const value = await computePromise;
-  if (value === null) return null;
+  const serializedValue = await computePromise;
+  if (serializedValue === null) return null;
 
+  // Deserialize a fresh copy per caller so concurrent single-flight callers never share mutable references
+  const value = deserializeCacheValueBigIntSafe<T>(serializedValue);
   const allowed = await authorizeResource(value, {
     tenantId: params.tenantId,
     actorUserId: params.actorUserId,

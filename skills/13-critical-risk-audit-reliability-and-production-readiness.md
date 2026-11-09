@@ -173,16 +173,17 @@ const UUID_SYNTAX_REGEX =
  */
 export async function verifyDatabaseRoleRlsEnforcement(client: PooledDbClient): Promise<void> {
   const res = await client.query<{ rolname: string; rolsuper: boolean; rolbypassrls: boolean }>(
-    `SELECT rolname, rolsuper, rolbypassrls FROM pg_catalog.pg_roles WHERE rolname = current_user`
+    `SELECT rolname, rolsuper, rolbypassrls FROM pg_catalog.pg_roles WHERE rolname IN (current_user, session_user)`
   );
-  const role = res.rows[0];
-  if (!role) {
-    throw new Error('DB_ROLE_VERIFICATION_FAILED: Could not inspect current_user in pg_roles');
+  if (!res.rows || res.rows.length === 0) {
+    throw new Error('DB_ROLE_VERIFICATION_FAILED: Could not inspect current_user/session_user in pg_roles');
   }
-  if (role.rolsuper || role.rolbypassrls) {
-    throw new Error(
-      `DB_RLS_BYPASS_HAZARD: Runtime role "${role.rolname}" has rolsuper=${String(role.rolsuper)} or rolbypassrls=${String(role.rolbypassrls)}; RLS policies would be silently bypassed!`
-    );
+  for (const role of res.rows) {
+    if (role.rolsuper || role.rolbypassrls) {
+      throw new Error(
+        `DB_RLS_BYPASS_HAZARD: Runtime or session role "${role.rolname}" has rolsuper=${String(role.rolsuper)} or rolbypassrls=${String(role.rolbypassrls)}; RLS policies would be silently bypassed!`
+      );
+    }
   }
 }
 
@@ -365,8 +366,8 @@ const UNANCHORED_SECRET_PATTERNS: ReadonlyArray<{
   },
   {
     ruleId: 'DATABASE_CONNECTION_URI',
-    description: 'Embedded PostgreSQL / Redis / MongoDB connection URI with credentials',
-    regex: /\b(?:postgres(?:ql)?|redis(?:s)?|mongodb(?:\+srv)?):\/\/[^:\s"']+:[^@\s"']+@[^\s"']+/,
+    description: 'Embedded PostgreSQL / Redis / MongoDB / AMQP / MySQL connection URI with credentials',
+    regex: /\b(?:postgres(?:ql)?|redis(?:s)?|mongodb(?:\+srv)?|amqp(?:s)?|mysql):\/\/[^:\s"']+:[^@\s"']+@[^\s"']+/,
   },
   {
     ruleId: 'SUPABASE_SERVICE_ROLE_JWT',
@@ -378,10 +379,20 @@ const UNANCHORED_SECRET_PATTERNS: ReadonlyArray<{
     description: 'GitHub PAT (ghp_, github_pat_) or Slack token (xoxb-, xoxp-)',
     regex: /\b(?:ghp_[0-9a-zA-Z]{20,}|github_pat_[0-9a-zA-Z_]{20,}|xox[bp]-[0-9a-zA-Z-]{15,})\b/,
   },
+  {
+    ruleId: 'GOOGLE_OR_AI_PROVIDER_API_KEY',
+    description: 'Google Cloud / Firebase API key (AIza...) or OpenAI/Anthropic secret key (sk-proj-, sk-ant-)',
+    regex: /\b(?:AIza[0-9A-Za-z_-]{35,}|sk-(?:proj|ant)-[0-9a-zA-Z_-]{20,})\b/,
+  },
+  {
+    ruleId: 'EMBEDDED_BEARER_JWT',
+    description: 'Hardcoded 3-part JWS/JWT bearer token (eyJ...)',
+    regex: /\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/,
+  },
 ];
 
 const FORBIDDEN_CLIENT_ENV_NAME_REGEX =
-  /(?:SECRET|PRIVATE|SERVICE_ROLE|DATABASE_URL|REDIS_URL|INTERNAL_KEY|SIGNING_KEY|WEBHOOK_SECRET|PASSWORD)/i;
+  /(?:SECRET|PRIVATE|SERVICE_ROLE|DATABASE_URL|REDIS_URL|INTERNAL_KEY|SIGNING_KEY|WEBHOOK_SECRET|PASSWORD|API_KEY)/i;
 
 export function scanReleaseArtifactsAndEnvForSecrets(params: {
   envVars: Readonly<Record<string, string | undefined>>;

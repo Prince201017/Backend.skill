@@ -378,6 +378,9 @@ export async function executeWithIdempotencyLock(params: {
         lockRes.providerIdempotencyKey,
         abortController.signal
       );
+      if (abortController.signal.aborted) {
+        throw new Error('IDEMPOTENCY_FENCING_TOKEN_REJECTED_STALE_OWNER');
+      }
       if (recon.resolved === 'SUCCEEDED') {
         const committed = await params.db.completeLockConditionally({
           tenantId: params.tenantId,
@@ -394,12 +397,15 @@ export async function executeWithIdempotencyLock(params: {
         return { status: recon.status, body: recon.body, replayed: true, fencingToken };
       }
       if (recon.resolved === 'STILL_UNKNOWN') {
-        await params.db.markUnknownReconciliationRequiredConditionally({
+        const markedStillUnknown = await params.db.markUnknownReconciliationRequiredConditionally({
           tenantId: params.tenantId,
           key: params.idempotencyKey,
           lockOwnerToken,
           fencingToken,
         });
+        if (!markedStillUnknown) {
+          throw new Error('IDEMPOTENCY_FENCING_TOKEN_REJECTED_STALE_OWNER');
+        }
         throw new OperationalAppError(
           503,
           'payment-reconciliation-pending',
@@ -477,12 +483,14 @@ Validating `t=<timestamp>,v1=<hmac>` within $\pm 300\text{s}$ proves only that t
 CREATE TABLE webhook_events (
     provider VARCHAR(32) NOT NULL,
     provider_event_id VARCHAR(128) NOT NULL,
+    tenant_id UUID NOT NULL,
     event_type VARCHAR(128) NOT NULL,
     entity_id VARCHAR(128) NOT NULL,
     provider_created_at_sec BIGINT NOT NULL,
     payload_sha256 CHAR(64) NOT NULL,
     status VARCHAR(24) NOT NULL CHECK (status IN ('PROCESSING', 'PROCESSED', 'FAILED_RETRYABLE')),
     lock_owner VARCHAR(128) NULL,
+    fencing_token BIGINT NOT NULL DEFAULT 1,
     locked_until TIMESTAMPTZ NOT NULL,
     processed_at TIMESTAMPTZ NULL,
     PRIMARY KEY (provider, provider_event_id)

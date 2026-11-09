@@ -260,6 +260,9 @@ export async function executeQueueWorkerJob<TPayload>(
     ) {
       throw err;
     }
+    if (abortController.signal.aborted) {
+      throw new Error(`JOB_LEASE_HEARTBEAT_FAILED: Worker ${workerInstanceId} aborted before status transition (${errorReason})`);
+    }
 
     const capMs = 300_000;
     const baseDelayMs = Math.min(capMs, 1000 * 2 ** attempt);

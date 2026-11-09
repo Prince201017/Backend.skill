@@ -420,7 +420,9 @@ export async function reconcileStaleSmsBudgetReservations(params: {
   let pendingCount = 0;
 
   for (const rec of params.staleRecords) {
-    const lookup = await params.queryProviderStatusByIdempotencyKey(rec.idempotencyKey);
+    const providerKey =
+      rec.providerIdempotencyKey || `${rec.tenantId}:${rec.reservationId}:${rec.idempotencyKey}`;
+    const lookup = await params.queryProviderStatusByIdempotencyKey(providerKey);
     if ('found' in lookup && lookup.found) {
       await params.store.commitReservation({
         reservationId: rec.reservationId,

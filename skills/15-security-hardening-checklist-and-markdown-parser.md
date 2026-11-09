@@ -77,16 +77,139 @@ const FORBIDDEN_CODE_BLOCK_ANTI_PATTERNS: ReadonlyArray<{
     description: 'Forgeable Symbol.for("backend.skill.pinnedTenantTx") used for transaction client verification',
     regex: /Symbol\.for\s*\(\s*['"]backend\.skill\.pinnedTenantTx['"]\s*\)/,
   },
+  {
+    id: 'INVALID_PG_UPDATE_ORDER_BY_LIMIT',
+    description: 'Invalid PostgreSQL syntax: direct ORDER BY / LIMIT on an UPDATE statement without a CTE or subquery',
+    regex: /\bUPDATE\s+[a-zA-Z0-9_.]+\s+SET\s+[^;()]*?\bORDER\s+BY\b[^;()]*?\bLIMIT\b/i,
+  },
 ];
 
-export function extractFencedCodeBlocks(markdown: string): string[] {
-  const blocks: string[] = [];
-  const regex = /\x60{3}(?:typescript|ts|javascript|js|sql)?\r?\n([\s\S]*?)\x60{3}/g;
-  let match: RegExpExecArray | null;
-  while ((match = regex.exec(markdown)) !== null) {
-    blocks.push(match[1]);
+export interface ExtractedCodeBlock {
+  readonly language: string;
+  readonly code: string;
+  readonly fenceLength: number;
+  readonly startLine: number;
+}
+
+/**
+ * Deterministic Line-by-Line Markdown Fenced Code Block Extractor:
+ * - Correctly handles nested code fences (e.g., a 4-backtick outer markdown block containing
+ *   3-backtick inner typescript blocks) by only closing when encountering a fence of the same
+ *   character (\x60 or ~) with length >= the opening fence length and no trailing info string.
+ * - Fails safely on malformed/unclosed fences at EOF by discarding unclosed blocks unless
+ *   includeMalformedUnclosed is explicitly requested.
+ */
+export function extractFencedCodeBlocksDetailed(
+  markdown: string,
+  options: {
+    allowedLanguages?: ReadonlySet<string>;
+    includeMalformedUnclosed?: boolean;
+  } = {}
+): {
+  blocks: ExtractedCodeBlock[];
+  malformedUnclosedCount: number;
+} {
+  const allowedLanguages =
+    options.allowedLanguages ??
+    new Set(['typescript', 'ts', 'javascript', 'js', 'sql', '']);
+  const lines = markdown.split(/\r?\n/);
+  const blocks: ExtractedCodeBlock[] = [];
+
+  let inFence = false;
+  let fenceChar = '';
+  let fenceLength = 0;
+  let fenceLang = '';
+  let fenceStartLine = 0;
+  let buffer: string[] = [];
+  let malformedUnclosedCount = 0;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!inFence) {
+      const openMatch = /^\s*(\x60{3,}|~{3,})\s*([a-zA-Z0-9_-]*)\s*$/.exec(line);
+      if (openMatch) {
+        inFence = true;
+        fenceChar = openMatch[1][0];
+        fenceLength = openMatch[1].length;
+        fenceLang = openMatch[2].toLowerCase();
+        fenceStartLine = i + 1;
+        buffer = [];
+      }
+    } else {
+      const closeMatch = /^\s*(\x60{3,}|~{3,})\s*$/.exec(line);
+      if (
+        closeMatch &&
+        closeMatch[1][0] === fenceChar &&
+        closeMatch[1].length >= fenceLength
+      ) {
+        if (allowedLanguages.has(fenceLang)) {
+          blocks.push({
+            language: fenceLang,
+            code: buffer.join('\n'),
+            fenceLength,
+            startLine: fenceStartLine,
+          });
+        } else if (fenceLang === 'markdown' || fenceLang === 'md') {
+          // Recursively extract inner executable code blocks from nested markdown examples
+          const nested = extractFencedCodeBlocksDetailed(buffer.join('\n'), options);
+          blocks.push(...nested.blocks);
+          malformedUnclosedCount += nested.malformedUnclosedCount;
+        }
+        inFence = false;
+        fenceChar = '';
+        fenceLength = 0;
+        fenceLang = '';
+        buffer = [];
+      } else {
+        buffer.push(line);
+      }
+    }
   }
-  return blocks;
+
+  if (inFence) {
+    malformedUnclosedCount += 1;
+    if (options.includeMalformedUnclosed && allowedLanguages.has(fenceLang)) {
+      blocks.push({
+        language: fenceLang,
+        code: buffer.join('\n'),
+        fenceLength,
+        startLine: fenceStartLine,
+      });
+    }
+  }
+
+  return { blocks, malformedUnclosedCount };
+}
+
+export function extractFencedCodeBlocks(markdown: string): string[] {
+  return extractFencedCodeBlocksDetailed(markdown).blocks.map((b) => b.code);
+}
+
+const CANONICAL_EVIDENCE_ID_REGEX = /^(?:TEST-\d{2,3}|DEVIL-\d{2,3}|VERIFY-\d{2})$/;
+
+export function validateEvidenceIdentifiers(ids: Iterable<string>): {
+  validIds: string[];
+  invalidIds: string[];
+  duplicateIds: string[];
+} {
+  const validIds: string[] = [];
+  const invalidIds: string[] = [];
+  const duplicateIds: string[] = [];
+  const seenValid = new Set<string>();
+  for (const rawId of ids) {
+    if (typeof rawId === 'string' && CANONICAL_EVIDENCE_ID_REGEX.test(rawId.trim())) {
+      const normalized = rawId.trim();
+      if (seenValid.has(normalized)) {
+        duplicateIds.push(normalized);
+      } else {
+        seenValid.add(normalized);
+        validIds.push(normalized);
+      }
+    } else {
+      invalidIds.push(String(rawId));
+    }
+  }
+  return { validIds, invalidIds, duplicateIds };
 }
 
 export function parseMarkdownSecurityChecklist(
@@ -95,17 +218,27 @@ export function parseMarkdownSecurityChecklist(
 ): {
   items: SecurityChecklistItem[];
   antiPatternViolations: Array<{ fileName: string; ruleId: string; description: string }>;
+  malformedFenceFiles: Array<{ fileName: string; malformedUnclosedCount: number }>;
 } {
   const items: SecurityChecklistItem[] = [];
   const antiPatternViolations: Array<{ fileName: string; ruleId: string; description: string }> = [];
+  const malformedFenceFiles: Array<{ fileName: string; malformedUnclosedCount: number }> = [];
   const passingTests = options.executedPassingTestIds ?? new Set<string>();
   const acceptedRisks = options.acceptedRiskIds ?? new Set<string>();
 
   for (const file of files) {
     const fileViolations: string[] = [];
+    const extracted = extractFencedCodeBlocksDetailed(file.content);
+    if (extracted.malformedUnclosedCount > 0) {
+      malformedFenceFiles.push({
+        fileName: file.fileName,
+        malformedUnclosedCount: extracted.malformedUnclosedCount,
+      });
+    }
+
     // Skip scanning Module 15's own detector definition block
     if (!file.fileName.startsWith('15-')) {
-      const codeBlocks = extractFencedCodeBlocks(file.content).join('\n');
+      const codeBlocks = extracted.blocks.map((b) => b.code).join('\n');
       for (const rule of FORBIDDEN_CODE_BLOCK_ANTI_PATTERNS) {
         if (rule.regex.test(codeBlocks)) {
           fileViolations.push(rule.id);
@@ -118,16 +251,13 @@ export function parseMarkdownSecurityChecklist(
       }
     }
 
-    const fileReferencedIds = Array.from(
-      new Set(
-        (file.content.match(/\b(?:TEST-\d{2,3}|DEVIL-\d{2})\b/g) ?? [])
-      )
-    );
-
     const lines = file.content.split(/\r?\n/);
     let currentSection = 'Root';
     let sectionHasCodeBlock = false;
     let sectionLines: string[] = [];
+    let inSectionFence = false;
+    let sectionFenceChar = '';
+    let sectionFenceLen = 0;
 
     const flushSection = (sectionTitle: string, bodyLines: string[], hasCode: boolean) => {
       const joined = bodyLines.join('\n');
@@ -144,24 +274,25 @@ export function parseMarkdownSecurityChecklist(
         : 'MEDIUM';
 
       const itemId = `${file.fileName}::${sectionTitle.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
-      const sectionTestMatches = Array.from(
-        new Set(
-          ((sectionTitle + '\n' + joined).match(/\b(?:TEST-\d{2,3}|DEVIL-\d{2})\b/g) ?? fileReferencedIds)
-        )
-      );
+      const rawMatches = (sectionTitle + '\n' + joined).match(
+        /\b(?:TEST-\d{2,3}|DEVIL-\d{2,3}|VERIFY-\d{2})\b/g
+      ) ?? [];
+      const { validIds: sectionTestMatches } = validateEvidenceIdentifiers(new Set(rawMatches));
+
       const matchedPassingTests = sectionTestMatches.filter((tid) => passingTests.has(tid));
       if (passingTests.has(itemId)) {
         matchedPassingTests.push(itemId);
       }
 
-      const hasImplementation = hasCode || /\x60{3}(?:typescript|sql|javascript)/.test(file.content);
+      const hasImplementation = hasCode || extracted.blocks.length > 0;
 
       // DEVIL-22 Fix: Never hardcode 'VERIFIED_REMEDIATED'!
-      // Status is 'DETECTED' if anti-patterns exist, 'ACCEPTED_RISK' if explicitly accepted,
+      // Status is 'DETECTED' if anti-patterns or malformed unclosed fences exist,
+      // 'ACCEPTED_RISK' if explicitly accepted,
       // 'VERIFIED_FIXED' ONLY if backed by executable passing test evidence and code implementation,
       // and 'UNVERIFIED' otherwise.
       let status: SecurityControlVerificationStatus;
-      if (fileViolations.length > 0) {
+      if (fileViolations.length > 0 || extracted.malformedUnclosedCount > 0) {
         status = 'DETECTED';
       } else if (acceptedRisks.has(itemId)) {
         status = 'ACCEPTED_RISK';
@@ -184,26 +315,55 @@ export function parseMarkdownSecurityChecklist(
     };
 
     for (const line of lines) {
-      const headingMatch = /^#{2,3}\s+(.+)$/.exec(line.trim());
-      if (headingMatch) {
-        if (sectionLines.length > 0) {
-          flushSection(currentSection, sectionLines, sectionHasCodeBlock);
-        }
-        currentSection = headingMatch[1].trim();
-        sectionLines = [];
-        sectionHasCodeBlock = false;
-      } else {
-        if (/^\x60{3}/.test(line.trim())) {
+      const fenceOpenOrClose = /^\s*(\x60{3,}|~{3,})/.exec(line);
+      if (fenceOpenOrClose) {
+        const ch = fenceOpenOrClose[1][0];
+        const len = fenceOpenOrClose[1].length;
+        if (!inSectionFence) {
+          inSectionFence = true;
+          sectionFenceChar = ch;
+          sectionFenceLen = len;
           sectionHasCodeBlock = true;
+        } else if (ch === sectionFenceChar && len >= sectionFenceLen && /^\s*(\x60{3,}|~{3,})\s*$/.test(line)) {
+          inSectionFence = false;
+          sectionFenceChar = '';
+          sectionFenceLen = 0;
         }
         sectionLines.push(line);
+        continue;
       }
+
+      if (!inSectionFence) {
+        const headingMatch = /^#{2,3}\s+(.+)$/.exec(line.trim());
+        if (headingMatch) {
+          if (sectionLines.length > 0) {
+            flushSection(currentSection, sectionLines, sectionHasCodeBlock);
+          }
+          currentSection = headingMatch[1].trim();
+          sectionLines = [];
+          sectionHasCodeBlock = false;
+          continue;
+        }
+      }
+
+      sectionLines.push(line);
     }
     if (sectionLines.length > 0) {
       flushSection(currentSection, sectionLines, sectionHasCodeBlock);
     }
   }
 
-  return { items, antiPatternViolations };
+  return { items, antiPatternViolations, malformedFenceFiles };
 }
 ```
+
+---
+
+## 3. Scanner Limitations: False-Positive & False-Negative Boundaries
+
+1. **Why Static Markdown & Regex Scanning Cannot Certify Runtime Security (False Negatives)**:
+   - `parseMarkdownSecurityChecklist` and `FORBIDDEN_CODE_BLOCK_ANTI_PATTERNS` inspect static AST/regex patterns inside fenced code blocks. They **cannot** detect semantic logic bugs, missing transaction boundaries across separate function calls, race conditions, or live PostgreSQL RLS misconfigurations unless paired with executable runtime tests (`executedPassingTestIds`).
+   - Consequently, `parseMarkdownSecurityChecklist` **never** emits `'VERIFIED_FIXED'` from static parsing alone: any control without matching `executedPassingTestIds` remains `'UNVERIFIED'`.
+2. **False-Positive Considerations**:
+   - Documentation blocks that intentionally illustrate vulnerable code inside a ` ```typescript ` fence will trigger `FORBIDDEN_CODE_BLOCK_ANTI_PATTERNS` (`status: 'DETECTED'`). Counter-examples in specification files should be described in prose or Threat Model tables rather than executable code fences so that all fenced code blocks remain production-safe and compilable.
+

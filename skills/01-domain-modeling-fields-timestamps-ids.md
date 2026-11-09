@@ -72,7 +72,7 @@ export const FieldSchemas = {
     .trim()
     .min(3)
     .max(254)
-    .transform((v) => v.normalize('NFKC').toLowerCase())
+    .transform((v: string) => v.normalize('NFKC').toLowerCase())
     .pipe(z.string().email()),
 
   e164Phone: z
@@ -84,21 +84,21 @@ export const FieldSchemas = {
     .string()
     .trim()
     .toUpperCase()
-    .refine((code) => /^[A-Z]{3}$/.test(code) && CURRENCY_EXPONENTS_MAP.has(code), {
+    .refine((code: string) => /^[A-Z]{3}$/.test(code) && CURRENCY_EXPONENTS_MAP.has(code), {
       message: 'Unsupported or invalid ISO-4217 currency code',
     }),
 
   nonNegativeMoneyMinor: z
     .union([z.number().int().nonnegative().safe(), z.string().regex(/^\d{1,19}$/)])
-    .transform((v) => BigInt(v))
-    .refine((val) => val >= 0n && val <= PG_BIGINT_SAFE_INPUT_MAX, {
+    .transform((v: number | string) => BigInt(v))
+    .refine((val: bigint) => val >= 0n && val <= PG_BIGINT_SAFE_INPUT_MAX, {
       message: 'Monetary amount exceeds safe PostgreSQL BIGINT bounds',
     }),
 
   signedMoneyMinor: z
     .union([z.number().int().safe(), z.string().regex(/^-?\d{1,19}$/)])
-    .transform((v) => BigInt(v))
-    .refine((val) => val >= -PG_BIGINT_SAFE_INPUT_MAX && val <= PG_BIGINT_SAFE_INPUT_MAX, {
+    .transform((v: number | string) => BigInt(v))
+    .refine((val: bigint) => val >= -PG_BIGINT_SAFE_INPUT_MAX && val <= PG_BIGINT_SAFE_INPUT_MAX, {
       message: 'Signed monetary amount exceeds safe PostgreSQL BIGINT bounds',
     }),
 
@@ -115,7 +115,7 @@ export const FieldSchemas = {
   isoTimestampNormalizedToUtc: z
     .string()
     .datetime({ offset: true })
-    .transform((v) => {
+    .transform((v: string) => {
       const parsed = new Date(v);
       if (Number.isNaN(parsed.getTime())) {
         throw new Error('Invalid ISO timestamp');
@@ -441,6 +441,21 @@ export function calculatePartialRefundCreditNote(
 ): CreditNoteLine {
   if (requestedQuantityToRefund <= 0n) {
     throw new Error('Refund quantity must be positive');
+  }
+  if (
+    lineState.capturedQuantity <= 0n ||
+    lineState.alreadyRefundedQuantity < 0n ||
+    lineState.alreadyRefundedQuantity > lineState.capturedQuantity ||
+    lineState.capturedNetMinor < 0n ||
+    lineState.alreadyRefundedNetMinor < 0n ||
+    lineState.alreadyRefundedNetMinor > lineState.capturedNetMinor ||
+    lineState.capturedTaxMinor < 0n ||
+    lineState.alreadyRefundedTaxMinor < 0n ||
+    lineState.alreadyRefundedTaxMinor > lineState.capturedTaxMinor
+  ) {
+    throw new Error(
+      `INVALID_LINE_REFUND_STATE: Line ${lineState.lineId} has negative or over-refunded baseline quantities/amounts`
+    );
   }
   const remainingQty = lineState.capturedQuantity - lineState.alreadyRefundedQuantity;
   if (requestedQuantityToRefund > remainingQty) {
@@ -899,12 +914,19 @@ export function computeJournalRequestHash(params: {
   idempotencyKey: string;
   postings: readonly JournalPostingLine[];
 }): string {
-  const canonicalLines = params.postings.map(
-    (p) => `${p.accountId}:${p.direction}:${p.amountMinor.toString()}:${p.currencyCode}`
-  );
+  const canonicalPayload = JSON.stringify({
+    tenantId: params.tenantId,
+    idempotencyKey: params.idempotencyKey,
+    postings: params.postings.map((p) => ({
+      accountId: p.accountId,
+      direction: p.direction,
+      amountMinor: p.amountMinor.toString(),
+      currencyCode: p.currencyCode,
+    })),
+  });
   return crypto
     .createHash('sha256')
-    .update(`${params.tenantId}|${params.idempotencyKey}|${canonicalLines.join(';')}`, 'utf8')
+    .update(canonicalPayload, 'utf8')
     .digest('hex');
 }
 
@@ -1042,6 +1064,55 @@ export async function persistBalancedJournalAtomically(params: {
 TypeScript validation alone does not protect the database if a bug or raw SQL query attempts to `UPDATE`/`DELETE` ledger rows or insert an unbalanced journal. Enforce append-only immutability, least-privilege grants, and deferred transaction-commit balance verification inside PostgreSQL:
 
 ```sql
+SET lock_timeout = '3s';
+SET statement_timeout = '10s';
+
+-- 0. Idempotent Role & Ledger Base Schema (Installs cleanly on an empty PostgreSQL 16 database)
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_runtime') THEN
+    CREATE ROLE app_runtime NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+  END IF;
+END
+$$;
+
+CREATE TABLE IF NOT EXISTS public.ledger_accounts (
+  account_id UUID PRIMARY KEY,
+  tenant_id UUID NOT NULL,
+  currency_code CHAR(3) NOT NULL,
+  status VARCHAR(16) NOT NULL CHECK (status IN ('ACTIVE', 'FROZEN', 'CLOSED')),
+  normal_balance VARCHAR(6) NOT NULL CHECK (normal_balance IN ('DEBIT', 'CREDIT')),
+  balance_minor BIGINT NOT NULL DEFAULT 0,
+  version INT NOT NULL DEFAULT 0 CHECK (version >= 0),
+  allow_negative_balance BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  CONSTRAINT chk_ledger_non_negative_balance CHECK (allow_negative_balance OR balance_minor >= 0)
+);
+
+CREATE TABLE IF NOT EXISTS public.journal_entries (
+  journal_id UUID PRIMARY KEY,
+  tenant_id UUID NOT NULL,
+  idempotency_key VARCHAR(128) NOT NULL,
+  request_hash CHAR(64) NOT NULL,
+  currency_code CHAR(3) NOT NULL,
+  total_debit_minor BIGINT NOT NULL CHECK (total_debit_minor > 0),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  UNIQUE (tenant_id, idempotency_key),
+  UNIQUE (tenant_id, journal_id)
+);
+
+CREATE TABLE IF NOT EXISTS public.journal_postings (
+  posting_id BIGSERIAL PRIMARY KEY,
+  journal_id UUID NOT NULL,
+  tenant_id UUID NOT NULL,
+  account_id UUID NOT NULL REFERENCES public.ledger_accounts (account_id),
+  direction VARCHAR(6) NOT NULL CHECK (direction IN ('DEBIT', 'CREDIT')),
+  amount_minor BIGINT NOT NULL CHECK (amount_minor > 0),
+  currency_code CHAR(3) NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  FOREIGN KEY (tenant_id, journal_id) REFERENCES public.journal_entries (tenant_id, journal_id)
+);
+
 -- 1. Least-Privilege Grants: app_runtime can only SELECT and INSERT on ledger tables (never UPDATE, DELETE, or TRUNCATE)
 REVOKE ALL ON public.journal_entries, public.journal_postings FROM PUBLIC, app_runtime;
 GRANT SELECT, INSERT ON public.journal_entries, public.journal_postings TO app_runtime;

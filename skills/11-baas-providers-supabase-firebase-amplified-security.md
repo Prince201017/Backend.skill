@@ -253,6 +253,76 @@ export function evaluateFirestoreProjectRule(params: {
 ## 4. Supabase RLS Policy Standard: Tables, Immutability Triggers, Realtime Channels & Storage (`DEVIL-15` Remediated)
 
 ```sql
+SET lock_timeout = '3s';
+SET statement_timeout = '10s';
+
+-- 0. Idempotent Prerequisite Roles, Schemas & Base Tables for Clean Database Installation
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+    CREATE ROLE anon NOLOGIN;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+    CREATE ROLE authenticated NOLOGIN;
+  END IF;
+END
+$$;
+
+CREATE SCHEMA IF NOT EXISTS auth;
+CREATE OR REPLACE FUNCTION auth.uid() RETURNS UUID LANGUAGE sql STABLE AS $$
+  SELECT NULLIF(current_setting('request.jwt.claim.sub', true), '')::uuid;
+$$;
+
+CREATE SCHEMA IF NOT EXISTS realtime;
+CREATE OR REPLACE FUNCTION realtime.topic() RETURNS TEXT LANGUAGE sql STABLE AS $$
+  SELECT COALESCE(current_setting('realtime.topic', true), '');
+$$;
+CREATE TABLE IF NOT EXISTS realtime.messages (
+  id UUID PRIMARY KEY,
+  topic TEXT NOT NULL,
+  extension TEXT NOT NULL,
+  payload JSONB NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE SCHEMA IF NOT EXISTS storage;
+CREATE TABLE IF NOT EXISTS storage.objects (
+  id UUID PRIMARY KEY,
+  bucket_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  owner UUID NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE TABLE IF NOT EXISTS public.tenant_members (
+  tenant_id UUID NOT NULL,
+  user_id UUID NOT NULL,
+  role VARCHAR(32) NOT NULL CHECK (role IN ('ADMIN', 'EDITOR', 'VIEWER')),
+  status VARCHAR(16) NOT NULL CHECK (status IN ('ACTIVE', 'SUSPENDED', 'REVOKED')),
+  PRIMARY KEY (tenant_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS public.projects (
+  id UUID PRIMARY KEY,
+  tenant_id UUID NOT NULL,
+  owner_id UUID NOT NULL,
+  name VARCHAR(120) NOT NULL,
+  status VARCHAR(16) NOT NULL CHECK (status IN ('DRAFT', 'ACTIVE', 'COMPLETED')),
+  budget_cents BIGINT NOT NULL CHECK (budget_cents >= 0 AND budget_cents <= 1000000000),
+  description VARCHAR(2000) NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE TABLE IF NOT EXISTS public.uploads (
+  upload_id UUID PRIMARY KEY,
+  tenant_id UUID NOT NULL,
+  owner_user_id UUID NOT NULL,
+  safe_storage_key TEXT NOT NULL UNIQUE,
+  status VARCHAR(32) NOT NULL CHECK (status IN ('QUARANTINED', 'SCANNING', 'APPROVED', 'REJECTED')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+
 -- 1. Authoritative Supabase RLS Policies & Immutability Trigger on public.projects (DEVIL-15 Remediation)
 ALTER TABLE public.projects ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.projects FORCE ROW LEVEL SECURITY;

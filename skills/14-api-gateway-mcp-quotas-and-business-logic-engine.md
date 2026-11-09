@@ -448,7 +448,9 @@ export function auditOpenApiSecurityAlternatives(spec: OpenApiSpecDocument): str
     if (!def) return false;
 
     if (def.type === 'openIdConnect') {
-      if (def.openIdConnectUrl && !def.openIdConnectUrl.startsWith('https://')) return false;
+      if (typeof def.openIdConnectUrl !== 'string' || !def.openIdConnectUrl.startsWith('https://')) {
+        return false;
+      }
       return true;
     }
 
@@ -467,13 +469,10 @@ export function auditOpenApiSecurityAlternatives(spec: OpenApiSpecDocument): str
       def.tokenIntrospectionUrl.startsWith('https://');
 
     if (def.type === 'http' && def.scheme?.toLowerCase() === 'bearer') {
-      // DEVIL-20 Fix: Do not blindly treat bare `{ type: 'http', scheme: 'bearer' }` or opaque tokens as verified JWTs
-      // unless bearerFormat === 'JWT' with issuer/audiences OR explicit HTTPS tokenIntrospectionUrl is configured.
-      if (def.bearerFormat !== undefined || def.issuer !== undefined || def.tokenIntrospectionUrl !== undefined) {
-        return hasExplicitAsymmetricJwt || hasExplicitOpaqueIntrospection;
-      }
-      // Backward-compatible check when scheme has no extended metadata only if bearerFormat is not explicitly non-JWT
-      return true;
+      // DEVIL-20 & DEVIL-63 Fix: Never treat bare `{ type: 'http', scheme: 'bearer' }` or opaque tokens as verified JWTs!
+      // Every HTTP bearer scheme MUST declare asymmetric JWT metadata (bearerFormat: 'JWT', issuer, audiences)
+      // OR an explicit HTTPS RFC 7662 tokenIntrospectionUrl.
+      return hasExplicitAsymmetricJwt || hasExplicitOpaqueIntrospection;
     }
 
     if (def.type === 'oauth2') {
@@ -620,7 +619,16 @@ export function computeMcpUserConfirmationToken(params: {
   const canonicalArgs = canonicalizeMcpArgValue(params.args);
   const noncePart = params.confirmationNonce ?? '';
   const expPart = params.confirmationExpiresAtMs !== undefined ? String(params.confirmationExpiresAtMs) : '';
-  const canonical = `${params.userId}|${params.tenantId}|${params.toolName}|${noncePart}|${expPart}|${canonicalArgs}`;
+  // DEVIL-63 Remediation: Use canonical JSON tuple serialization instead of raw '|' concatenation
+  // so delimiter injection in userId, tenantId, toolName, or nonce can never collide across fields.
+  const canonical = JSON.stringify([
+    params.userId,
+    params.tenantId,
+    params.toolName,
+    noncePart,
+    expPart,
+    canonicalArgs,
+  ]);
   return createHmac('sha256', params.confirmationSecret).update(canonical, 'utf8').digest('hex');
 }
 

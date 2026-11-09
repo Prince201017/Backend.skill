@@ -853,8 +853,31 @@ export function extractVerifiedApiGatewayUserInfo(params: {
   }
 
   const nowSec = Math.floor((params.nowMs ?? Date.now()) / 1000);
-  if (typeof endUserClaims.exp !== 'number' || nowSec >= endUserClaims.exp + 15) {
-    throw new Error('GATEWAY_USERINFO_REJECTED: End-user JWT in X-Apigateway-Api-Userinfo has expired');
+  const clockSkewSec = 15;
+  const maxEndUserLifetimeSec = 86_400;
+
+  if (typeof endUserClaims.exp !== 'number' || !Number.isFinite(endUserClaims.exp) || nowSec >= endUserClaims.exp + clockSkewSec) {
+    throw new Error('GATEWAY_USERINFO_REJECTED: End-user JWT in X-Apigateway-Api-Userinfo has expired or has invalid exp');
+  }
+  if (
+    typeof endUserClaims.iat !== 'number' ||
+    !Number.isFinite(endUserClaims.iat) ||
+    endUserClaims.iat > nowSec + clockSkewSec ||
+    endUserClaims.exp < endUserClaims.iat ||
+    endUserClaims.exp - endUserClaims.iat > maxEndUserLifetimeSec
+  ) {
+    throw new Error('GATEWAY_USERINFO_REJECTED: End-user JWT in X-Apigateway-Api-Userinfo has future/invalid iat or excessive lifetime');
+  }
+  const maybeNbf = (endUserClaims as unknown as { nbf?: unknown }).nbf;
+  if (maybeNbf !== undefined) {
+    if (typeof maybeNbf !== 'number' || !Number.isFinite(maybeNbf) || nowSec + clockSkewSec < maybeNbf) {
+      throw new Error('GATEWAY_USERINFO_REJECTED: End-user JWT in X-Apigateway-Api-Userinfo is not yet valid (nbf)');
+    }
+  }
+  if (endUserClaims.tenantId !== undefined) {
+    if (typeof endUserClaims.tenantId !== 'string' || !/^[a-zA-Z0-9_-]{1,64}$/.test(endUserClaims.tenantId)) {
+      throw new Error('GATEWAY_USERINFO_REJECTED: Invalid or empty tenantId in userinfo claims');
+    }
   }
 
   return {

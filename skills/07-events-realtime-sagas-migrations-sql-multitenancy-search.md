@@ -300,19 +300,30 @@ export async function runOrResumeDurableSaga<TContext>(params: {
       await params.store.recordStepStatus(params.sagaId, i, step.stepName, 'FORWARD_STARTED', fencingToken);
       const timeoutMs = step.stepTimeoutMs ?? 10_000;
       const controller = new AbortController();
-      const timer = setTimeout(
-        () => controller.abort(new SagaAmbiguousStepTimeoutError(`Step ${step.stepName} timed out`)),
-        timeoutMs
-      );
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          const timeoutErr = new SagaAmbiguousStepTimeoutError(`Step ${step.stepName} timed out`);
+          controller.abort(timeoutErr);
+          reject(timeoutErr);
+        }, timeoutMs);
+      });
 
       try {
-        await step.executeForward(lease.context, forwardIdempotencyKey, controller.signal);
-        clearTimeout(timer);
+        await Promise.race([
+          step.executeForward(lease.context, forwardIdempotencyKey, controller.signal),
+          timeoutPromise,
+        ]);
+        if (timer) clearTimeout(timer);
         await params.store.recordStepStatus(params.sagaId, i, step.stepName, 'FORWARD_COMPLETED', fencingToken);
         stepMap.set(i, { stepIndex: i, stepName: step.stepName, status: 'FORWARD_COMPLETED' });
       } catch (err) {
-        clearTimeout(timer);
-        if (err instanceof SagaAmbiguousStepTimeoutError || (err instanceof Error && 'isAmbiguousTimeout' in err)) {
+        if (timer) clearTimeout(timer);
+        const isTimeoutAbort =
+          controller.signal.aborted ||
+          err instanceof SagaAmbiguousStepTimeoutError ||
+          (err instanceof Error && ('isAmbiguousTimeout' in err || err.name === 'AbortError'));
+        if (isTimeoutAbort) {
           // Ambiguous pivot timeout: halt and mark for reconciliation rather than blind compensation/retry
           await params.store.recordStepStatus(
             params.sagaId,
@@ -411,9 +422,26 @@ export async function runOrResumeDurableSaga<TContext>(params: {
    SET statement_timeout = '60s';
    ```
 3. **4-Phase Expand-and-Contract with Explicit Rollback Plans**:
-   - **Phase 1 (Expand)**: Add nullable column (`ALTER TABLE orders ADD COLUMN tax_jurisdiction VARCHAR(32) NULL;`) + `CREATE INDEX CONCURRENTLY`. *Rollback*: `DROP INDEX CONCURRENTLY` and `ALTER TABLE DROP COLUMN` (safe because no code writes to it yet).
-   - **Phase 2 (Dual-Write & Checkpointed Batch Backfill)**: Deploy app code that writes to both old and new columns. Run batched backfill (`UPDATE orders SET tax_jurisdiction = 'US' WHERE id > $lastCursor AND tax_jurisdiction IS NULL ORDER BY id ASC LIMIT 2000`). *Rollback*: Revert app deployment to read old column; dual-written data remains intact.
-   - **Phase 3 (Validate Constraint & Switch Reads)**: Add `NOT VALID` constraint (`ALTER TABLE orders ADD CONSTRAINT chk_tax_jur_not_null CHECK (tax_jurisdiction IS NOT NULL) NOT VALID; ALTER TABLE orders VALIDATE CONSTRAINT chk_tax_jur_not_null;`) and switch reads. *Rollback*: Revert app to read old column and drop constraint if needed.
+   - **Phase 1 (Expand)**: Add nullable column (`ALTER TABLE public.orders ADD COLUMN tax_jurisdiction VARCHAR(32) NULL;`) + `CREATE INDEX CONCURRENTLY`. *Rollback*: `DROP INDEX CONCURRENTLY` and `ALTER TABLE DROP COLUMN` (safe because no code writes to it yet).
+   - **Phase 2 (Dual-Write & Checkpointed Batch Backfill — `DEVIL-62` Remediated)**: Deploy app code that writes to both old and new columns. Because standard PostgreSQL forbids `ORDER BY` and `LIMIT` directly on an `UPDATE` statement, execute the checkpointed batch backfill using a CTE with `ORDER BY id ASC LIMIT 2000 FOR UPDATE SKIP LOCKED`:
+     ```sql
+     WITH batch AS (
+       SELECT id
+       FROM public.orders
+       WHERE id > $1
+         AND tax_jurisdiction IS NULL
+       ORDER BY id ASC
+       LIMIT 2000
+       FOR UPDATE SKIP LOCKED
+     )
+     UPDATE public.orders AS o
+     SET tax_jurisdiction = 'US'
+     FROM batch
+     WHERE o.id = batch.id
+     RETURNING o.id;
+     ```
+     *Rollback*: Revert app deployment to read old column; dual-written data remains intact.
+   - **Phase 3 (Validate Constraint & Switch Reads)**: Add `NOT VALID` constraint (`SET lock_timeout = '2s'; ALTER TABLE public.orders ADD CONSTRAINT chk_tax_jur_not_null CHECK (tax_jurisdiction IS NOT NULL) NOT VALID; SET statement_timeout = '30min'; ALTER TABLE public.orders VALIDATE CONSTRAINT chk_tax_jur_not_null;`) and switch reads. *Rollback*: Revert app to read old column and drop constraint if needed.
    - **Phase 4 (Contract)**: Remove dual-write from code, verify zero queries reference old column, and drop old column in the next release.
 
 ---
@@ -425,30 +453,116 @@ export async function runOrResumeDurableSaga<TContext>(params: {
    In PostgreSQL, any role can call `SELECT set_config('app.current_tenant_id', '<victim_uuid>', true)`. If an application query has a SQL injection flaw or an unvalidated helper sets `app.current_tenant_id` without a transaction-bound HMAC, an attacker can switch tenants mid-transaction.
 2. **Database-Side Cryptographic Verification (`security.verify_active_tenant_context` & `security.verify_active_user_context`)**:
    - A restricted schema `security` owned by `db_migrator` holds the HMAC verification key in a protected table (`security.guc_hmac_keys`) inaccessible to `app_runtime`.
-   - `security.verify_active_tenant_context(target_tenant_id uuid)` and `security.verify_active_user_context(target_user_id uuid)` are `SECURITY DEFINER` functions with `SET search_path = pg_catalog, public` that recompute `encode(hmac(target_id::text || ':' || txid_current()::text, secret_key, 'sha256'), 'hex')` and compare it to `current_setting('app.current_tenant_mac', true)` / `current_setting('app.current_user_mac', true)`.
+   - `security.verify_active_tenant_context(target_tenant_id uuid)` and `security.verify_active_user_context(target_user_id uuid)` are `SECURITY DEFINER` functions with `SET search_path = pg_catalog, public` that recompute `encode(extensions.hmac(target_id::text || ':' || txid_current()::text, secret_key, 'sha256'), 'hex')` and compare it in constant time (`security.constant_time_hex_equal_32`) to `current_setting('app.current_tenant_mac', true)` / `current_setting('app.current_user_mac', true)`.
    - Every RLS policy on `public.tenant_members` and tenant domain tables (`public.orders`, etc.) calls these verification functions so raw `set_config('app.current_tenant_id', ...)` without a matching `txid_current()`-bound HMAC is rejected fail-closed!
 
 ```sql
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
+SET lock_timeout = '3s';
+SET statement_timeout = '10s';
 
--- 1. Dedicated Migration Owner vs. Least-Privilege Runtime Role
-CREATE ROLE db_migrator NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
-CREATE ROLE app_runtime LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+CREATE SCHEMA IF NOT EXISTS extensions;
+CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA extensions;
+
+-- 1. Dedicated Migration Owner vs. Least-Privilege Runtime Role (Idempotent for Clean DB Install)
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'db_migrator') THEN
+    CREATE ROLE db_migrator NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_runtime') THEN
+    CREATE ROLE app_runtime LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+  END IF;
+END
+$$;
 
 REVOKE ALL ON SCHEMA public FROM PUBLIC;
 GRANT USAGE ON SCHEMA public TO app_runtime;
+
+-- 1b. Prerequisite Base Domain Tables & Tenant-Bounded Search Index
+CREATE TABLE IF NOT EXISTS public.tenants (
+    id UUID PRIMARY KEY,
+    name VARCHAR(120) NOT NULL,
+    status VARCHAR(16) NOT NULL CHECK (status IN ('ACTIVE', 'SUSPENDED', 'DELETED')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE TABLE IF NOT EXISTS public.tenant_members (
+    tenant_id UUID NOT NULL REFERENCES public.tenants (id) ON DELETE CASCADE,
+    user_id UUID NOT NULL,
+    role VARCHAR(32) NOT NULL CHECK (role IN ('OWNER', 'ADMIN', 'BILLING_ADMIN', 'MEMBER', 'READONLY')),
+    status VARCHAR(16) NOT NULL CHECK (status IN ('ACTIVE', 'SUSPENDED', 'REVOKED')),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (tenant_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS public.orders (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL REFERENCES public.tenants (id) ON DELETE RESTRICT,
+    customer_user_id UUID NOT NULL,
+    order_number VARCHAR(64) NOT NULL,
+    tax_jurisdiction VARCHAR(32) NOT NULL DEFAULT 'US',
+    total_minor BIGINT NOT NULL CHECK (total_minor >= 0),
+    currency_code CHAR(3) NOT NULL DEFAULT 'USD',
+    search_vector tsvector GENERATED ALWAYS AS (
+      to_tsvector('simple', coalesce(order_number, '') || ' ' || coalesce(tax_jurisdiction, ''))
+    ) STORED,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    UNIQUE (tenant_id, order_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_orders_tenant_created_at
+  ON public.orders (tenant_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_orders_tenant_search_gin
+  ON public.orders USING GIN (search_vector);
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.tenants, public.tenant_members, public.orders TO app_runtime;
 
 -- 2. Restricted Security Schema & Protected HMAC Key Table (Inaccessible to app_runtime)
 CREATE SCHEMA IF NOT EXISTS security AUTHORIZATION db_migrator;
 REVOKE ALL ON SCHEMA security FROM PUBLIC;
 GRANT USAGE ON SCHEMA security TO app_runtime;
 
-CREATE TABLE security.guc_hmac_keys (
+CREATE TABLE IF NOT EXISTS security.guc_hmac_keys (
     key_id INT PRIMARY KEY DEFAULT 1 CHECK (key_id = 1),
     hmac_secret TEXT NOT NULL CHECK (char_length(hmac_secret) >= 32)
 );
 REVOKE ALL ON TABLE security.guc_hmac_keys FROM PUBLIC;
 REVOKE ALL ON TABLE security.guc_hmac_keys FROM app_runtime;
+
+CREATE OR REPLACE FUNCTION security.constant_time_hex_equal_32(expected_hex TEXT, actual_hex TEXT)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+IMMUTABLE
+PARALLEL SAFE
+SET search_path = pg_catalog
+AS $$
+DECLARE
+  v_expected BYTEA;
+  v_actual BYTEA;
+  v_diff INT := 0;
+  v_i INT;
+BEGIN
+  IF expected_hex IS NULL OR actual_hex IS NULL THEN
+    RETURN FALSE;
+  END IF;
+  IF pg_catalog.char_length(expected_hex) <> 64 OR pg_catalog.char_length(actual_hex) <> 64 THEN
+    RETURN FALSE;
+  END IF;
+  IF expected_hex !~ '^[0-9a-fA-F]{64}$' OR actual_hex !~ '^[0-9a-fA-F]{64}$' THEN
+    RETURN FALSE;
+  END IF;
+  v_expected := pg_catalog.decode(expected_hex, 'hex');
+  v_actual := pg_catalog.decode(actual_hex, 'hex');
+  IF pg_catalog.octet_length(v_expected) <> 32 OR pg_catalog.octet_length(v_actual) <> 32 THEN
+    RETURN FALSE;
+  END IF;
+  FOR v_i IN 0..31 LOOP
+    v_diff := v_diff | (pg_catalog.get_byte(v_expected, v_i) # pg_catalog.get_byte(v_actual, v_i));
+  END LOOP;
+  RETURN v_diff = 0;
+END;
+$$;
 
 CREATE OR REPLACE FUNCTION security.verify_active_user_context(row_user_id UUID)
 RETURNS BOOLEAN
@@ -483,7 +597,10 @@ BEGIN
     ),
     'hex'
   );
-  RETURN v_user_mac = v_expected_mac;
+  RETURN security.constant_time_hex_equal_32(v_expected_mac, v_user_mac);
+EXCEPTION
+  WHEN OTHERS THEN
+    RETURN FALSE;
 END;
 $$;
 
@@ -520,10 +637,16 @@ BEGIN
     ),
     'hex'
   );
-  RETURN v_tenant_mac = v_expected_mac;
+  RETURN security.constant_time_hex_equal_32(v_expected_mac, v_tenant_mac);
+EXCEPTION
+  WHEN OTHERS THEN
+    RETURN FALSE;
 END;
 $$;
 
+REVOKE ALL ON FUNCTION security.constant_time_hex_equal_32(TEXT, TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION security.verify_active_user_context(UUID) FROM PUBLIC;
+REVOKE ALL ON FUNCTION security.verify_active_tenant_context(UUID) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION security.verify_active_user_context(UUID) TO app_runtime;
 GRANT EXECUTE ON FUNCTION security.verify_active_tenant_context(UUID) TO app_runtime;
 
