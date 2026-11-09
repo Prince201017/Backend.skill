@@ -38,6 +38,7 @@ CREATE TABLE outbox_events (
     aggregate_id UUID NOT NULL,
     event_type VARCHAR(128) NOT NULL,
     payload JSONB NOT NULL,
+    event_hmac CHAR(64) NOT NULL,
     traceparent VARCHAR(128) NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     leased_until TIMESTAMPTZ NULL,
@@ -55,6 +56,7 @@ CREATE TABLE inbox_processed_events (
     consumer_group VARCHAR(64) NOT NULL,
     event_id UUID NOT NULL,
     tenant_id UUID NOT NULL,
+    payload_sha256 CHAR(64) NOT NULL,
     processed_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     PRIMARY KEY (consumer_group, event_id)
 );
@@ -74,7 +76,7 @@ export interface OutboxRecord {
   event_type: string;
   payload: Record<string, unknown>;
   traceparent: string | null;
-  event_hmac?: string;
+  event_hmac: string; // Mandatory HMAC-SHA256 authenticity tag
 }
 
 export interface TransactionalDbClient {
@@ -91,11 +93,26 @@ export interface TransactionalDbPool {
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
+function canonicalizeOutboxPayload(val: unknown): string {
+  if (val === null || val === undefined) return 'null';
+  if (typeof val === 'bigint') return JSON.stringify(val.toString());
+  if (typeof val !== 'object') return JSON.stringify(val);
+  if (Array.isArray(val)) return `[${val.map((v) => canonicalizeOutboxPayload(v)).join(',')}]`;
+  const obj = val as Record<string, unknown>;
+  const keys = Object.keys(obj)
+    .filter((k) => k !== '__proto__' && k !== 'constructor' && k !== 'prototype')
+    .sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalizeOutboxPayload(obj[k])}`).join(',')}}`;
+}
+
 export function computeOutboxEventHmac(
   event: Pick<OutboxRecord, 'event_id' | 'tenant_id' | 'aggregate_type' | 'aggregate_id' | 'event_type' | 'payload'>,
   outboxHmacSecret: string
 ): string {
-  const canonical = `${event.event_id}|${event.tenant_id}|${event.aggregate_type}|${event.aggregate_id}|${event.event_type}|${JSON.stringify(event.payload)}`;
+  if (!outboxHmacSecret || outboxHmacSecret.length < 32) {
+    throw new Error('OUTBOX_CONFIG_ERROR: outboxHmacSecret must be at least 32 characters');
+  }
+  const canonical = `${event.event_id}|${event.tenant_id}|${event.aggregate_type}|${event.aggregate_id}|${event.event_type}|${canonicalizeOutboxPayload(event.payload)}`;
   return crypto.createHmac('sha256', outboxHmacSecret).update(canonical, 'utf8').digest('hex');
 }
 
@@ -132,7 +149,7 @@ export async function runCommittedOutboxRelayBatch(
        LIMIT $1
        FOR UPDATE SKIP LOCKED
      )
-     RETURNING event_id, tenant_id, aggregate_type, aggregate_id, event_type, payload, traceparent`,
+     RETURNING event_id, tenant_id, aggregate_type, aggregate_id, event_type, payload, event_hmac, traceparent`,
     [batchSize, maxRelayAttempts]
   );
 
@@ -147,7 +164,6 @@ export async function runCommittedOutboxRelayBatch(
       await brokerPublish(record);
       publishedIds.push(record.event_id);
     } catch (err) {
-      // Persist last_error on failed relay attempt so operators have diagnostic visibility on DLQ rows
       const errMsg = err instanceof Error ? err.message.slice(0, 500) : 'BROKER_PUBLISH_ERROR';
       await dbClient
         .query(`UPDATE outbox_events SET last_error = $2 WHERE event_id = $1`, [record.event_id, errMsg])
@@ -170,60 +186,84 @@ export async function runCommittedOutboxRelayBatch(
 }
 
 /**
- * Consumer Inbox Pattern with Strict Single-Connection Transaction Consistency
- * AND Broker Event Authenticity / Tenant-ID Verification (DEVIL-05 Remediation):
- * - Validates UUID syntax of event.tenant_id and event.event_id.
- * - Verifies optional event_hmac when outboxHmacSecret is provided (blocking forged broker messages from spoofing tenant_id).
- * - Verifies that the target tenant is ACTIVE before setting app.current_tenant_id.
+ * Consumer Inbox Pattern with Strict Single-Connection Transaction Consistency,
+ * Mandatory Broker Event HMAC Verification, and Mandatory Transaction-Bound Tenant GUC MAC (DEVIL-01 & DEVIL-12).
  */
 export async function consumeEventIdempotently(params: {
   pool: TransactionalDbPool;
   consumerGroup: string;
   event: OutboxRecord;
-  outboxHmacSecret?: string;
+  outboxHmacSecret: string; // Mandatory (>= 32 chars)
+  gucHmacSecret: string;    // Mandatory (>= 32 chars) for DB-verified app.current_tenant_mac
   applySideEffectInTx: (txClient: TransactionalDbClient) => Promise<void>;
 }): Promise<'PROCESSED' | 'DUPLICATE_SKIPPED'> {
+  if (!params.outboxHmacSecret || params.outboxHmacSecret.length < 32) {
+    throw new Error('INBOX_CONFIG_ERROR: outboxHmacSecret (>= 32 chars) is mandatory');
+  }
+  if (!params.gucHmacSecret || params.gucHmacSecret.length < 32) {
+    throw new Error('INBOX_CONFIG_ERROR: gucHmacSecret (>= 32 chars) is mandatory');
+  }
   if (!UUID_REGEX.test(params.event.tenant_id) || !UUID_REGEX.test(params.event.event_id)) {
     throw new Error('INBOX_EVENT_REJECTED: Invalid tenant_id or event_id UUID format');
   }
-
-  if (params.outboxHmacSecret) {
-    if (!params.event.event_hmac || !/^[0-9a-fA-F]{64}$/.test(params.event.event_hmac)) {
-      throw new Error('INBOX_EVENT_REJECTED: Missing or malformed event_hmac signature');
-    }
-    const expectedHmac = Buffer.from(
-      computeOutboxEventHmac(params.event, params.outboxHmacSecret),
-      'hex'
-    );
-    const actualHmac = Buffer.from(params.event.event_hmac, 'hex');
-    if (
-      expectedHmac.length !== actualHmac.length ||
-      !crypto.timingSafeEqual(expectedHmac, actualHmac)
-    ) {
-      throw new Error('INBOX_EVENT_REJECTED: Broker event HMAC signature mismatch (tenant spoofing blocked)');
-    }
+  if (!params.event.event_hmac || !/^[0-9a-fA-F]{64}$/.test(params.event.event_hmac)) {
+    throw new Error('INBOX_EVENT_REJECTED: Missing or malformed event_hmac signature');
   }
+
+  const expectedHmac = Buffer.from(
+    computeOutboxEventHmac(params.event, params.outboxHmacSecret),
+    'hex'
+  );
+  const actualHmac = Buffer.from(params.event.event_hmac, 'hex');
+  if (
+    expectedHmac.length !== actualHmac.length ||
+    !crypto.timingSafeEqual(expectedHmac, actualHmac)
+  ) {
+    throw new Error('INBOX_EVENT_REJECTED: Broker event HMAC signature mismatch (tenant spoofing blocked)');
+  }
+
+  const payloadSha256 = crypto
+    .createHash('sha256')
+    .update(canonicalizeOutboxPayload(params.event.payload), 'utf8')
+    .digest('hex');
 
   const txClient = await params.pool.connect();
   try {
     await txClient.query('BEGIN ISOLATION LEVEL READ COMMITTED');
 
-    const insertInbox = await txClient.query(
-      `INSERT INTO inbox_processed_events (consumer_group, event_id, tenant_id)
-       VALUES ($1, $2, $3)
-       ON CONFLICT (consumer_group, event_id) DO NOTHING`,
-      [params.consumerGroup, params.event.event_id, params.event.tenant_id]
+    const insertInbox = await txClient.query<{ payload_sha256: string }>(
+      `INSERT INTO inbox_processed_events (consumer_group, event_id, tenant_id, payload_sha256)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (consumer_group, event_id) DO NOTHING
+       RETURNING payload_sha256`,
+      [params.consumerGroup, params.event.event_id, params.event.tenant_id, payloadSha256]
     );
 
     if (insertInbox.rowCount === 0) {
+      const existingRes = await txClient.query<{ payload_sha256: string }>(
+        `SELECT payload_sha256 FROM inbox_processed_events WHERE consumer_group = $1 AND event_id = $2`,
+        [params.consumerGroup, params.event.event_id]
+      );
+      if (existingRes.rows[0] && existingRes.rows[0].payload_sha256 !== payloadSha256) {
+        throw new Error('INBOX_EVENT_TAMPERED: Duplicate event_id received with different payload hash');
+      }
       await txClient.query('COMMIT');
       return 'DUPLICATE_SKIPPED';
     }
 
-    // Establish transaction-local tenant context only after verifying event authenticity & deduplication
+    // Bind tenant context + transaction-local HMAC to current PostgreSQL txid_current()
+    const txidRes = await txClient.query<{ txid: string }>(`SELECT txid_current()::text AS txid`);
+    const txid = txidRes.rows[0]?.txid ?? '0';
+    const tenantMac = crypto
+      .createHmac('sha256', params.gucHmacSecret)
+      .update(`tenant|${txid}|${params.event.tenant_id}|system_inbox`, 'utf8')
+      .digest('hex');
+
+    await txClient.query(`SELECT set_config('app.current_user_id', 'system_inbox', true)`);
     await txClient.query(`SELECT set_config('app.current_tenant_id', $1, true)`, [
       params.event.tenant_id,
     ]);
+    await txClient.query(`SELECT set_config('app.current_tenant_mac', $1, true)`, [tenantMac]);
 
     // Execute business side effects on the EXACT SAME txClient connection!
     await params.applySideEffectInTx(txClient);

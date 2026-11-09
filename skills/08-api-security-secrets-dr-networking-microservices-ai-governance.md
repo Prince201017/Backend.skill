@@ -137,6 +137,19 @@ const defaultDnsResolver: DnsResolverFn = async (hostname) => {
   return res.map((r) => ({ address: r.address, family: r.family as 4 | 6 }));
 };
 
+export function isAmbiguousIpv4Hostname(hostname: string): boolean {
+  const clean = hostname.trim().toLowerCase();
+  if (net.isIP(clean) === 4) return false; // Standard canonical dotted-quad is unambiguous
+  // Reject integer/dword IPv4 (e.g. 2130706433), hex IPv4 (0x7f000001 or 0x7f.0.0.1),
+  // octal IPv4 (0177.0.0.1), or short-form 2/3-part IPv4 (127.1, 127.0.1)
+  if (/^(?:0x[0-9a-f]+|\d+)$/.test(clean)) return true;
+  const parts = clean.split('.');
+  if (parts.length >= 2 && parts.length <= 4 && parts.every((p) => /^(?:0x[0-9a-f]+|\d+)$/.test(p))) {
+    return true;
+  }
+  return false;
+}
+
 /**
  * Validates URL scheme, credentials, port, and resolves DNS once, verifying that EVERY
  * returned A/AAAA record is a public global unicast IP (defeating mixed public/private DNS responses).
@@ -155,6 +168,15 @@ export async function resolveAndPinSafeTarget(
   pinnedLookup: net.LookupFunction;
   httpsAgent: https.Agent;
 }> {
+  // Reject non-canonical raw authority/hostname tricks before or after WHATWG URL normalization
+  const rawHostMatch = /^https:\/\/([^/?#]+)/i.exec(rawUrl.trim());
+  if (rawHostMatch) {
+    const rawHostOnly = rawHostMatch[1].split(':')[0].replace(/^\[|\]$/g, '');
+    if (isAmbiguousIpv4Hostname(rawHostOnly)) {
+      throw new Error(`SSRF_BLOCKED: Ambiguous octal/hex/dword/short IPv4 hostname "${rawHostOnly}" is forbidden`);
+    }
+  }
+
   let parsedUrl: URL;
   try {
     parsedUrl = new URL(rawUrl);
@@ -177,6 +199,10 @@ export async function resolveAndPinSafeTarget(
 
   // Handle IP literal in hostname directly (e.g. https://127.0.0.1/ or https://[::1]/)
   const cleanHost = parsedUrl.hostname.replace(/^\[|\]$/g, '');
+  if (isAmbiguousIpv4Hostname(cleanHost)) {
+    throw new Error(`SSRF_BLOCKED: Ambiguous IPv4 hostname "${cleanHost}" is forbidden`);
+  }
+
   const literalVersion = net.isIP(cleanHost);
   let records: ReadonlyArray<{ address: string; family: 4 | 6 }>;
 
@@ -245,11 +271,8 @@ const SAFE_CROSS_ORIGIN_REDIRECT_HEADERS = new Set([
 
 /**
  * Transport-Matched, DNS-Pinned Safe HTTPS Fetcher with Hop-by-Hop Redirect Re-Validation,
- * Cross-Origin Redirect Header Stripping, Hard Timeouts, and Streaming Response-Size Cutoff.
- *
- * Why this uses `https.request` with `httpsAgent` instead of `globalThis.fetch(url, { agent })`:
- * Node's built-in `fetch()` uses Undici and silently ignores `https.Agent`! Using `https.request`
- * guarantees that `httpsAgent`'s `lookup` callback is invoked by `net.Socket` and `tls.connect`.
+ * Cross-Origin Redirect Header Stripping, Hard Total Wall-Clock Deadline (`DEVIL-17`),
+ * and Streaming Response-Size Cutoff.
  */
 export async function executePinnedSafeHttpsRequest(params: {
   url: string;
@@ -258,12 +281,15 @@ export async function executePinnedSafeHttpsRequest(params: {
   bodyBuffer?: Buffer;
   maxRedirects?: number;
   timeoutMs?: number;
+  totalDeadlineMs?: number;
   maxResponseBytes?: number;
   dnsResolver?: DnsResolverFn;
+  allowTestTransportOverride?: boolean;
   transportOverride?: (hop: {
     parsedUrl: URL;
     pinnedIp: string;
     headers: Record<string, string>;
+    signal: AbortSignal;
   }) => Promise<{ statusCode: number; headers: Record<string, string>; body: Buffer }>;
 }): Promise<{
   statusCode: number;
@@ -272,9 +298,19 @@ export async function executePinnedSafeHttpsRequest(params: {
   finalUrl: string;
   pinnedIpUsed: string;
 }> {
+  if (params.transportOverride) {
+    if (params.allowTestTransportOverride !== true || process.env.NODE_ENV === 'production') {
+      throw new Error(
+        'SSRF_TRANSPORT_OVERRIDE_FORBIDDEN: transportOverride requires allowTestTransportOverride === true and non-production runtime'
+      );
+    }
+  }
+
   const maxRedirects = params.maxRedirects ?? 3;
   const timeoutMs = params.timeoutMs ?? 5_000;
+  const totalDeadlineMs = params.totalDeadlineMs ?? timeoutMs;
   const maxResponseBytes = params.maxResponseBytes ?? 2 * 1024 * 1024; // 2MB max response
+  const startedAtMs = Date.now();
 
   // Never forward Authorization, Cookie, or internal gateway headers to untrusted external URLs,
   // and reject any header key/value containing CR, LF, or Null bytes (CRLF injection guard).
@@ -288,141 +324,185 @@ export async function executePinnedSafeHttpsRequest(params: {
     }
   }
 
-  const initialOrigin = new URL(params.url).origin;
+  let initialOrigin: string;
+  try {
+    initialOrigin = new URL(params.url).origin;
+  } catch {
+    throw new Error('SSRF_BLOCKED: Malformed URL');
+  }
   let currentUrl = params.url;
   let currentMethod = params.method ?? 'GET';
   let currentBody = params.bodyBuffer;
 
-  for (let redirectCount = 0; redirectCount <= maxRedirects; redirectCount++) {
-    // Re-validate and DNS-pin EVERY hop (initial request + each redirect Location target)
-    const pinned = await resolveAndPinSafeTarget(currentUrl, {
-      dnsResolver: params.dnsResolver,
-    });
+  const deadlineController = new AbortController();
+  const hardDeadlineTimer = setTimeout(() => {
+    deadlineController.abort(new Error(`SSRF_HARD_DEADLINE_EXCEEDED: Exceeded total deadline of ${totalDeadlineMs}ms`));
+  }, totalDeadlineMs);
 
-    // DEVIL-09 Guard: If a redirect crossed to a different origin, strip all custom/application headers!
-    if (pinned.parsedUrl.origin !== initialOrigin) {
-      const strippedHeaders: Record<string, string> = {};
-      for (const [hk, hv] of Object.entries(currentSafeHeaders)) {
-        if (SAFE_CROSS_ORIGIN_REDIRECT_HEADERS.has(hk.toLowerCase())) {
-          strippedHeaders[hk] = hv;
-        }
+  try {
+    for (let redirectCount = 0; redirectCount <= maxRedirects; redirectCount++) {
+      const elapsedMs = Date.now() - startedAtMs;
+      const remainingDeadlineMs = totalDeadlineMs - elapsedMs;
+      if (remainingDeadlineMs <= 0 || deadlineController.signal.aborted) {
+        throw new Error(`SSRF_HARD_DEADLINE_EXCEEDED: Exceeded total deadline of ${totalDeadlineMs}ms`);
       }
-      currentSafeHeaders = strippedHeaders;
-    }
 
-    const requestHeaders: Record<string, string> = {
-      ...currentSafeHeaders,
-      Host: pinned.parsedUrl.host,
-    };
+      // Re-validate and DNS-pin EVERY hop (initial request + each redirect Location target)
+      const pinned = await resolveAndPinSafeTarget(currentUrl, {
+        dnsResolver: params.dnsResolver,
+      });
 
-    const hopResponse = params.transportOverride
-      ? await params.transportOverride({
-          parsedUrl: pinned.parsedUrl,
-          pinnedIp: pinned.pinnedIp,
-          headers: requestHeaders,
-        })
-      : await new Promise<{ statusCode: number; headers: Record<string, string>; body: Buffer }>(
-          (resolve, reject) => {
-            const req = https.request(
-              {
-                protocol: 'https:',
-                hostname: pinned.parsedUrl.hostname,
-                port: pinned.parsedUrl.port || 443,
-                path: `${pinned.parsedUrl.pathname}${pinned.parsedUrl.search}`,
-                method: currentMethod,
-                headers: requestHeaders,
-                agent: pinned.httpsAgent,
-                servername: pinned.parsedUrl.hostname,
-                timeout: timeoutMs,
-              },
-              (res) => {
-                const chunks: Buffer[] = [];
-                let totalBytes = 0;
-
-                res.on('data', (chunk: Buffer) => {
-                  totalBytes += chunk.byteLength;
-                  if (totalBytes > maxResponseBytes) {
-                    req.destroy(
-                      new Error(`SSRF_RESPONSE_TOO_LARGE: Exceeded ${maxResponseBytes} bytes`)
-                    );
-                    return;
-                  }
-                  chunks.push(chunk);
-                });
-
-                res.on('end', () => {
-                  if (totalBytes > maxResponseBytes) return;
-                  const normHeaders: Record<string, string> = {};
-                  for (const [hk, hv] of Object.entries(res.headers)) {
-                    if (typeof hv === 'string') normHeaders[hk.toLowerCase()] = hv;
-                    else if (Array.isArray(hv)) normHeaders[hk.toLowerCase()] = hv.join(', ');
-                  }
-                  resolve({
-                    statusCode: res.statusCode ?? 500,
-                    headers: normHeaders,
-                    body: Buffer.concat(chunks),
-                  });
-                });
-
-                res.on('error', reject);
-              }
-            );
-
-            req.on('timeout', () => {
-              req.destroy(new Error('SSRF_REQUEST_TIMEOUT'));
-            });
-            req.on('error', reject);
-
-            if (currentBody && currentBody.byteLength > 0) {
-              req.write(currentBody);
-            }
-            req.end();
+      // DEVIL-09 Guard: If a redirect crossed to a different origin, strip all custom/application headers!
+      if (pinned.parsedUrl.origin !== initialOrigin) {
+        const strippedHeaders: Record<string, string> = {};
+        for (const [hk, hv] of Object.entries(currentSafeHeaders)) {
+          if (SAFE_CROSS_ORIGIN_REDIRECT_HEADERS.has(hk.toLowerCase())) {
+            strippedHeaders[hk] = hv;
           }
-        );
+        }
+        currentSafeHeaders = strippedHeaders;
+      }
 
-    if (hopResponse.body.byteLength > maxResponseBytes) {
-      throw new Error(`SSRF_RESPONSE_TOO_LARGE: Exceeded ${maxResponseBytes} bytes`);
+      const requestHeaders: Record<string, string> = {
+        ...currentSafeHeaders,
+        Host: pinned.parsedUrl.host,
+      };
+
+      const hopTimeoutMs = Math.min(timeoutMs, Math.max(1, totalDeadlineMs - (Date.now() - startedAtMs)));
+
+      const hopResponse = params.transportOverride
+        ? await Promise.race([
+            params.transportOverride({
+              parsedUrl: pinned.parsedUrl,
+              pinnedIp: pinned.pinnedIp,
+              headers: requestHeaders,
+              signal: deadlineController.signal,
+            }),
+            new Promise<never>((_, reject) => {
+              const onAbort = () =>
+                reject(
+                  deadlineController.signal.reason ??
+                    new Error(`SSRF_HARD_DEADLINE_EXCEEDED: Exceeded total deadline of ${totalDeadlineMs}ms`)
+                );
+              if (deadlineController.signal.aborted) {
+                onAbort();
+                return;
+              }
+              deadlineController.signal.addEventListener('abort', onAbort, { once: true });
+            }),
+          ])
+        : await new Promise<{ statusCode: number; headers: Record<string, string>; body: Buffer }>(
+            (resolve, reject) => {
+              const req = https.request(
+                {
+                  protocol: 'https:',
+                  hostname: pinned.parsedUrl.hostname,
+                  port: pinned.parsedUrl.port || 443,
+                  path: `${pinned.parsedUrl.pathname}${pinned.parsedUrl.search}`,
+                  method: currentMethod,
+                  headers: requestHeaders,
+                  agent: pinned.httpsAgent,
+                  servername: pinned.parsedUrl.hostname,
+                  timeout: hopTimeoutMs,
+                  signal: deadlineController.signal,
+                },
+                (res) => {
+                  const chunks: Buffer[] = [];
+                  let totalBytes = 0;
+
+                  res.on('data', (chunk: Buffer) => {
+                    if (Date.now() - startedAtMs > totalDeadlineMs) {
+                      req.destroy(
+                        new Error(`SSRF_HARD_DEADLINE_EXCEEDED: Exceeded total deadline of ${totalDeadlineMs}ms`)
+                      );
+                      return;
+                    }
+                    totalBytes += chunk.byteLength;
+                    if (totalBytes > maxResponseBytes) {
+                      req.destroy(
+                        new Error(`SSRF_RESPONSE_TOO_LARGE: Exceeded ${maxResponseBytes} bytes`)
+                      );
+                      return;
+                    }
+                    chunks.push(chunk);
+                  });
+
+                  res.on('end', () => {
+                    if (totalBytes > maxResponseBytes) return;
+                    const normHeaders: Record<string, string> = {};
+                    for (const [hk, hv] of Object.entries(res.headers)) {
+                      if (typeof hv === 'string') normHeaders[hk.toLowerCase()] = hv;
+                      else if (Array.isArray(hv)) normHeaders[hk.toLowerCase()] = hv.join(', ');
+                    }
+                    resolve({
+                      statusCode: res.statusCode ?? 500,
+                      headers: normHeaders,
+                      body: Buffer.concat(chunks),
+                    });
+                  });
+
+                  res.on('error', reject);
+                }
+              );
+
+              req.on('timeout', () => {
+                req.destroy(new Error('SSRF_REQUEST_TIMEOUT'));
+              });
+              req.on('error', reject);
+
+              if (currentBody && currentBody.byteLength > 0) {
+                req.write(currentBody);
+              }
+              req.end();
+            }
+          );
+
+      if (hopResponse.body.byteLength > maxResponseBytes) {
+        throw new Error(`SSRF_RESPONSE_TOO_LARGE: Exceeded ${maxResponseBytes} bytes`);
+      }
+
+      const status = hopResponse.statusCode;
+      if (status === 301 || status === 302 || status === 303 || status === 307 || status === 308) {
+        if (redirectCount >= maxRedirects) {
+          throw new Error(`SSRF_MAX_REDIRECTS_EXCEEDED: Exceeded ${maxRedirects} redirects`);
+        }
+        const locationHeader = hopResponse.headers['location'] ?? hopResponse.headers['Location'];
+        if (!locationHeader || /[\r\n\0]/.test(locationHeader)) {
+          throw new Error('SSRF_REDIRECT_ERROR: Redirect response missing or invalid Location header');
+        }
+        const nextParsed = new URL(locationHeader, pinned.parsedUrl);
+        const nextUrl = nextParsed.toString();
+        if (
+          nextParsed.origin !== initialOrigin &&
+          (status === 307 || status === 308) &&
+          currentBody &&
+          currentBody.byteLength > 0
+        ) {
+          throw new Error(
+            'SSRF_CROSS_ORIGIN_BODY_REDIRECT_BLOCKED: Refusing to forward request body across cross-origin 307/308 redirect'
+          );
+        }
+        currentUrl = nextUrl;
+        if (status === 301 || status === 302 || status === 303 || nextParsed.origin !== initialOrigin) {
+          currentMethod = 'GET';
+          currentBody = undefined;
+        }
+        continue;
+      }
+
+      return {
+        statusCode: hopResponse.statusCode,
+        headers: hopResponse.headers,
+        body: hopResponse.body,
+        finalUrl: pinned.parsedUrl.toString(),
+        pinnedIpUsed: pinned.pinnedIp,
+      };
     }
 
-    const status = hopResponse.statusCode;
-    if (status === 301 || status === 302 || status === 303 || status === 307 || status === 308) {
-      if (redirectCount >= maxRedirects) {
-        throw new Error(`SSRF_MAX_REDIRECTS_EXCEEDED: Exceeded ${maxRedirects} redirects`);
-      }
-      const locationHeader = hopResponse.headers['location'] ?? hopResponse.headers['Location'];
-      if (!locationHeader || /[\r\n\0]/.test(locationHeader)) {
-        throw new Error('SSRF_REDIRECT_ERROR: Redirect response missing or invalid Location header');
-      }
-      const nextParsed = new URL(locationHeader, pinned.parsedUrl);
-      const nextUrl = nextParsed.toString();
-      if (
-        nextParsed.origin !== initialOrigin &&
-        (status === 307 || status === 308) &&
-        currentBody &&
-        currentBody.byteLength > 0
-      ) {
-        throw new Error(
-          'SSRF_CROSS_ORIGIN_BODY_REDIRECT_BLOCKED: Refusing to forward request body across cross-origin 307/308 redirect'
-        );
-      }
-      currentUrl = nextUrl;
-      if (status === 301 || status === 302 || status === 303 || nextParsed.origin !== initialOrigin) {
-        currentMethod = 'GET';
-        currentBody = undefined;
-      }
-      continue;
-    }
-
-    return {
-      statusCode: hopResponse.statusCode,
-      headers: hopResponse.headers,
-      body: hopResponse.body,
-      finalUrl: pinned.parsedUrl.toString(),
-      pinnedIpUsed: pinned.pinnedIp,
-    };
+    throw new Error(`SSRF_MAX_REDIRECTS_EXCEEDED: Exceeded ${maxRedirects} redirects`);
+  } finally {
+    clearTimeout(hardDeadlineTimer);
   }
-
-  throw new Error(`SSRF_MAX_REDIRECTS_EXCEEDED: Exceeded ${maxRedirects} redirects`);
 }
 ```
 

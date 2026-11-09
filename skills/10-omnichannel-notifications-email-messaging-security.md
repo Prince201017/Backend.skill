@@ -46,6 +46,7 @@ export interface SmsBudgetReservationRecord {
   reservationId: string;
   tenantId: string;
   idempotencyKey: string;
+  providerIdempotencyKey: string;
   reservedCostCents: number;
   status: DeliveryLifecycleStatus;
   providerMessageSid?: string;
@@ -57,7 +58,10 @@ export interface SmsQuotaBudgetStore {
   reserveBudgetAtomically(params: {
     reservationId: string;
     tenantId: string;
+    recipientId: string;
+    classification: NotificationClassification;
     idempotencyKey: string;
+    providerIdempotencyKey: string;
     e164Phone: string;
     costCents: number;
     maxDailyBudgetCents: number;
@@ -68,7 +72,14 @@ export interface SmsQuotaBudgetStore {
   }): Promise<
     | { outcome: 'RESERVED'; reservation: SmsBudgetReservationRecord }
     | { outcome: 'IDEMPOTENT_REPLAY'; reservation: SmsBudgetReservationRecord }
-    | { outcome: 'REJECTED'; reason: 'DAILY_BUDGET_EXCEEDED' | 'PHONE_RATE_LIMIT' | 'SUBNET_RATE_LIMIT' }
+    | {
+        outcome: 'REJECTED';
+        reason:
+          | 'DAILY_BUDGET_EXCEEDED'
+          | 'PHONE_RATE_LIMIT'
+          | 'SUBNET_RATE_LIMIT'
+          | 'CONSENT_REVOKED_OR_OPTED_OUT';
+      }
   >;
   commitReservation(params: {
     reservationId: string;
@@ -85,6 +96,7 @@ export interface SmsQuotaBudgetStore {
     reservationId: string;
     tenantId: string;
     reason: string;
+    providerMessageSid?: string;
   }): Promise<void>;
 }
 
@@ -126,7 +138,7 @@ export function validateRecipientAndConsent(params: {
 
 ---
 
-## 3. Provider Failover Classification & Ambiguous Write Handling
+## 3. Provider Failover Classification & Ambiguous Write Handling (`DEVIL-18` Remediated)
 
 ```typescript
 // Executable TypeScript — Deterministic Provider Error Classification & Safe Dispatch
@@ -208,11 +220,16 @@ export async function dispatchSmsWithBudgetAndFailover(params: {
     allowedCountryPrefixes: params.allowedCountryPrefixes,
   });
 
-  // Phase 1: Atomic Budget & Rate-Limit Reservation
+  const providerIdempotencyKey = `${params.tenantId}:${params.reservationId}:${params.idempotencyKey}`;
+
+  // Phase 1: Atomic Budget, Consent & Rate-Limit Reservation
   const resResult = await params.store.reserveBudgetAtomically({
     reservationId: params.reservationId,
     tenantId: params.tenantId,
+    recipientId: params.recipientId,
+    classification: params.classification,
     idempotencyKey: params.idempotencyKey,
+    providerIdempotencyKey,
     e164Phone: params.e164Phone,
     costCents: params.costCents,
     maxDailyBudgetCents: params.maxDailyBudgetCents,
@@ -232,94 +249,155 @@ export async function dispatchSmsWithBudgetAndFailover(params: {
     };
   }
 
-  // Phase 2: Primary Provider Attempt
+  // DEVIL-18 Fix: Re-verify fresh recipient consent immediately before provider dispatch
+  // so an inbound STOP webhook processed concurrently with reservation cancels the send and releases budget!
   try {
-    const primaryRes = await params.primaryProvider.sendSms({
-      idempotencyKey: params.idempotencyKey,
+    const freshProfile = await params.store.getRecipientProfile(params.tenantId, params.recipientId);
+    validateRecipientAndConsent({
+      profile: freshProfile,
+      classification: params.classification,
+      e164Phone: params.e164Phone,
+      allowedCountryPrefixes: params.allowedCountryPrefixes,
+    });
+  } catch (consentErr) {
+    await params.store.releaseReservation({
+      reservationId: params.reservationId,
+      tenantId: params.tenantId,
+      reason: consentErr instanceof Error ? consentErr.message : 'CONSENT_REVOKED_PRE_SEND',
+    });
+    throw consentErr;
+  }
+
+  // Phase 2: Primary Provider Attempt (Isolated from Phase 3a DB commit!)
+  let primaryRes: { providerMessageSid: string } | null = null;
+  let primarySendErr: ProviderSendAttemptError | null = null;
+  try {
+    primaryRes = await params.primaryProvider.sendSms({
+      idempotencyKey: providerIdempotencyKey,
       to: params.e164Phone,
       body: params.body,
     });
-    // Phase 3a: Commit reservation as ACCEPTED_BY_PROVIDER (not DELIVERED; delivery requires webhook)
-    await params.store.commitReservation({
-      reservationId: params.reservationId,
-      tenantId: params.tenantId,
-      providerMessageSid: primaryRes.providerMessageSid,
-    });
-    return {
-      status: 'ACCEPTED_BY_PROVIDER',
-      providerMessageSid: primaryRes.providerMessageSid,
-      providerUsed: params.primaryProvider.providerName,
-    };
   } catch (rawErr) {
-    const providerErr = rawErr as ProviderSendAttemptError;
-    const category = classifyNotificationProviderFailure(providerErr);
+    primarySendErr = rawErr as ProviderSendAttemptError;
+  }
 
-    if (category === 'DETERMINISTIC_PRE_ACCEPTANCE_REJECTION') {
-      // Phase 3b: Release budget reservation immediately so rejected sends never permanently consume budget
-      await params.store.releaseReservation({
-        reservationId: params.reservationId,
-        tenantId: params.tenantId,
-        reason: providerErr.message,
-      });
-      throw new Error(`SMS_PROVIDER_REJECTED_PRE_ACCEPTANCE:${providerErr.message}`);
-    }
-
-    if (category === 'AMBIGUOUS_POST_WRITE') {
-      // Phase 3c: 502 / 504 / post-write 503 / ETIMEDOUT -> NEVER blindly failover and double-send!
-      await params.store.markReservationAmbiguous({
-        reservationId: params.reservationId,
-        tenantId: params.tenantId,
-        reason: providerErr.message,
-      });
-      return {
-        status: 'AMBIGUOUS_RECONCILIATION_REQUIRED',
-      };
-    }
-
-    // SAFE_PRE_SEND_FAILOVER: Try secondary provider if configured
-    if (!params.secondaryProvider) {
-      await params.store.releaseReservation({
-        reservationId: params.reservationId,
-        tenantId: params.tenantId,
-        reason: providerErr.message,
-      });
-      throw new Error(`SMS_PRE_SEND_FAILED_NO_SECONDARY:${providerErr.message}`);
-    }
-
+  // DEVIL-18 Fix: If primaryProvider.sendSms SUCCEEDED, NEVER enter provider failover if commitReservation throws!
+  if (primaryRes !== null) {
     try {
-      const secondaryRes = await params.secondaryProvider.sendSms({
-        idempotencyKey: params.idempotencyKey,
-        to: params.e164Phone,
-        body: params.body,
-      });
       await params.store.commitReservation({
         reservationId: params.reservationId,
         tenantId: params.tenantId,
-        providerMessageSid: secondaryRes.providerMessageSid,
+        providerMessageSid: primaryRes.providerMessageSid,
       });
       return {
         status: 'ACCEPTED_BY_PROVIDER',
-        providerMessageSid: secondaryRes.providerMessageSid,
-        providerUsed: params.secondaryProvider.providerName,
+        providerMessageSid: primaryRes.providerMessageSid,
+        providerUsed: params.primaryProvider.providerName,
       };
-    } catch (secRawErr) {
-      const secErr = secRawErr as ProviderSendAttemptError;
-      const secCategory = classifyNotificationProviderFailure(secErr);
-      if (secCategory === 'AMBIGUOUS_POST_WRITE') {
-        await params.store.markReservationAmbiguous({
+    } catch (commitErr) {
+      // Post-acceptance DB commit failure: record providerMessageSid in ambiguous state for reconciliation; NEVER re-send!
+      await params.store
+        .markReservationAmbiguous({
           reservationId: params.reservationId,
           tenantId: params.tenantId,
-          reason: secErr.message,
-        });
-        return { status: 'AMBIGUOUS_RECONCILIATION_REQUIRED' };
-      }
-      await params.store.releaseReservation({
+          reason: `POST_ACCEPTANCE_DB_COMMIT_FAILED:${commitErr instanceof Error ? commitErr.message : String(commitErr)}`,
+          providerMessageSid: primaryRes.providerMessageSid,
+        })
+        .catch(() => undefined);
+      return {
+        status: 'AMBIGUOUS_RECONCILIATION_REQUIRED',
+        providerMessageSid: primaryRes.providerMessageSid,
+        providerUsed: params.primaryProvider.providerName,
+      };
+    }
+  }
+
+  const providerErr = primarySendErr!;
+  const category = classifyNotificationProviderFailure(providerErr);
+
+  if (category === 'DETERMINISTIC_PRE_ACCEPTANCE_REJECTION') {
+    // Phase 3b: Release budget reservation immediately so rejected sends never permanently consume budget
+    await params.store.releaseReservation({
+      reservationId: params.reservationId,
+      tenantId: params.tenantId,
+      reason: providerErr.message,
+    });
+    throw new Error(`SMS_PROVIDER_REJECTED_PRE_ACCEPTANCE:${providerErr.message}`);
+  }
+
+  if (category === 'AMBIGUOUS_POST_WRITE') {
+    // Phase 3c: 502 / 504 / post-write 503 / ETIMEDOUT -> NEVER blindly failover and double-send!
+    await params.store.markReservationAmbiguous({
+      reservationId: params.reservationId,
+      tenantId: params.tenantId,
+      reason: providerErr.message,
+    });
+    return {
+      status: 'AMBIGUOUS_RECONCILIATION_REQUIRED',
+    };
+  }
+
+  // SAFE_PRE_SEND_FAILOVER: Try secondary provider if configured
+  if (!params.secondaryProvider) {
+    await params.store.releaseReservation({
+      reservationId: params.reservationId,
+      tenantId: params.tenantId,
+      reason: providerErr.message,
+    });
+    throw new Error(`SMS_PRE_SEND_FAILED_NO_SECONDARY:${providerErr.message}`);
+  }
+
+  let secondaryRes: { providerMessageSid: string } | null = null;
+  try {
+    secondaryRes = await params.secondaryProvider.sendSms({
+      idempotencyKey: providerIdempotencyKey,
+      to: params.e164Phone,
+      body: params.body,
+    });
+  } catch (secRawErr) {
+    const secErr = secRawErr as ProviderSendAttemptError;
+    const secCategory = classifyNotificationProviderFailure(secErr);
+    if (secCategory === 'AMBIGUOUS_POST_WRITE') {
+      await params.store.markReservationAmbiguous({
         reservationId: params.reservationId,
         tenantId: params.tenantId,
         reason: secErr.message,
       });
-      throw new Error(`SMS_SECONDARY_PROVIDER_REJECTED:${secErr.message}`);
+      return { status: 'AMBIGUOUS_RECONCILIATION_REQUIRED' };
     }
+    await params.store.releaseReservation({
+      reservationId: params.reservationId,
+      tenantId: params.tenantId,
+      reason: secErr.message,
+    });
+    throw new Error(`SMS_SECONDARY_PROVIDER_REJECTED:${secErr.message}`);
+  }
+
+  try {
+    await params.store.commitReservation({
+      reservationId: params.reservationId,
+      tenantId: params.tenantId,
+      providerMessageSid: secondaryRes.providerMessageSid,
+    });
+    return {
+      status: 'ACCEPTED_BY_PROVIDER',
+      providerMessageSid: secondaryRes.providerMessageSid,
+      providerUsed: params.secondaryProvider.providerName,
+    };
+  } catch (secCommitErr) {
+    await params.store
+      .markReservationAmbiguous({
+        reservationId: params.reservationId,
+        tenantId: params.tenantId,
+        reason: `POST_ACCEPTANCE_DB_COMMIT_FAILED:${secCommitErr instanceof Error ? secCommitErr.message : String(secCommitErr)}`,
+        providerMessageSid: secondaryRes.providerMessageSid,
+      })
+      .catch(() => undefined);
+    return {
+      status: 'AMBIGUOUS_RECONCILIATION_REQUIRED',
+      providerMessageSid: secondaryRes.providerMessageSid,
+      providerUsed: params.secondaryProvider.providerName,
+    };
   }
 }
 

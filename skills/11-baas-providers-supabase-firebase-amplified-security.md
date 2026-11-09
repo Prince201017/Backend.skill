@@ -250,13 +250,14 @@ export function evaluateFirestoreProjectRule(params: {
 
 ---
 
-## 4. Supabase RLS Policy Standard: Tables, Realtime Channels & Storage (`DEVIL-12` Hardened)
+## 4. Supabase RLS Policy Standard: Tables, Immutability Triggers, Realtime Channels & Storage (`DEVIL-15` Remediated)
 
 ```sql
--- 1. Authoritative Supabase RLS Policy on public.projects
+-- 1. Authoritative Supabase RLS Policies & Immutability Trigger on public.projects (DEVIL-15 Remediation)
 ALTER TABLE public.projects ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.projects FORCE ROW LEVEL SECURITY;
 REVOKE ALL ON TABLE public.projects FROM anon;
+REVOKE DELETE ON TABLE public.projects FROM authenticated;
 
 CREATE POLICY tenant_active_member_select_projects
   ON public.projects
@@ -269,6 +270,25 @@ CREATE POLICY tenant_active_member_select_projects
       WHERE tm.tenant_id = projects.tenant_id
         AND tm.user_id = auth.uid()
         AND tm.status = 'ACTIVE'
+    )
+  );
+
+CREATE POLICY tenant_active_editor_insert_projects
+  ON public.projects
+  FOR INSERT
+  TO authenticated
+  WITH CHECK (
+    projects.owner_id = auth.uid()
+    AND projects.status = 'DRAFT'
+    AND projects.budget_cents >= 0
+    AND projects.budget_cents <= 1000000000
+    AND EXISTS (
+      SELECT 1
+      FROM public.tenant_members tm
+      WHERE tm.tenant_id = projects.tenant_id
+        AND tm.user_id = auth.uid()
+        AND tm.status = 'ACTIVE'
+        AND tm.role IN ('ADMIN', 'EDITOR')
     )
   );
 
@@ -290,13 +310,60 @@ CREATE POLICY tenant_active_editor_update_projects
   WITH CHECK (
     -- Clients can never transition a project directly to 'COMPLETED' via PostgREST
     projects.status IN ('DRAFT', 'ACTIVE')
+    AND EXISTS (
+      SELECT 1
+      FROM public.tenant_members tm
+      WHERE tm.tenant_id = projects.tenant_id
+        AND tm.user_id = auth.uid()
+        AND tm.status = 'ACTIVE'
+        AND (projects.owner_id = auth.uid() OR tm.role = 'ADMIN')
+    )
   );
 
--- 2. Supabase Realtime Channel Authorization (realtime.messages)
--- Blocks cross-tenant WebSocket channel snooping on Broadcast/Presence topics ("tenant:<uuid>:events")
-ALTER TABLE realtime.messages ENABLE ROW LEVEL SECURITY;
+-- Explicit deny policy for client DELETE on public.projects
+CREATE POLICY tenant_projects_deny_client_delete
+  ON public.projects
+  FOR DELETE
+  TO authenticated
+  USING (false);
 
-CREATE POLICY tenant_realtime_channel_isolation
+-- PostgreSQL RLS WITH CHECK only sees the NEW row and cannot compare NEW vs. OLD columns by itself!
+-- Enforce column immutability (tenant_id, owner_id, created_at) and forbid ACTIVE -> DRAFT downgrade via trigger:
+CREATE OR REPLACE FUNCTION public.enforce_project_immutable_columns_and_state()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+BEGIN
+  IF NEW.tenant_id <> OLD.tenant_id THEN
+    RAISE EXCEPTION 'IMMUTABLE_COLUMN_VIOLATION: project.tenant_id cannot be reassigned across tenants';
+  END IF;
+  IF NEW.owner_id <> OLD.owner_id THEN
+    RAISE EXCEPTION 'IMMUTABLE_COLUMN_VIOLATION: project.owner_id cannot be mutated by client update';
+  END IF;
+  IF NEW.created_at <> OLD.created_at THEN
+    RAISE EXCEPTION 'IMMUTABLE_COLUMN_VIOLATION: project.created_at is immutable';
+  END IF;
+  IF OLD.status = 'ACTIVE' AND NEW.status = 'DRAFT' THEN
+    RAISE EXCEPTION 'INVALID_STATE_TRANSITION: Cannot downgrade project from ACTIVE to DRAFT';
+  END IF;
+  NEW.updated_at := clock_timestamp();
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_enforce_project_immutable_columns
+  BEFORE UPDATE ON public.projects
+  FOR EACH ROW
+  EXECUTE FUNCTION public.enforce_project_immutable_columns_and_state();
+
+-- 2. Supabase Realtime Channel Authorization (realtime.messages) — Both Subscribe (SELECT) & Publish (INSERT)
+-- Blocks cross-tenant WebSocket channel snooping AND unauthorized message injection on Broadcast/Presence topics ("tenant:<uuid>:events")
+ALTER TABLE realtime.messages ENABLE ROW LEVEL SECURITY;
+ALTER TABLE realtime.messages FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_realtime_channel_subscribe_isolation
   ON realtime.messages
   FOR SELECT
   TO authenticated
@@ -308,6 +375,22 @@ CREATE POLICY tenant_realtime_channel_isolation
       WHERE tm.tenant_id = NULLIF(split_part(realtime.topic(), ':', 2), '')::uuid
         AND tm.user_id = auth.uid()
         AND tm.status = 'ACTIVE'
+    )
+  );
+
+CREATE POLICY tenant_realtime_channel_publish_isolation
+  ON realtime.messages
+  FOR INSERT
+  TO authenticated
+  WITH CHECK (
+    realtime.topic() LIKE 'tenant:%'
+    AND EXISTS (
+      SELECT 1
+      FROM public.tenant_members tm
+      WHERE tm.tenant_id = NULLIF(split_part(realtime.topic(), ':', 2), '')::uuid
+        AND tm.user_id = auth.uid()
+        AND tm.status = 'ACTIVE'
+        AND tm.role IN ('ADMIN', 'EDITOR')
     )
   );
 

@@ -18,14 +18,25 @@ This module provides production-grade implementations for RFC 9457 error boundar
 
 ```typescript
 export class OperationalAppError extends Error {
+  public readonly status: number;
+  public readonly typeSlug: string;
+  public readonly title: string;
+  public readonly detail: string;
+  public readonly fieldErrors?: Array<{ field: string; code: string; message: string }>;
+
   constructor(
-    public readonly status: number,
-    public readonly typeSlug: string,
-    public readonly title: string,
-    public readonly detail: string,
-    public readonly fieldErrors?: Array<{ field: string; code: string; message: string }>
+    status: number,
+    typeSlug: string,
+    title: string,
+    detail: string,
+    fieldErrors?: Array<{ field: string; code: string; message: string }>
   ) {
     super(detail);
+    this.status = status;
+    this.typeSlug = typeSlug;
+    this.title = title;
+    this.detail = detail;
+    this.fieldErrors = fieldErrors;
   }
 }
 
@@ -554,52 +565,64 @@ export function verifyWebhookSignature(params: {
 
 export interface PersistentWebhookStore {
   /**
+   * Mandatory authoritative entity-to-tenant resolver (DEVIL-12):
    * Resolves the authoritative tenantId for entityId from the server database
    * (never trusting unverified metadata.tenantId inside the webhook payload!).
    */
-  resolveAuthoritativeEntityTenant?(entityId: string): Promise<{
+  resolveAuthoritativeEntityTenant(entityId: string): Promise<{
     tenantId: string;
     providerIdempotencyKey?: string;
   } | null>;
 
   /**
-   * Atomically claims (provider, providerEventId) in PostgreSQL.
+   * Atomically claims (provider, providerEventId) in PostgreSQL with a monotonic fencingToken.
+   * If (provider, providerEventId) already exists with a different payloadSha256, returns
+   * 'PAYLOAD_HASH_MISMATCH_TAMPERED' to block duplicate ID tampering!
    */
   claimWebhookEvent(params: {
     provider: string;
     providerEventId: string;
     eventType: string;
     entityId: string;
+    tenantId: string;
     providerCreatedAtSec: number;
     payloadSha256: string;
     lockOwner: string;
     leaseSeconds: number;
   }): Promise<
-    | { claimStatus: 'CLAIMED' }
+    | { claimStatus: 'CLAIMED'; fencingToken: bigint }
     | { claimStatus: 'DUPLICATE_ALREADY_PROCESSED' }
     | { claimStatus: 'IN_FLIGHT_CONCURRENT' }
+    | { claimStatus: 'PAYLOAD_HASH_MISMATCH_TAMPERED' }
   >;
 
   /**
-   * Executes inside a single DB transaction: checks whether providerCreatedAtSec >= entity's
-   * last_webhook_created_at_sec, reconciles any UNKNOWN_RECONCILIATION_REQUIRED idempotency_keys row
-   * sharing the same providerIdempotencyKey (preventing double-fulfillment races between webhook and timeout recovery),
+   * Executes inside a single DB transaction gated by (lockOwner, fencingToken):
+   * checks whether providerCreatedAtSec >= entity's last_webhook_created_at_sec,
+   * reconciles any UNKNOWN_RECONCILIATION_REQUIRED idempotency_keys row sharing resolvedProviderIdempotencyKey,
    * applies the domain mutation if newer, and marks the webhook PROCESSED.
    */
   applyOrderedDomainEffectAndMarkProcessed(params: {
     provider: string;
     providerEventId: string;
     entityId: string;
+    tenantId: string;
     providerCreatedAtSec: number;
     lockOwner: string;
+    fencingToken: bigint;
     resolvedProviderIdempotencyKey?: string;
     applyEffect: () => Promise<void>;
-  }): Promise<'APPLIED_AND_PROCESSED' | 'OUT_OF_ORDER_STALE_EVENT_IGNORED'>;
+  }): Promise<
+    | 'APPLIED_AND_PROCESSED'
+    | 'OUT_OF_ORDER_STALE_EVENT_IGNORED'
+    | 'FENCING_TOKEN_REJECTED_STALE_WORKER'
+  >;
 
   markWebhookFailedRetryable(params: {
     provider: string;
     providerEventId: string;
     lockOwner: string;
+    fencingToken: bigint;
   }): Promise<void>;
 }
 
@@ -626,6 +649,15 @@ export async function verifyAndProcessWebhookIdempotently(params: {
     | 'OUT_OF_ORDER_STALE_EVENT_IGNORED'
     | 'IN_FLIGHT_CONCURRENT';
 }> {
+  if (!Buffer.isBuffer(params.rawBodyBuffer) || params.rawBodyBuffer.byteLength === 0) {
+    throw new OperationalAppError(
+      400,
+      'webhook-raw-body-required',
+      'Raw Webhook Body Buffer Required',
+      'Webhook signature verification requires the exact unparsed rawBodyBuffer.'
+    );
+  }
+
   // 1. Cryptographic signature & timestamp verification against exact rawBodyBuffer
   const sigVerdict = verifyWebhookSignature({
     rawBodyBuffer: params.rawBodyBuffer,
@@ -654,44 +686,53 @@ export async function verifyAndProcessWebhookIdempotently(params: {
     );
   }
 
-  // DEVIL-04 Guard: Verify that the webhook's entityId actually belongs to claimedTenantId in our DB
-  let resolvedProviderIdempotencyKey: string | undefined;
-  if (params.store.resolveAuthoritativeEntityTenant) {
-    const authEntity = await params.store.resolveAuthoritativeEntityTenant(envelope.entityId);
-    if (!authEntity) {
-      throw new OperationalAppError(
-        404,
-        'webhook-entity-not-found',
-        'Webhook Target Entity Not Found',
-        'Referenced entityId does not exist in authoritative store.'
-      );
-    }
-    if (envelope.claimedTenantId && envelope.claimedTenantId !== authEntity.tenantId) {
-      throw new OperationalAppError(
-        403,
-        'webhook-cross-tenant-attribution-mismatch',
-        'Webhook Tenant Attribution Mismatch',
-        'Webhook metadata tenantId does not match the authoritative tenant owner of entityId.'
-      );
-    }
-    resolvedProviderIdempotencyKey = authEntity.providerIdempotencyKey;
+  // 2. Mandatory Authoritative Entity-to-Tenant Attribution Verification (DEVIL-12)
+  if (typeof params.store.resolveAuthoritativeEntityTenant !== 'function') {
+    throw new Error('WEBHOOK_CONFIG_ERROR: store.resolveAuthoritativeEntityTenant is mandatory');
   }
+  const authEntity = await params.store.resolveAuthoritativeEntityTenant(envelope.entityId);
+  if (!authEntity) {
+    throw new OperationalAppError(
+      404,
+      'webhook-entity-not-found',
+      'Webhook Target Entity Not Found',
+      'Referenced entityId does not exist in authoritative store.'
+    );
+  }
+  if (envelope.claimedTenantId !== undefined && envelope.claimedTenantId !== authEntity.tenantId) {
+    throw new OperationalAppError(
+      403,
+      'webhook-cross-tenant-attribution-mismatch',
+      'Webhook Tenant Attribution Mismatch',
+      'Webhook metadata tenantId does not match the authoritative tenant owner of entityId.'
+    );
+  }
+  const resolvedProviderIdempotencyKey = authEntity.providerIdempotencyKey;
 
   const payloadSha256 = crypto.createHash('sha256').update(params.rawBodyBuffer).digest('hex');
   const lockOwner = crypto.randomUUID();
 
-  // 2. Atomic persistent claim in PostgreSQL (defeats replay inside the 300s window & concurrent deliveries)
+  // 3. Atomic persistent claim in PostgreSQL with payloadSha256 collision check & fencingToken
   const claim = await params.store.claimWebhookEvent({
     provider: params.provider,
     providerEventId: envelope.providerEventId,
     eventType: envelope.eventType,
     entityId: envelope.entityId,
+    tenantId: authEntity.tenantId,
     providerCreatedAtSec: envelope.providerCreatedAtSec,
     payloadSha256,
     lockOwner,
     leaseSeconds: 30,
   });
 
+  if (claim.claimStatus === 'PAYLOAD_HASH_MISMATCH_TAMPERED') {
+    throw new OperationalAppError(
+      409,
+      'webhook-event-id-payload-mismatch',
+      'Webhook Event ID Payload Hash Mismatch',
+      'A webhook with this providerEventId was already recorded with a different payload SHA-256 digest.'
+    );
+  }
   if (claim.claimStatus === 'DUPLICATE_ALREADY_PROCESSED') {
     return { outcome: 'DUPLICATE_ALREADY_PROCESSED' };
   }
@@ -699,28 +740,38 @@ export async function verifyAndProcessWebhookIdempotently(params: {
     return { outcome: 'IN_FLIGHT_CONCURRENT' };
   }
 
-  // 3. Apply domain mutation with out-of-order protection and mark PROCESSED atomically
+  const { fencingToken } = claim;
+
+  // 4. Apply domain mutation with out-of-order protection, fencing token verification, and atomic mark PROCESSED
   try {
     const res = await params.store.applyOrderedDomainEffectAndMarkProcessed({
       provider: params.provider,
       providerEventId: envelope.providerEventId,
       entityId: envelope.entityId,
+      tenantId: authEntity.tenantId,
       providerCreatedAtSec: envelope.providerCreatedAtSec,
       lockOwner,
+      fencingToken,
       resolvedProviderIdempotencyKey,
       applyEffect: params.applyDomainEffect,
     });
 
+    if (res === 'FENCING_TOKEN_REJECTED_STALE_WORKER') {
+      throw new Error('WEBHOOK_FENCING_TOKEN_REJECTED_STALE_WORKER');
+    }
     if (res === 'OUT_OF_ORDER_STALE_EVENT_IGNORED') {
       return { outcome: 'OUT_OF_ORDER_STALE_EVENT_IGNORED' };
     }
     return { outcome: 'PROCESSED' };
   } catch (err) {
-    await params.store.markWebhookFailedRetryable({
-      provider: params.provider,
-      providerEventId: envelope.providerEventId,
-      lockOwner,
-    });
+    if (!(err instanceof Error && err.message === 'WEBHOOK_FENCING_TOKEN_REJECTED_STALE_WORKER')) {
+      await params.store.markWebhookFailedRetryable({
+        provider: params.provider,
+        providerEventId: envelope.providerEventId,
+        lockOwner,
+        fencingToken,
+      });
+    }
     throw err;
   }
 }
@@ -794,7 +845,11 @@ export class CircuitBreaker {
   private halfOpenInFlightProbes = 0;
   private nextAttemptAtMs = 0;
 
-  constructor(private readonly opts: CircuitBreakerOptions) {}
+  private readonly opts: CircuitBreakerOptions;
+
+  constructor(opts: CircuitBreakerOptions) {
+    this.opts = opts;
+  }
 
   public getState(): CircuitState {
     if (this.state === 'OPEN' && Date.now() >= this.nextAttemptAtMs) {

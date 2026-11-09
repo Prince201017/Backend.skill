@@ -322,14 +322,22 @@ export interface CorrelatedTraceEnvelope {
 export function exportCorrelatedTraceEnvelope(shared: SharedTraceBuffer): CorrelatedTraceEnvelope {
   const sanitizedHops: TraceHopSpan[] = shared.hops.map((hop) => ({
     ...hop,
+    operationName:
+      hop.operationName.length > 256 ? `${hop.operationName.slice(0, 256)}...[TRUNCATED]` : hop.operationName,
+    serviceName:
+      hop.serviceName.length > 128 ? `${hop.serviceName.slice(0, 128)}...[TRUNCATED]` : hop.serviceName,
+    errorMessage:
+      hop.errorMessage && Buffer.byteLength(hop.errorMessage, 'utf8') > 2048
+        ? `${hop.errorMessage.slice(0, 1024)}...[TRUNCATED]`
+        : hop.errorMessage,
     redactedRequestPreview: boundPreviewPayload(hop.redactedRequestPreview, MAX_HOP_PAYLOAD_BYTES),
     redactedResponsePreview: boundPreviewPayload(hop.redactedResponsePreview, MAX_HOP_PAYLOAD_BYTES),
   }));
 
   const candidate: CorrelatedTraceEnvelope = {
-    traceId: shared.traceId,
-    tenantId: shared.tenantId,
-    requestId: shared.requestId,
+    traceId: shared.traceId.slice(0, 128),
+    tenantId: shared.tenantId.slice(0, 128),
+    requestId: shared.requestId.slice(0, 128),
     hopCount: sanitizedHops.length,
     envelopeTruncated: false,
     byteLength: 0,
@@ -344,7 +352,7 @@ export function exportCorrelatedTraceEnvelope(shared: SharedTraceBuffer): Correl
     return candidate;
   }
 
-  // Step 1: Strip request/response previews on non-root hops to fit within 32 KB
+  // Step 1: Strip request/response previews on hops to fit within 32 KB
   candidate.envelopeTruncated = true;
   candidate.hops = sanitizedHops.map((hop) => ({
     spanId: hop.spanId,
@@ -361,9 +369,30 @@ export function exportCorrelatedTraceEnvelope(shared: SharedTraceBuffer): Correl
   serialized = JSON.stringify(candidate);
   byteLength = Buffer.byteLength(serialized, 'utf8');
 
-  // Step 2: Drop oldest non-root hops until strictly <= 32,768 bytes
+  // Step 2 (DEVIL-21 Fix): Drop OLDEST non-root hops first (index 1, preserving root hop at index 0
+  // and the most recent tail hops) until strictly <= 32,768 bytes!
   while (byteLength > MAX_TRACE_ENVELOPE_BYTES && candidate.hops.length > 1) {
-    candidate.hops.pop();
+    candidate.hops.splice(1, 1);
+    serialized = JSON.stringify(candidate);
+    byteLength = Buffer.byteLength(serialized, 'utf8');
+  }
+
+  // Step 3 (DEVIL-21 Fix): Guarantee <= 32,768 bytes even when only a single oversized root hop remains
+  if (byteLength > MAX_TRACE_ENVELOPE_BYTES && candidate.hops.length === 1) {
+    const rootHop = candidate.hops[0];
+    candidate.hops = [
+      {
+        spanId: rootHop.spanId.slice(0, 32),
+        parentSpanId: null,
+        serviceName: rootHop.serviceName.slice(0, 64),
+        operationName: rootHop.operationName.slice(0, 128),
+        direction: rootHop.direction,
+        startedAtMs: rootHop.startedAtMs,
+        durationMs: rootHop.durationMs,
+        statusCode: rootHop.statusCode,
+        errorMessage: rootHop.errorMessage ? `${rootHop.errorMessage.slice(0, 512)}...[TRUNCATED]` : undefined,
+      },
+    ];
     serialized = JSON.stringify(candidate);
     byteLength = Buffer.byteLength(serialized, 'utf8');
   }

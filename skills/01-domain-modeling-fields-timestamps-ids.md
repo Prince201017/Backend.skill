@@ -690,11 +690,23 @@ export async function executeDomainStateTransition<TState extends string, TConte
   expectedVersion: number;
   context: TContext;
   rules: readonly StateTransitionRule<TState, TContext>[];
+  persistTransitionConditionally: (update: {
+    tenantId: string;
+    entityId: string;
+    expectedCurrentState: TState;
+    expectedVersion: number;
+    nextState: TState;
+    nextVersion: number;
+    auditEvent: string;
+  }) => Promise<{ updatedRowCount: number }>;
 }): Promise<{
   nextState: TState;
   nextVersion: number;
   auditEvent: string;
 }> {
+  if (!Number.isInteger(params.expectedVersion) || params.expectedVersion < 0) {
+    throw new Error('STATE_INVALID_EXPECTED_VERSION');
+  }
   if (params.currentVersion !== params.expectedVersion) {
     throw new Error(
       `STATE_CONFLICT_STALE_VERSION: ${params.entityName} (${params.entityId}) expected v${params.expectedVersion}, found v${params.currentVersion}`
@@ -729,10 +741,31 @@ export async function executeDomainStateTransition<TState extends string, TConte
     }
   }
 
+  const nextVersion = params.expectedVersion + 1;
+  const auditEvent = `${params.entityName.toLowerCase()}.transitioned.${params.currentState.toLowerCase()}_to_${params.targetState.toLowerCase()}`;
+
+  // DEVIL-11 Fix: Enforce conditional database update (WHERE tenant_id=$1 AND id=$2 AND state=$3 AND version=$4)
+  // and verify affected rowCount === 1 so concurrent transitions cannot overwrite each other!
+  const writeResult = await params.persistTransitionConditionally({
+    tenantId: params.tenantId,
+    entityId: params.entityId,
+    expectedCurrentState: params.currentState,
+    expectedVersion: params.expectedVersion,
+    nextState: params.targetState,
+    nextVersion,
+    auditEvent,
+  });
+
+  if (writeResult.updatedRowCount !== 1) {
+    throw new Error(
+      `STATE_CONFLICT_CONCURRENT_MODIFICATION: Conditional update for ${params.entityName} (${params.entityId}) at v${params.expectedVersion} affected ${writeResult.updatedRowCount} rows`
+    );
+  }
+
   return {
     nextState: params.targetState,
-    nextVersion: params.currentVersion + 1,
-    auditEvent: `${params.entityName.toLowerCase()}.transitioned.${params.currentState.toLowerCase()}_to_${params.targetState.toLowerCase()}`,
+    nextVersion,
+    auditEvent,
   };
 }
 ```
@@ -740,7 +773,7 @@ export async function executeDomainStateTransition<TState extends string, TConte
 ### B. Strict Double-Entry Accounting Journal Validator & Atomic Persistence Engine
 1. **Explicit Direction Validation**: Reject any posting whose `direction` is not strictly `'DEBIT'` or `'CREDIT'` (never use `if (dir === 'DEBIT') ... else` which silently treats invalid strings as `'CREDIT'`).
 2. **PostgreSQL `BIGINT` Bounds**: Validate every line's `amountMinor` and the cumulative `totalDebitMinor`/`totalCreditMinor` against `assertPgBigIntRange`.
-3. **Tenant-Account Ownership & Atomic Persistence**: Lock all referenced accounts in deterministic lexicographical order (`ORDER BY account_id FOR UPDATE`), verify that every account belongs to `params.tenantId`, uses `currencyCode`, and is `'ACTIVE'`, enforce idempotency uniqueness (`UNIQUE (tenant_id, idempotency_key)`), and commit the journal header, posting lines, and account balance updates in a single ACID transaction.
+3. **Tenant-Account Ownership & Atomic Persistence**: Lock all referenced accounts in deterministic lexicographical order (`ORDER BY account_id FOR UPDATE`), verify that every account belongs to `params.tenantId`, uses `currencyCode`, and is `'ACTIVE'`, enforce idempotency uniqueness (`UNIQUE (tenant_id, idempotency_key)`), verify affected row counts on account updates (`updatedAccountCount === sortedAccountIds.length`), and commit the journal header, posting lines, and account balance updates in a single ACID transaction.
 
 ```typescript
 export interface JournalPostingLine {
@@ -827,8 +860,9 @@ export interface LedgerAccountRow {
   tenantId: string;
   currencyCode: string;
   status: 'ACTIVE' | 'FROZEN' | 'CLOSED';
-  normalBalance?: 'DEBIT' | 'CREDIT'; // Defaults to 'CREDIT' (Liability/Wallet); 'DEBIT' for Asset/Cash accounts
+  normalBalance: 'DEBIT' | 'CREDIT'; // Mandatory: 'DEBIT' for Asset/Expense; 'CREDIT' for Liability/Equity/Revenue
   balanceMinor: bigint;
+  version: number;
   allowNegativeBalance: boolean;
 }
 
@@ -838,25 +872,46 @@ export interface LedgerTransactionPort {
       findJournalByIdempotencyKey: (
         tenantId: string,
         idempotencyKey: string
-      ) => Promise<{ journalId: string; totalDebitMinor: bigint; currencyCode: string } | null>;
+      ) => Promise<{
+        journalId: string;
+        totalDebitMinor: bigint;
+        currencyCode: string;
+        requestHash?: string;
+      } | null>;
       lockAccountsSortedForUpdate: (sortedAccountIds: readonly string[]) => Promise<LedgerAccountRow[]>;
       insertJournalAndUpdateBalances: (data: {
         journalId: string;
         tenantId: string;
         idempotencyKey: string;
+        requestHash: string;
         currencyCode: string;
         totalDebitMinor: bigint;
         postings: readonly JournalPostingLine[];
+        expectedAccountVersions: ReadonlyMap<string, number>;
         updatedBalances: ReadonlyMap<string, bigint>;
-      }) => Promise<void>;
+      }) => Promise<{ updatedAccountCount: number }>;
     }) => Promise<T>
   ): Promise<T>;
+}
+
+export function computeJournalRequestHash(params: {
+  tenantId: string;
+  idempotencyKey: string;
+  postings: readonly JournalPostingLine[];
+}): string {
+  const canonicalLines = params.postings.map(
+    (p) => `${p.accountId}:${p.direction}:${p.amountMinor.toString()}:${p.currencyCode}`
+  );
+  return crypto
+    .createHash('sha256')
+    .update(`${params.tenantId}|${params.idempotencyKey}|${canonicalLines.join(';')}`, 'utf8')
+    .digest('hex');
 }
 
 /**
  * Atomic Double-Entry Journal Persistence with Tenant-Account Ownership,
  * Normal-Balance Sign Enforcement (Asset DEBIT-normal vs Liability CREDIT-normal),
- * and Idempotency Enforcement.
+ * Conditional Version Verification, and Idempotency Payload-Hash Enforcement (DEVIL-10 & DEVIL-11).
  */
 export async function persistBalancedJournalAtomically(params: {
   journalId: string;
@@ -871,11 +926,25 @@ export async function persistBalancedJournalAtomically(params: {
   replayedIdempotent: boolean;
 }> {
   const validated = validateBalancedDoubleEntryJournal(params);
+  const requestHash = computeJournalRequestHash(params);
 
   return params.ledgerPort.runInTransaction(async (tx) => {
-    // 1. Check unique (tenant_id, idempotency_key) inside the transaction
+    // 1. Check unique (tenant_id, idempotency_key) inside the transaction and verify payload hash match!
     const existing = await tx.findJournalByIdempotencyKey(params.tenantId, params.idempotencyKey);
     if (existing) {
+      if (existing.requestHash !== undefined && existing.requestHash !== requestHash) {
+        throw new Error(
+          `LEDGER_IDEMPOTENCY_PAYLOAD_MISMATCH: Idempotency key "${params.idempotencyKey}" was already used with a different journal payload`
+        );
+      }
+      if (
+        existing.totalDebitMinor !== validated.totalDebitMinor ||
+        existing.currencyCode !== validated.currencyCode
+      ) {
+        throw new Error(
+          `LEDGER_IDEMPOTENCY_PAYLOAD_MISMATCH: Idempotency key "${params.idempotencyKey}" amount/currency mismatch`
+        );
+      }
       return {
         journalId: existing.journalId,
         currencyCode: existing.currencyCode,
@@ -887,11 +956,13 @@ export async function persistBalancedJournalAtomically(params: {
     // 2. Lock all referenced accounts in deterministic lexicographical order (prevents deadlocks)
     const lockedAccounts = await tx.lockAccountsSortedForUpdate(validated.sortedAccountIds);
     const accountMap = new Map<string, LedgerAccountRow>();
+    const expectedAccountVersions = new Map<string, number>();
     for (const acc of lockedAccounts) {
       accountMap.set(acc.accountId, acc);
+      expectedAccountVersions.set(acc.accountId, acc.version ?? 0);
     }
 
-    // 3. Enforce tenant ownership, currency match, and active status on every single account
+    // 3. Enforce tenant ownership, currency match, normalBalance presence, and active status on every account
     for (const accountId of validated.sortedAccountIds) {
       const acc = accountMap.get(accountId);
       if (!acc) {
@@ -910,6 +981,11 @@ export async function persistBalancedJournalAtomically(params: {
       if (acc.status !== 'ACTIVE') {
         throw new Error(`LEDGER_ACCOUNT_INACTIVE: Account "${accountId}" is ${acc.status}`);
       }
+      if (acc.normalBalance !== 'DEBIT' && acc.normalBalance !== 'CREDIT') {
+        throw new Error(
+          `LEDGER_INVALID_NORMAL_BALANCE: Account "${accountId}" must declare normalBalance 'DEBIT' or 'CREDIT'`
+        );
+      }
     }
 
     // 4. Compute new account balances respecting each account's normalBalance ('DEBIT' vs 'CREDIT')
@@ -922,8 +998,7 @@ export async function persistBalancedJournalAtomically(params: {
     for (const line of params.postings) {
       const currentBal = updatedBalances.get(line.accountId)!;
       const accMeta = accountMap.get(line.accountId)!;
-      const normalSide = accMeta.normalBalance ?? 'CREDIT';
-      // A posting matching the account's normal balance side increases its balance; the opposite side decreases it
+      const normalSide = accMeta.normalBalance;
       const delta = line.direction === normalSide ? line.amountMinor : -line.amountMinor;
       const nextBal = currentBal + delta;
       assertPgBigIntRange(nextBal, `account[${line.accountId}].balanceMinor`, { allowNegative: true });
@@ -934,16 +1009,24 @@ export async function persistBalancedJournalAtomically(params: {
       updatedBalances.set(line.accountId, nextBal);
     }
 
-    // 5. Atomically insert journal header, posting lines, and updated balances
-    await tx.insertJournalAndUpdateBalances({
+    // 5. Atomically insert journal header, posting lines, and conditionally update account balances + versions
+    const writeRes = await tx.insertJournalAndUpdateBalances({
       journalId: params.journalId,
       tenantId: params.tenantId,
       idempotencyKey: params.idempotencyKey,
+      requestHash,
       currencyCode: validated.currencyCode,
       totalDebitMinor: validated.totalDebitMinor,
       postings: params.postings,
+      expectedAccountVersions,
       updatedBalances,
     });
+
+    if (writeRes.updatedAccountCount !== validated.sortedAccountIds.length) {
+      throw new Error(
+        `LEDGER_CONCURRENT_VERSION_CONFLICT: Expected to update ${validated.sortedAccountIds.length} accounts, but updated ${writeRes.updatedAccountCount}`
+      );
+    }
 
     return {
       journalId: params.journalId,
@@ -955,10 +1038,15 @@ export async function persistBalancedJournalAtomically(params: {
 }
 ```
 
-### C. Authoritative Database-Level Ledger Immutability & Balance Integrity DDL
-TypeScript validation alone does not protect the database if a bug or compromised query attempts to `UPDATE` or `DELETE` historical ledger rows. Enforce append-only immutability in PostgreSQL:
+### C. Authoritative Database-Level Ledger Immutability, Privilege Lockdown & Deferred Balance Trigger (`DEVIL-11`)
+TypeScript validation alone does not protect the database if a bug or raw SQL query attempts to `UPDATE`/`DELETE` ledger rows or insert an unbalanced journal. Enforce append-only immutability, least-privilege grants, and deferred transaction-commit balance verification inside PostgreSQL:
 
 ```sql
+-- 1. Least-Privilege Grants: app_runtime can only SELECT and INSERT on ledger tables (never UPDATE, DELETE, or TRUNCATE)
+REVOKE ALL ON public.journal_entries, public.journal_postings FROM PUBLIC, app_runtime;
+GRANT SELECT, INSERT ON public.journal_entries, public.journal_postings TO app_runtime;
+
+-- 2. Append-Only Immutability Trigger (Blocks even table owners / migrations from mutating posted ledger rows)
 CREATE OR REPLACE FUNCTION public.prevent_ledger_mutation()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -977,6 +1065,40 @@ CREATE TRIGGER trg_journal_entries_immutable
 CREATE TRIGGER trg_journal_postings_immutable
   BEFORE UPDATE OR DELETE ON public.journal_postings
   FOR EACH ROW EXECUTE FUNCTION public.prevent_ledger_mutation();
+
+-- 3. Deferred Commit-Time Double-Entry Balance Invariant Trigger
+CREATE OR REPLACE FUNCTION public.verify_journal_balanced_at_commit()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  v_debit_sum BIGINT;
+  v_credit_sum BIGINT;
+  v_line_count INT;
+BEGIN
+  SELECT
+    COUNT(*),
+    COALESCE(SUM(CASE WHEN direction = 'DEBIT' THEN amount_minor ELSE 0 END), 0),
+    COALESCE(SUM(CASE WHEN direction = 'CREDIT' THEN amount_minor ELSE 0 END), 0)
+  INTO v_line_count, v_debit_sum, v_credit_sum
+  FROM public.journal_postings
+  WHERE journal_id = NEW.journal_id
+    AND tenant_id = NEW.tenant_id;
+
+  IF v_line_count < 2 OR v_debit_sum <= 0 OR v_debit_sum <> v_credit_sum THEN
+    RAISE EXCEPTION 'LEDGER_DB_INVARIANT_VIOLATION: Journal % is unbalanced at commit (debits=%, credits=%, lines=%)',
+      NEW.journal_id, v_debit_sum, v_credit_sum, v_line_count
+      USING ERRCODE = '23514';
+  END IF;
+  RETURN NULL;
+END;
+$$;
+
+CREATE CONSTRAINT TRIGGER trg_verify_journal_balanced_commit
+  AFTER INSERT ON public.journal_entries
+  DEFERRABLE INITIALLY DEFERRED
+  FOR EACH ROW EXECUTE FUNCTION public.verify_journal_balanced_at_commit();
 ```
 
 ---

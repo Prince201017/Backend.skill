@@ -69,6 +69,9 @@ CREATE TABLE saga_instances (
         'COMPENSATED_ROLLED_BACK',
         'RECONCILIATION_REQUIRED'
     )),
+    fencing_token BIGINT NOT NULL DEFAULT 0,
+    lease_owner VARCHAR(128) NULL,
+    lease_expires_at TIMESTAMPTZ NULL,
     context_json JSONB NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
@@ -87,6 +90,7 @@ CREATE TABLE saga_step_logs (
         'COMPENSATED',
         'COMPENSATION_FAILED_INTERVENTION_REQUIRED'
     )),
+    fencing_token BIGINT NOT NULL DEFAULT 0,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     PRIMARY KEY (saga_id, step_index)
 );
@@ -109,11 +113,26 @@ export type DurableStepStatus =
   | 'COMPENSATED'
   | 'COMPENSATION_FAILED_INTERVENTION_REQUIRED';
 
+export type PriorStepExecutionStatus =
+  | 'CONFIRMED_COMPLETED_DOWNSTREAM'
+  | 'CONFIRMED_NEVER_EXECUTED_DOWNSTREAM'
+  | 'INDETERMINATE_REQUIRES_RECONCILIATION';
+
 export interface SagaStepDefinition<TContext> {
   stepName: string;
   stepTimeoutMs?: number;
   executeForward: (ctx: TContext, idempotencyKey: string, signal: AbortSignal) => Promise<void>;
   compensateBackward?: (ctx: TContext, idempotencyKey: string, signal: AbortSignal) => Promise<void>;
+  /**
+   * DEVIL-13 Remediation: When a recovery worker finds a step in 'FORWARD_STARTED' or
+   * 'FORWARD_AMBIGUOUS_TIMEOUT', it MUST reconcile downstream side-effect status before
+   * deciding whether to mark completed, re-run forward, or halt for reconciliation.
+   */
+  reconcilePriorExecution?: (
+    ctx: TContext,
+    idempotencyKey: string,
+    signal: AbortSignal
+  ) => Promise<PriorStepExecutionStatus>;
 }
 
 export interface PersistedSagaStepRecord {
@@ -123,25 +142,36 @@ export interface PersistedSagaStepRecord {
 }
 
 export interface DurableSagaStateStore<TContext> {
-  loadOrCreateSagaInstance(params: {
+  acquireSagaLease(params: {
     sagaId: string;
     tenantId: string;
     sagaType: string;
+    workerId: string;
+    leaseDurationMs: number;
     initialContext: TContext;
-  }): Promise<{
-    sagaStatus: DurableSagaStatus;
-    context: TContext;
-    steps: ReadonlyArray<PersistedSagaStepRecord>;
-  }>;
+  }): Promise<
+    | {
+        acquired: true;
+        fencingToken: bigint;
+        sagaStatus: DurableSagaStatus;
+        context: TContext;
+        steps: ReadonlyArray<PersistedSagaStepRecord>;
+      }
+    | {
+        acquired: false;
+        reason: 'ACTIVE_LEASE_HELD_BY_ANOTHER_WORKER';
+      }
+  >;
 
   recordStepStatus(
     sagaId: string,
     stepIndex: number,
     stepName: string,
-    status: DurableStepStatus
+    status: DurableStepStatus,
+    fencingToken: bigint
   ): Promise<void>;
 
-  updateSagaStatus(sagaId: string, status: DurableSagaStatus): Promise<void>;
+  updateSagaStatus(sagaId: string, status: DurableSagaStatus, fencingToken: bigint): Promise<void>;
 }
 
 export class SagaAmbiguousStepTimeoutError extends Error {
@@ -152,53 +182,122 @@ export class SagaAmbiguousStepTimeoutError extends Error {
 }
 
 /**
- * Durable, Crash-Recoverable Saga Orchestrator:
- * - Persists every step state transition before and after execution.
- * - On crash recovery, loads persisted steps from DurableSagaStateStore, skips already FORWARD_COMPLETED steps,
- *   or resumes backward compensation for all FORWARD_COMPLETED / COMPENSATING steps in reverse order.
+ * Durable, Crash-Recoverable Saga Orchestrator (`DEVIL-13` Hardened):
+ * - Acquires an exclusive worker lease with a monotonic `fencingToken: bigint` to prevent concurrent recovery split-brain.
+ * - Persists every step state transition fenced by `fencingToken`.
+ * - If a step is found in `'FORWARD_STARTED'` or `'FORWARD_AMBIGUOUS_TIMEOUT'` during recovery, calls
+ *   `step.reconcilePriorExecution()` (if provided) before re-executing; if no reconciler exists or the state
+ *   is indeterminate, halts in `'RECONCILIATION_REQUIRED'` instead of blindly re-running or compensating.
  */
 export async function runOrResumeDurableSaga<TContext>(params: {
   sagaId: string;
   tenantId: string;
   sagaType: string;
+  workerId?: string;
+  leaseDurationMs?: number;
   initialContext: TContext;
   steps: readonly SagaStepDefinition<TContext>[];
   store: DurableSagaStateStore<TContext>;
   maxCompensationAttempts?: number;
 }): Promise<{ finalStatus: DurableSagaStatus }> {
   const maxCompAttempts = params.maxCompensationAttempts ?? 3;
-  const loaded = await params.store.loadOrCreateSagaInstance({
+  const lease = await params.store.acquireSagaLease({
     sagaId: params.sagaId,
     tenantId: params.tenantId,
     sagaType: params.sagaType,
+    workerId: params.workerId ?? 'default-saga-worker',
+    leaseDurationMs: params.leaseDurationMs ?? 30_000,
     initialContext: params.initialContext,
   });
 
-  if (loaded.sagaStatus === 'COMPLETED' || loaded.sagaStatus === 'COMPENSATED_ROLLED_BACK') {
-    return { finalStatus: loaded.sagaStatus };
+  if (!lease.acquired) {
+    throw new Error(`SAGA_LEASE_CONFLICT: ${lease.reason}`);
   }
-  if (loaded.sagaStatus === 'RECONCILIATION_REQUIRED') {
+
+  const { fencingToken } = lease;
+
+  if (lease.sagaStatus === 'COMPLETED' || lease.sagaStatus === 'COMPENSATED_ROLLED_BACK') {
+    return { finalStatus: lease.sagaStatus };
+  }
+  if (lease.sagaStatus === 'RECONCILIATION_REQUIRED') {
     return { finalStatus: 'RECONCILIATION_REQUIRED' };
   }
 
   const stepMap = new Map<number, PersistedSagaStepRecord>();
-  for (const s of loaded.steps) {
+  for (const s of lease.steps) {
     stepMap.set(s.stepIndex, s);
   }
 
-  let shouldCompensate = loaded.sagaStatus === 'COMPENSATING_BACKWARD';
+  let shouldCompensate = lease.sagaStatus === 'COMPENSATING_BACKWARD';
 
   // Phase 1: Forward execution (resumes from the first non-completed step)
   if (!shouldCompensate) {
     for (let i = 0; i < params.steps.length; i++) {
       const step = params.steps[i];
       const existing = stepMap.get(i);
+      const forwardIdempotencyKey = `${params.sagaId}:step:${i}:${step.stepName}:forward`;
 
       if (existing?.status === 'FORWARD_COMPLETED') {
         continue; // Already completed before crash; skip!
       }
 
-      await params.store.recordStepStatus(params.sagaId, i, step.stepName, 'FORWARD_STARTED');
+      // DEVIL-13 Fix: If a prior run crashed after recording 'FORWARD_STARTED' or 'FORWARD_AMBIGUOUS_TIMEOUT',
+      // never blindly re-run or compensate without reconciling downstream execution status first!
+      if (existing?.status === 'FORWARD_STARTED' || existing?.status === 'FORWARD_AMBIGUOUS_TIMEOUT') {
+        if (!step.reconcilePriorExecution) {
+          await params.store.recordStepStatus(
+            params.sagaId,
+            i,
+            step.stepName,
+            'FORWARD_AMBIGUOUS_TIMEOUT',
+            fencingToken
+          );
+          await params.store.updateSagaStatus(params.sagaId, 'RECONCILIATION_REQUIRED', fencingToken);
+          return { finalStatus: 'RECONCILIATION_REQUIRED' };
+        }
+
+        const reconcileController = new AbortController();
+        const reconcileTimer = setTimeout(() => reconcileController.abort(), step.stepTimeoutMs ?? 10_000);
+        let priorOutcome: PriorStepExecutionStatus;
+        try {
+          priorOutcome = await step.reconcilePriorExecution(
+            lease.context,
+            forwardIdempotencyKey,
+            reconcileController.signal
+          );
+          clearTimeout(reconcileTimer);
+        } catch {
+          clearTimeout(reconcileTimer);
+          priorOutcome = 'INDETERMINATE_REQUIRES_RECONCILIATION';
+        }
+
+        if (priorOutcome === 'CONFIRMED_COMPLETED_DOWNSTREAM') {
+          await params.store.recordStepStatus(
+            params.sagaId,
+            i,
+            step.stepName,
+            'FORWARD_COMPLETED',
+            fencingToken
+          );
+          stepMap.set(i, { stepIndex: i, stepName: step.stepName, status: 'FORWARD_COMPLETED' });
+          continue;
+        }
+
+        if (priorOutcome === 'INDETERMINATE_REQUIRES_RECONCILIATION') {
+          await params.store.recordStepStatus(
+            params.sagaId,
+            i,
+            step.stepName,
+            'FORWARD_AMBIGUOUS_TIMEOUT',
+            fencingToken
+          );
+          await params.store.updateSagaStatus(params.sagaId, 'RECONCILIATION_REQUIRED', fencingToken);
+          return { finalStatus: 'RECONCILIATION_REQUIRED' };
+        }
+        // priorOutcome === 'CONFIRMED_NEVER_EXECUTED_DOWNSTREAM': safe to proceed with forward execution below
+      }
+
+      await params.store.recordStepStatus(params.sagaId, i, step.stepName, 'FORWARD_STARTED', fencingToken);
       const timeoutMs = step.stepTimeoutMs ?? 10_000;
       const controller = new AbortController();
       const timer = setTimeout(
@@ -207,56 +306,59 @@ export async function runOrResumeDurableSaga<TContext>(params: {
       );
 
       try {
-        await step.executeForward(
-          loaded.context,
-          `${params.sagaId}:step:${i}:${step.stepName}:forward`,
-          controller.signal
-        );
+        await step.executeForward(lease.context, forwardIdempotencyKey, controller.signal);
         clearTimeout(timer);
-        await params.store.recordStepStatus(params.sagaId, i, step.stepName, 'FORWARD_COMPLETED');
+        await params.store.recordStepStatus(params.sagaId, i, step.stepName, 'FORWARD_COMPLETED', fencingToken);
         stepMap.set(i, { stepIndex: i, stepName: step.stepName, status: 'FORWARD_COMPLETED' });
       } catch (err) {
         clearTimeout(timer);
         if (err instanceof SagaAmbiguousStepTimeoutError || (err instanceof Error && 'isAmbiguousTimeout' in err)) {
           // Ambiguous pivot timeout: halt and mark for reconciliation rather than blind compensation/retry
-          await params.store.recordStepStatus(params.sagaId, i, step.stepName, 'FORWARD_AMBIGUOUS_TIMEOUT');
-          await params.store.updateSagaStatus(params.sagaId, 'RECONCILIATION_REQUIRED');
+          await params.store.recordStepStatus(
+            params.sagaId,
+            i,
+            step.stepName,
+            'FORWARD_AMBIGUOUS_TIMEOUT',
+            fencingToken
+          );
+          await params.store.updateSagaStatus(params.sagaId, 'RECONCILIATION_REQUIRED', fencingToken);
           return { finalStatus: 'RECONCILIATION_REQUIRED' };
         }
-        await params.store.recordStepStatus(params.sagaId, i, step.stepName, 'FORWARD_FAILED');
+        await params.store.recordStepStatus(params.sagaId, i, step.stepName, 'FORWARD_FAILED', fencingToken);
         stepMap.set(i, { stepIndex: i, stepName: step.stepName, status: 'FORWARD_FAILED' });
         shouldCompensate = true;
-        await params.store.updateSagaStatus(params.sagaId, 'COMPENSATING_BACKWARD');
+        await params.store.updateSagaStatus(params.sagaId, 'COMPENSATING_BACKWARD', fencingToken);
         break;
       }
     }
   }
 
   if (!shouldCompensate) {
-    await params.store.updateSagaStatus(params.sagaId, 'COMPLETED');
+    await params.store.updateSagaStatus(params.sagaId, 'COMPLETED', fencingToken);
     return { finalStatus: 'COMPLETED' };
   }
 
-  // Phase 2: Backward compensation in reverse order across all durable steps that started/completed forward
+  // Phase 2: Backward compensation in reverse order across all durable steps that completed forward
   let anyCompensationFailed = false;
   for (let i = params.steps.length - 1; i >= 0; i--) {
     const step = params.steps[i];
     const recorded = stepMap.get(i);
     if (!recorded) continue;
     if (recorded.status === 'COMPENSATED') continue;
-    if (
-      recorded.status !== 'FORWARD_COMPLETED' &&
-      recorded.status !== 'FORWARD_STARTED' &&
-      recorded.status !== 'COMPENSATING'
-    ) {
+    if (recorded.status === 'FORWARD_STARTED' || recorded.status === 'FORWARD_AMBIGUOUS_TIMEOUT') {
+      // Never blindly compensate an unconfirmed step without reconciling first
+      anyCompensationFailed = true;
+      continue;
+    }
+    if (recorded.status !== 'FORWARD_COMPLETED' && recorded.status !== 'COMPENSATING') {
       continue;
     }
     if (!step.compensateBackward) {
-      await params.store.recordStepStatus(params.sagaId, i, step.stepName, 'COMPENSATED');
+      await params.store.recordStepStatus(params.sagaId, i, step.stepName, 'COMPENSATED', fencingToken);
       continue;
     }
 
-    await params.store.recordStepStatus(params.sagaId, i, step.stepName, 'COMPENSATING');
+    await params.store.recordStepStatus(params.sagaId, i, step.stepName, 'COMPENSATING', fencingToken);
     let compensated = false;
 
     for (let attempt = 1; attempt <= maxCompAttempts; attempt++) {
@@ -264,12 +366,12 @@ export async function runOrResumeDurableSaga<TContext>(params: {
       const timer = setTimeout(() => controller.abort(), step.stepTimeoutMs ?? 10_000);
       try {
         await step.compensateBackward(
-          loaded.context,
+          lease.context,
           `${params.sagaId}:step:${i}:${step.stepName}:compensate`,
           controller.signal
         );
         clearTimeout(timer);
-        await params.store.recordStepStatus(params.sagaId, i, step.stepName, 'COMPENSATED');
+        await params.store.recordStepStatus(params.sagaId, i, step.stepName, 'COMPENSATED', fencingToken);
         compensated = true;
         break;
       } catch {
@@ -283,7 +385,8 @@ export async function runOrResumeDurableSaga<TContext>(params: {
         params.sagaId,
         i,
         step.stepName,
-        'COMPENSATION_FAILED_INTERVENTION_REQUIRED'
+        'COMPENSATION_FAILED_INTERVENTION_REQUIRED',
+        fencingToken
       );
     }
   }
@@ -291,7 +394,7 @@ export async function runOrResumeDurableSaga<TContext>(params: {
   const finalStatus: DurableSagaStatus = anyCompensationFailed
     ? 'RECONCILIATION_REQUIRED'
     : 'COMPENSATED_ROLLED_BACK';
-  await params.store.updateSagaStatus(params.sagaId, finalStatus);
+  await params.store.updateSagaStatus(params.sagaId, finalStatus, fencingToken);
   return { finalStatus };
 }
 ```
@@ -315,16 +418,19 @@ export async function runOrResumeDurableSaga<TContext>(params: {
 
 ---
 
-## 5. Multi-Tenancy PostgreSQL RLS Architecture, Threat Model & Limitations (`DEVIL-01` Hardened)
+## 5. Multi-Tenancy PostgreSQL RLS Architecture, Cryptographic MAC Verification & Bootstrap Isolation (`DEVIL-01` & `DEVIL-02` Remediated)
 
-### Explicit Threat Model & Limitations of PostgreSQL RLS
-1. **What RLS Protects Against**: Accidental omission of `WHERE tenant_id = $1` in application queries executed by a non-superuser, `NOBYPASSRLS` application database role (`app_runtime`) after `withTenantTransaction()` has verified membership and set the transaction-local context.
-2. **What Naive `current_setting('app.current_tenant_id')` Does NOT Protect Against**:
-   - **SQL Injection Inside `app_runtime`**: In PostgreSQL, any role can call `SELECT set_config('app.current_tenant_id', '<victim_uuid>', true)`. If an application query has a SQL injection vulnerability allowing stacked queries or function calls, an attacker can overwrite `app.current_tenant_id` mid-transaction unless the GUC is paired with a transaction-bound cryptographic MAC (`app.current_tenant_mac`) verified against `txid_current()`!
-   - **Compromised Database Credentials**: Since a shared connection pool uses a single `app_runtime` credential for all tenants, an attacker who steals the `DATABASE_URL` password can connect directly and set any `app.current_tenant_id` unless tenant context activation is gated through a `SECURITY DEFINER` function or per-transaction HMAC.
-   - **Table Owner / `BYPASSRLS` / `SUPERUSER`**: Even with `ENABLE ROW LEVEL SECURITY`, the table owner bypasses RLS unless `FORCE ROW LEVEL SECURITY` is enabled on **every** table, and `SUPERUSER` / `BYPASSRLS` roles always bypass RLS even when `FORCE ROW LEVEL SECURITY` is set!
+### Explicit Threat Model & Cryptographic GUC Binding
+1. **Why Plain `current_setting('app.current_tenant_id')` Is Vulnerable (`DEVIL-01`)**:
+   In PostgreSQL, any role can call `SELECT set_config('app.current_tenant_id', '<victim_uuid>', true)`. If an application query has a SQL injection flaw or an unvalidated helper sets `app.current_tenant_id` without a transaction-bound HMAC, an attacker can switch tenants mid-transaction.
+2. **Database-Side Cryptographic Verification (`security.verify_active_tenant_context` & `security.verify_active_user_context`)**:
+   - A restricted schema `security` owned by `db_migrator` holds the HMAC verification key in a protected table (`security.guc_hmac_keys`) inaccessible to `app_runtime`.
+   - `security.verify_active_tenant_context(target_tenant_id uuid)` and `security.verify_active_user_context(target_user_id uuid)` are `SECURITY DEFINER` functions with `SET search_path = pg_catalog, public` that recompute `encode(hmac(target_id::text || ':' || txid_current()::text, secret_key, 'sha256'), 'hex')` and compare it to `current_setting('app.current_tenant_mac', true)` / `current_setting('app.current_user_mac', true)`.
+   - Every RLS policy on `public.tenant_members` and tenant domain tables (`public.orders`, etc.) calls these verification functions so raw `set_config('app.current_tenant_id', ...)` without a matching `txid_current()`-bound HMAC is rejected fail-closed!
 
 ```sql
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
 -- 1. Dedicated Migration Owner vs. Least-Privilege Runtime Role
 CREATE ROLE db_migrator NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
 CREATE ROLE app_runtime LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
@@ -332,9 +438,99 @@ CREATE ROLE app_runtime LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
 REVOKE ALL ON SCHEMA public FROM PUBLIC;
 GRANT USAGE ON SCHEMA public TO app_runtime;
 
--- 2. Solve the tenant_members Bootstrap Paradox:
--- Allow withTenantTransaction() to read the caller's own membership row during authorization
--- BEFORE app.current_tenant_id is populated!
+-- 2. Restricted Security Schema & Protected HMAC Key Table (Inaccessible to app_runtime)
+CREATE SCHEMA IF NOT EXISTS security AUTHORIZATION db_migrator;
+REVOKE ALL ON SCHEMA security FROM PUBLIC;
+GRANT USAGE ON SCHEMA security TO app_runtime;
+
+CREATE TABLE security.guc_hmac_keys (
+    key_id INT PRIMARY KEY DEFAULT 1 CHECK (key_id = 1),
+    hmac_secret TEXT NOT NULL CHECK (char_length(hmac_secret) >= 32)
+);
+REVOKE ALL ON TABLE security.guc_hmac_keys FROM PUBLIC;
+REVOKE ALL ON TABLE security.guc_hmac_keys FROM app_runtime;
+
+CREATE OR REPLACE FUNCTION security.verify_active_user_context(row_user_id UUID)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  v_user_id TEXT;
+  v_user_mac TEXT;
+  v_secret TEXT;
+  v_expected_mac TEXT;
+BEGIN
+  v_user_id := NULLIF(current_setting('app.current_user_id', true), '');
+  v_user_mac := NULLIF(current_setting('app.current_user_mac', true), '');
+  IF v_user_id IS NULL OR v_user_mac IS NULL OR row_user_id IS NULL THEN
+    RETURN FALSE;
+  END IF;
+  IF v_user_id::uuid <> row_user_id THEN
+    RETURN FALSE;
+  END IF;
+  SELECT hmac_secret INTO v_secret FROM security.guc_hmac_keys WHERE key_id = 1;
+  IF v_secret IS NULL OR char_length(v_secret) < 32 THEN
+    RETURN FALSE;
+  END IF;
+  v_expected_mac := encode(
+    extensions.hmac(
+      convert_to('user:' || v_user_id || ':' || txid_current()::text, 'UTF8'),
+      convert_to(v_secret, 'UTF8'),
+      'sha256'
+    ),
+    'hex'
+  );
+  RETURN v_user_mac = v_expected_mac;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION security.verify_active_tenant_context(row_tenant_id UUID)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  v_tenant_id TEXT;
+  v_tenant_mac TEXT;
+  v_secret TEXT;
+  v_expected_mac TEXT;
+BEGIN
+  v_tenant_id := NULLIF(current_setting('app.current_tenant_id', true), '');
+  v_tenant_mac := NULLIF(current_setting('app.current_tenant_mac', true), '');
+  IF v_tenant_id IS NULL OR v_tenant_mac IS NULL OR row_tenant_id IS NULL THEN
+    RETURN FALSE;
+  END IF;
+  IF v_tenant_id::uuid <> row_tenant_id THEN
+    RETURN FALSE;
+  END IF;
+  SELECT hmac_secret INTO v_secret FROM security.guc_hmac_keys WHERE key_id = 1;
+  IF v_secret IS NULL OR char_length(v_secret) < 32 THEN
+    RETURN FALSE;
+  END IF;
+  v_expected_mac := encode(
+    extensions.hmac(
+      convert_to(v_tenant_id || ':' || txid_current()::text, 'UTF8'),
+      convert_to(v_secret, 'UTF8'),
+      'sha256'
+    ),
+    'hex'
+  );
+  RETURN v_tenant_mac = v_expected_mac;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION security.verify_active_user_context(UUID) TO app_runtime;
+GRANT EXECUTE ON FUNCTION security.verify_active_tenant_context(UUID) TO app_runtime;
+
+-- 3. Solve the tenant_members Bootstrap Paradox Securely (DEVIL-02 Remediation):
+-- During withTenantTransaction() bootstrap, ONLY app.current_user_id + app.current_user_mac are set
+-- while app.current_tenant_id remains empty (''). This policy verifies the cryptographic MAC on
+-- app.current_user_id (for self-membership lookup) OR app.current_tenant_id (after tenant activation).
 ALTER TABLE public.tenant_members ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.tenant_members FORCE ROW LEVEL SECURITY;
 
@@ -342,11 +538,11 @@ CREATE POLICY tenant_members_self_or_active_tenant_policy ON public.tenant_membe
   FOR SELECT
   TO app_runtime
   USING (
-    user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid
-    OR tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid
+    security.verify_active_user_context(user_id)
+    OR security.verify_active_tenant_context(tenant_id)
   );
 
--- 3. Strict Tenant Isolation Policy on Domain Tables (Fail-Closed on NULL/Empty GUC)
+-- 4. Strict Cryptographic Tenant Isolation Policy on Domain Tables (Fail-Closed on Missing/Forged MAC)
 ALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.orders FORCE ROW LEVEL SECURITY;
 
@@ -354,8 +550,8 @@ CREATE POLICY tenant_isolation_policy ON public.orders
   AS RESTRICTIVE
   FOR ALL
   TO app_runtime
-  USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)
-  WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
+  USING (security.verify_active_tenant_context(tenant_id))
+  WITH CHECK (security.verify_active_tenant_context(tenant_id));
 ```
 
 ---

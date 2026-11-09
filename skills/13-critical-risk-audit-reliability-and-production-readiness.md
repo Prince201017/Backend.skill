@@ -49,15 +49,33 @@ export interface VerifiedServerIdentity {
   readonly expiresAtSec: number;
 }
 
+export interface VerifyServerIdentityOptions {
+  readonly nowSec?: number;
+  readonly maxClockSkewSec?: number;
+  readonly maxAssertionLifetimeSec?: number;
+  readonly isSessionRevoked?: (sessionId: string, userId: string) => boolean;
+}
+
 /**
- * Verifies an HMAC-SHA256 signed server session assertion (or OIDC JWT).
- * Rejects missing, malformed, forged, or expired identities before touching the database.
+ * Verifies an HMAC-SHA256 signed server session assertion (`DEVIL-19` Hardened).
+ * Enforces signing secret strength (>= 32 chars), constant-time HMAC verification,
+ * non-empty `userId` and `sessionId`, `issuedAtSec` clock-skew bounds, `expiresAtSec` expiry,
+ * maximum assertion lifetime (`maxAssertionLifetimeSec`, default 3600s), and session revocation checks.
  */
 export function verifyServerIdentityAssertion(
   assertionToken: string | undefined | null,
   signingSecret: string,
-  nowSec = Math.floor(Date.now() / 1000)
+  nowSecOrOptions: number | VerifyServerIdentityOptions = Math.floor(Date.now() / 1000)
 ): VerifiedServerIdentity {
+  if (!signingSecret || typeof signingSecret !== 'string' || signingSecret.trim().length < 32) {
+    throw new Error('AUTH_SIGNING_SECRET_WEAK_OR_MISSING: signingSecret must be at least 32 characters');
+  }
+  const opts: VerifyServerIdentityOptions =
+    typeof nowSecOrOptions === 'number' ? { nowSec: nowSecOrOptions } : nowSecOrOptions;
+  const nowSec = opts.nowSec ?? Math.floor(Date.now() / 1000);
+  const maxClockSkewSec = opts.maxClockSkewSec ?? 60;
+  const maxAssertionLifetimeSec = opts.maxAssertionLifetimeSec ?? 3600;
+
   if (!assertionToken || typeof assertionToken !== 'string') {
     throw new Error('AUTH_IDENTITY_MISSING');
   }
@@ -66,6 +84,9 @@ export function verifyServerIdentityAssertion(
     throw new Error('AUTH_IDENTITY_MALFORMED');
   }
   const [payloadB64, sigB64] = parts;
+  if (!payloadB64 || !sigB64) {
+    throw new Error('AUTH_IDENTITY_MALFORMED');
+  }
   const expectedSig = createHmac('sha256', signingSecret).update(payloadB64, 'utf8').digest();
   let providedSig: Buffer;
   try {
@@ -87,11 +108,37 @@ export function verifyServerIdentityAssertion(
     throw new Error('AUTH_IDENTITY_PAYLOAD_INVALID');
   }
 
-  if (!parsed.userId || typeof parsed.userId !== 'string') {
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error('AUTH_IDENTITY_PAYLOAD_INVALID');
+  }
+  if (!parsed.userId || typeof parsed.userId !== 'string' || parsed.userId.trim().length === 0) {
     throw new Error('AUTH_IDENTITY_USER_MISSING');
   }
-  if (typeof parsed.expiresAtSec !== 'number' || parsed.expiresAtSec <= nowSec) {
+  if (!parsed.sessionId || typeof parsed.sessionId !== 'string' || parsed.sessionId.trim().length === 0) {
+    throw new Error('AUTH_IDENTITY_SESSION_MISSING');
+  }
+  if (
+    typeof parsed.issuedAtSec !== 'number' ||
+    !Number.isFinite(parsed.issuedAtSec) ||
+    parsed.issuedAtSec > nowSec + maxClockSkewSec
+  ) {
+    throw new Error('AUTH_IDENTITY_ISSUED_IN_FUTURE_OR_INVALID');
+  }
+  if (
+    typeof parsed.expiresAtSec !== 'number' ||
+    !Number.isFinite(parsed.expiresAtSec) ||
+    parsed.expiresAtSec <= nowSec - maxClockSkewSec
+  ) {
     throw new Error('AUTH_IDENTITY_EXPIRED');
+  }
+  if (parsed.expiresAtSec < parsed.issuedAtSec) {
+    throw new Error('AUTH_IDENTITY_INVALID_TIME_RANGE');
+  }
+  if (parsed.expiresAtSec - parsed.issuedAtSec > maxAssertionLifetimeSec) {
+    throw new Error('AUTH_IDENTITY_LIFETIME_EXCEEDED');
+  }
+  if (opts.isSessionRevoked && opts.isSessionRevoked(parsed.sessionId, parsed.userId)) {
+    throw new Error('AUTH_IDENTITY_SESSION_REVOKED');
   }
   return parsed;
 }
@@ -110,6 +157,7 @@ export interface DbConnectionPool {
 
 export interface AuthorizedTenantTxContext {
   readonly userId: string;
+  readonly sessionId: string;
   readonly tenantId: string;
   readonly role: TenantRole;
   readonly permissions: readonly TenantPermission[];
@@ -139,13 +187,15 @@ export async function verifyDatabaseRoleRlsEnforcement(client: PooledDbClient): 
 }
 
 /**
- * Remediated withTenantTransaction():
- * 1. Verifies server-side identity first.
+ * Remediated withTenantTransaction() (`DEVIL-01`, `DEVIL-02`, `DEVIL-19` Hardened):
+ * 1. Enforces mandatory `gucHmacSecret` (>= 32 chars) and verifies server-side identity assertion lifecycle.
  * 2. Validates UUID syntax only as an input hygiene filter (never as authorization).
- * 3. Starts transaction (`BEGIN`), clears any stale `app.current_tenant_id`, and queries authoritative membership (`FOR SHARE`).
- * 4. Verifies active tenant status, active membership status, and required permission.
- * 5. Populates `app.current_tenant_id` and `app.current_user_id` (`is_local = true`) ONLY AFTER authorization.
- * 6. Runs all queries on `txClient` and guarantees `COMMIT`/`ROLLBACK` cleanup before pool release.
+ * 3. Starts transaction (`BEGIN`), obtains `txid_current()::text`, clears any stale `app.current_tenant_id` / `app.current_tenant_mac`,
+ *    and sets ONLY `app.current_user_id` + `app.current_user_mac` (`HMAC(gucHmacSecret, "user:" + userId + ":" + txid)`).
+ * 4. Queries authoritative membership (`FOR SHARE OF t, tm`) while `app.current_tenant_id` remains unset (`''`).
+ * 5. Verifies active tenant status, active membership status, and required permission.
+ * 6. Populates `app.current_tenant_id` and `app.current_tenant_mac` (`HMAC(gucHmacSecret, tenantId + ":" + txid)`) ONLY AFTER authorization.
+ * 7. Runs all queries on `txClient` and guarantees `COMMIT`/`ROLLBACK` cleanup before pool release.
  */
 export async function withTenantTransaction<T>(params: {
   pool: DbConnectionPool;
@@ -153,15 +203,25 @@ export async function withTenantTransaction<T>(params: {
   identitySigningSecret: string;
   requestedTenantId: string;
   requiredPermission: TenantPermission;
-  gucHmacSecret?: string;
+  gucHmacSecret: string;
   nowSec?: number;
+  maxAssertionLifetimeSec?: number;
+  isSessionRevoked?: (sessionId: string, userId: string) => boolean;
   work: (txClient: PooledDbClient, authContext: AuthorizedTenantTxContext) => Promise<T>;
 }): Promise<T> {
+  if (!params.gucHmacSecret || typeof params.gucHmacSecret !== 'string' || params.gucHmacSecret.trim().length < 32) {
+    throw new Error('GUC_HMAC_SECRET_MISSING_OR_WEAK: gucHmacSecret (>= 32 chars) is mandatory for tenant transactions');
+  }
+
   // Step 1: Authenticate user from verified server-side identity assertion
   const verifiedIdentity = verifyServerIdentityAssertion(
     params.identityAssertionToken,
     params.identitySigningSecret,
-    params.nowSec
+    {
+      nowSec: params.nowSec,
+      maxAssertionLifetimeSec: params.maxAssertionLifetimeSec,
+      isSessionRevoked: params.isSessionRevoked,
+    }
   );
 
   // Step 2: Input format check (hygiene only — does NOT establish authorization)
@@ -173,13 +233,22 @@ export async function withTenantTransaction<T>(params: {
   try {
     await client.query('BEGIN');
 
-    // Step 3a: Clear any stale tenant context and set ONLY the verified user_id so that
-    // tenant_members FORCE ROW LEVEL SECURITY (user_id = current_setting('app.current_user_id'))
+    // Step 3a (DEVIL-01 & DEVIL-02): Bind context MACs to PostgreSQL's current transaction ID (txid_current()::text)
+    const txidRes = await client.query<{ txid: string }>(`SELECT txid_current()::text AS txid`);
+    const currentTxId = txidRes.rows[0]?.txid ?? '0';
+    const userGucMac = createHmac('sha256', params.gucHmacSecret)
+      .update(`user:${verifiedIdentity.userId}:${currentTxId}`, 'utf8')
+      .digest('hex');
+
+    // Clear any stale tenant context and set ONLY the verified user_id + user_mac so that
+    // tenant_members FORCE ROW LEVEL SECURITY (security.verify_active_user_context(user_id))
     // permits reading this user's membership row BEFORE app.current_tenant_id is populated!
     await client.query(`SELECT set_config('app.current_tenant_id', '', true)`);
+    await client.query(`SELECT set_config('app.current_tenant_mac', '', true)`);
     await client.query(`SELECT set_config('app.current_user_id', $1, true)`, [
       verifiedIdentity.userId,
     ]);
+    await client.query(`SELECT set_config('app.current_user_mac', $1, true)`, [userGucMac]);
 
     // Step 3b: Query authoritative tenant + membership status inside the transaction (FOR SHARE lock)
     // CRITICAL: app.current_tenant_id is still empty ('') here!
@@ -221,20 +290,18 @@ export async function withTenantTransaction<T>(params: {
       );
     }
 
-    // Step 4: Establish transaction-local RLS tenant context ONLY AFTER authorization succeeds
+    // Step 4: Establish transaction-local RLS tenant context + cryptographic MAC ONLY AFTER authorization succeeds
+    const tenantGucMac = createHmac('sha256', params.gucHmacSecret)
+      .update(`${row.tenant_id}:${currentTxId}`, 'utf8')
+      .digest('hex');
     await client.query(`SELECT set_config('app.current_tenant_id', $1, true)`, [
       row.tenant_id,
     ]);
-
-    if (params.gucHmacSecret && params.gucHmacSecret.length >= 32) {
-      const gucMac = createHmac('sha256', params.gucHmacSecret)
-        .update(`${row.tenant_id}:${verifiedIdentity.userId}`, 'utf8')
-        .digest('hex');
-      await client.query(`SELECT set_config('app.current_tenant_mac', $1, true)`, [gucMac]);
-    }
+    await client.query(`SELECT set_config('app.current_tenant_mac', $1, true)`, [tenantGucMac]);
 
     const authContext: AuthorizedTenantTxContext = {
       userId: verifiedIdentity.userId,
+      sessionId: verifiedIdentity.sessionId,
       tenantId: row.tenant_id,
       role: row.role,
       permissions: grantedPermissions,
