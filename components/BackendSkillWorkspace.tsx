@@ -348,6 +348,29 @@ public async initiateGracefulShutdown(params): Promise<void> {
   await params.closeDatabasePools();
 }`,
   },
+  {
+    id: 'CRIT-13',
+    domain: '13. PostgreSQL 16 Ledger Invariants, Deferred Commit Triggers, Forced RLS & Canonical Roles',
+    consequence: 'Cross-tenant account postings, unbalanced journals, post-finalization mutations, forged GUC context, or role drift',
+    severity: 'CRITICAL',
+    moduleRef: 'Module 01 & 07 (ARGON-LEDGER-001..005, ARGON-ROLE-004)',
+    vulnerabilityFound:
+      'Single-column account FKs allow cross-tenant postings; statement-time triggers fail multi-statement journal entry; missing FORCE RLS or unverified app.current_user_id allows context spoofing; conflicting role attributes allow privilege drift.',
+    remediationImplemented:
+      'Enforced composite FKs (tenant_id, account_id, currency_code), DEFERRABLE INITIALLY DEFERRED commit triggers for OLD/NEW journal balance & FINALIZED lifecycle locking, txid_current()-bound HMAC verification for both tenant and user GUCs under FORCE ROW LEVEL SECURITY, rational FX conversion settlements, and fail-closed canonical role invariants (db_migrator, app_runtime, app_login).',
+    verificationAssertion:
+      'PASS: Verified against real PostgreSQL engine in VERIFY-01 & VERIFY-22..25 (0 skipped, 10 migration scenarios, concurrent overdraft contention).',
+    remediationCode: `-- Module 01 & 07: Deferred Commit Balance Trigger + Cryptographic Tenant & User RLS
+CREATE CONSTRAINT TRIGGER trg_verify_posting_journal_balanced_commit
+AFTER INSERT OR UPDATE OR DELETE ON public.journal_postings
+DEFERRABLE INITIALLY DEFERRED FOR EACH ROW
+EXECUTE FUNCTION public.verify_posting_parent_journal_balanced_at_commit();
+
+CREATE POLICY ledger_accounts_tenant_isolation_restrictive ON public.ledger_accounts
+  AS RESTRICTIVE FOR ALL TO PUBLIC
+  USING (security.verify_active_tenant_context(tenant_id))
+  WITH CHECK (security.verify_active_tenant_context(tenant_id));`,
+  },
 ];
 
 const SCENARIOS: TraceScenario[] = [

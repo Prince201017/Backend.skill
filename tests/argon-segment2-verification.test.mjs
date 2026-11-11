@@ -3029,5 +3029,324 @@ test('VERIFY-24: Chunk 3 Independent Red-Team Adversarial Matrix (ARGON-LEDGER-0
   }
 });
 
+// ============================================================================
+// VERIFY-25: CONCURRENT MULTI-TRANSACTION POSTGRESQL CONTENTION, OVERDRAFT RACE,
+// IDEMPOTENCY REPLAY RACE & INTERLEAVED MULTI-TENANT POOL ISOLATION
+// ============================================================================
+test('VERIFY-25: Concurrent PostgreSQL Transaction Contention — Overdraft Prevention, Idempotency Replay Race & Interleaved Multi-Tenant Pool Isolation', async () => {
+  const { PGlite } = await import('@electric-sql/pglite');
+  const { pgcrypto } = await import('@electric-sql/pglite/contrib/pgcrypto');
+
+  const mod01Content = fs.readFileSync(
+    path.join(ROOT, 'skills/01-domain-modeling-fields-timestamps-ids.md'),
+    'utf8'
+  );
+  const mod07Content = fs.readFileSync(
+    path.join(ROOT, 'skills/07-events-realtime-sagas-migrations-sql-multitenancy-search.md'),
+    'utf8'
+  );
+  const authoritativeDdlSql = mod15.extractFencedCodeBlocksDetailed(mod01Content, {
+    allowedLanguages: new Set(['sql']),
+  }).blocks[0].code;
+  const mod07RlsSql = mod15
+    .extractFencedCodeBlocksDetailed(mod07Content, {
+      allowedLanguages: new Set(['sql']),
+    })
+    .blocks.find((b) => b.code.includes('security.verify_active_tenant_context')).code;
+
+  const db = new PGlite({ extensions: { pgcrypto } });
+  try {
+    await db.exec(authoritativeDdlSql);
+    await db.exec(mod07RlsSql);
+
+    const gucHmacSecret = 'verify25-concurrent-guc-hmac-secret-32-bytes-minimum!!';
+    const identitySecret = 'verify25-concurrent-identity-secret-32-bytes-minimum!!';
+
+    await db.query(
+      `INSERT INTO security.guc_hmac_keys (key_id, hmac_secret)
+       VALUES (1, $1)
+       ON CONFLICT (key_id) DO UPDATE SET hmac_secret = EXCLUDED.hmac_secret`,
+      [gucHmacSecret]
+    );
+
+    const tenantA = '0195f8a0-0000-7000-8000-00000000ca01';
+    const tenantB = '0195f8a0-0000-7000-8000-00000000cb02';
+    const userA = '0195f8a0-0000-7000-8000-00000000ca99';
+    const userB = '0195f8a0-0000-7000-8000-00000000cb99';
+
+    const acctAAssetWallet = '0195f8a0-0000-7000-8000-00000000ca11';
+    const acctAClearing = '0195f8a0-0000-7000-8000-00000000ca12';
+    const acctBAssetWallet = '0195f8a0-0000-7000-8000-00000000cb11';
+    const acctBClearing = '0195f8a0-0000-7000-8000-00000000cb12';
+
+    // Seed tenants & memberships for Module 13 withTenantTransaction
+    await db.query(
+      `INSERT INTO public.tenants (id, name, status) VALUES ($1, 'Tenant A Corp', 'ACTIVE'), ($2, 'Tenant B Corp', 'ACTIVE')`,
+      [tenantA, tenantB]
+    );
+    await db.query(
+      `INSERT INTO public.tenant_members (tenant_id, user_id, role, status)
+       VALUES ($1, $2, 'OWNER', 'ACTIVE'), ($3, $4, 'OWNER', 'ACTIVE')`,
+      [tenantA, userA, tenantB, userB]
+    );
+
+    // Seed ledger accounts:
+    // acctAAssetWallet has balance_minor = 10000 ($100.00), normal_balance = 'DEBIT', allow_negative_balance = FALSE
+    await db.query(
+      `INSERT INTO public.ledger_accounts (account_id, tenant_id, currency_code, status, normal_balance, balance_minor, allow_negative_balance)
+       VALUES
+         ($1, $2, 'USD', 'ACTIVE', 'DEBIT', 10000, FALSE),
+         ($3, $2, 'USD', 'ACTIVE', 'DEBIT', 50000, FALSE),
+         ($4, $5, 'USD', 'ACTIVE', 'DEBIT', 20000, FALSE),
+         ($6, $5, 'USD', 'ACTIVE', 'DEBIT', 50000, FALSE)`,
+      [acctAAssetWallet, tenantA, acctAClearing, acctBAssetWallet, tenantB, acctBClearing]
+    );
+
+    // Build a real PostgreSQL LedgerTransactionPort backed by db.transaction() under app_login + cryptographic RLS
+    const createPgLedgerPort = (activeTenantId, activeUserId) => ({
+      async runInTransaction(fn) {
+        return db.transaction(async (tx) => {
+          await tx.exec('SET LOCAL ROLE app_login;');
+          const txidRes = await tx.query('SELECT txid_current()::text AS txid');
+          const txid = txidRes.rows[0].txid;
+          const tenantMac = crypto
+            .createHmac('sha256', Buffer.from(gucHmacSecret, 'utf8'))
+            .update(`${activeTenantId}:${txid}`)
+            .digest('hex');
+          const userMac = crypto
+            .createHmac('sha256', Buffer.from(gucHmacSecret, 'utf8'))
+            .update(`user:${activeUserId}:${txid}`)
+            .digest('hex');
+
+          await tx.query(`SELECT set_config('app.current_tenant_id', $1, true)`, [activeTenantId]);
+          await tx.query(`SELECT set_config('app.current_tenant_mac', $1, true)`, [tenantMac]);
+          await tx.query(`SELECT set_config('app.current_user_id', $1, true)`, [activeUserId]);
+          await tx.query(`SELECT set_config('app.current_user_mac', $1, true)`, [userMac]);
+
+          return fn({
+            async findJournalByIdempotencyKey(tId, idemKey) {
+              const res = await tx.query(
+                `SELECT journal_id, total_debit_minor, currency_code, request_hash
+                 FROM public.journal_entries
+                 WHERE tenant_id = $1 AND idempotency_key = $2`,
+                [tId, idemKey]
+              );
+              if (res.rows.length === 0) return null;
+              const r = res.rows[0];
+              return {
+                journalId: r.journal_id,
+                totalDebitMinor: BigInt(r.total_debit_minor),
+                currencyCode: r.currency_code.trim(),
+                requestHash: r.request_hash.trim(),
+              };
+            },
+            async lockAccountsSortedForUpdate(sortedAccountIds) {
+              const res = await tx.query(
+                `SELECT account_id, tenant_id, currency_code, status, normal_balance, balance_minor, version, allow_negative_balance
+                 FROM public.ledger_accounts
+                 WHERE account_id = ANY($1::uuid[])
+                 ORDER BY account_id ASC
+                 FOR UPDATE`,
+                [sortedAccountIds]
+              );
+              return res.rows.map((r) => ({
+                accountId: r.account_id,
+                tenantId: r.tenant_id,
+                currencyCode: r.currency_code.trim(),
+                status: r.status,
+                normalBalance: r.normal_balance,
+                balanceMinor: BigInt(r.balance_minor),
+                version: Number(r.version),
+                allowNegativeBalance: Boolean(r.allow_negative_balance),
+              }));
+            },
+            async insertJournalAndUpdateBalances(data) {
+              await tx.query(
+                `INSERT INTO public.journal_entries (
+                   journal_id, tenant_id, idempotency_key, request_hash, currency_code, total_debit_minor, total_credit_minor
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $6)`,
+                [
+                  data.journalId,
+                  data.tenantId,
+                  data.idempotencyKey,
+                  data.requestHash,
+                  data.currencyCode,
+                  data.totalDebitMinor.toString(),
+                ]
+              );
+
+              for (const line of data.postings) {
+                await tx.query(
+                  `INSERT INTO public.journal_postings (
+                     journal_id, tenant_id, account_id, direction, amount_minor, currency_code
+                   ) VALUES ($1, $2, $3, $4, $5, $6)`,
+                  [
+                    data.journalId,
+                    data.tenantId,
+                    line.accountId,
+                    line.direction,
+                    line.amountMinor.toString(),
+                    line.currencyCode,
+                  ]
+                );
+              }
+
+              let updatedAccountCount = 0;
+              for (const [accId, nextBal] of data.updatedBalances.entries()) {
+                const expectedVer = data.expectedAccountVersions.get(accId);
+                const upd = await tx.query(
+                  `UPDATE public.ledger_accounts
+                   SET balance_minor = $1, version = version + 1
+                   WHERE tenant_id = $2 AND account_id = $3 AND version = $4
+                   RETURNING account_id`,
+                  [nextBal.toString(), data.tenantId, accId, expectedVer]
+                );
+                updatedAccountCount += upd.rows.length;
+              }
+              return { updatedAccountCount };
+            },
+          });
+        });
+      },
+    });
+
+    // ------------------------------------------------------------------------
+    // 1. CONCURRENT OVERDRAFT CONTENTION TEST (5 racing payouts of 6,000 against 10,000 balance)
+    // ------------------------------------------------------------------------
+    const portA = createPgLedgerPort(tenantA, userA);
+    const overdraftRacePromises = Array.from({ length: 5 }, (_, idx) =>
+      mod01.persistBalancedJournalAtomically({
+        journalId: `0195f8a0-0000-7000-8000-00000000cd0${idx + 1}`,
+        tenantId: tenantA,
+        idempotencyKey: `idem-concurrent-overdraft-00${idx + 1}`,
+        postings: [
+          // Credit asset wallet by 6000 (reduces DEBIT-normal asset balance by 6000)
+          { accountId: acctAAssetWallet, direction: 'CREDIT', amountMinor: 6000n, currencyCode: 'USD' },
+          // Debit clearing account by 6000 (increases DEBIT-normal clearing balance by 6000)
+          { accountId: acctAClearing, direction: 'DEBIT', amountMinor: 6000n, currencyCode: 'USD' },
+        ],
+        ledgerPort: portA,
+      })
+    );
+
+    const overdraftOutcomes = await Promise.allSettled(overdraftRacePromises);
+    const succeededOverdraft = overdraftOutcomes.filter((o) => o.status === 'fulfilled');
+    const rejectedOverdraft = overdraftOutcomes.filter((o) => o.status === 'rejected');
+
+    assert.equal(succeededOverdraft.length, 1, 'Exactly 1 of 5 concurrent 6000 payouts from 10000 wallet must succeed');
+    assert.equal(rejectedOverdraft.length, 4, 'Remaining 4 concurrent payouts must fail with LEDGER_INSUFFICIENT_FUNDS');
+    for (const rej of rejectedOverdraft) {
+      assert.match(String(rej.reason?.message ?? rej.reason), /LEDGER_INSUFFICIENT_FUNDS/);
+    }
+
+    const walletAfterRace = await db.query(
+      `SELECT balance_minor, version FROM public.ledger_accounts WHERE account_id = $1`,
+      [acctAAssetWallet]
+    );
+    assert.equal(BigInt(walletAfterRace.rows[0].balance_minor), 4000n, 'Asset wallet balance must be exactly 4000n');
+    assert.equal(Number(walletAfterRace.rows[0].version), 1, 'Asset wallet version must be incremented exactly once');
+
+    // ------------------------------------------------------------------------
+    // 2. CONCURRENT IDEMPOTENCY REPLAY & PAYLOAD CONFLICT RACE
+    // ------------------------------------------------------------------------
+    const sharedIdemKey = 'idem-concurrent-replay-shared-001';
+    const replayRacePromises = Array.from({ length: 5 }, (_, idx) =>
+      mod01.persistBalancedJournalAtomically({
+        journalId: `0195f8a0-0000-7000-8000-00000000ce0${idx + 1}`,
+        tenantId: tenantA,
+        idempotencyKey: sharedIdemKey,
+        postings: [
+          { accountId: acctAAssetWallet, direction: 'CREDIT', amountMinor: 2500n, currencyCode: 'USD' },
+          { accountId: acctAClearing, direction: 'DEBIT', amountMinor: 2500n, currencyCode: 'USD' },
+        ],
+        ledgerPort: portA,
+      })
+    );
+
+    const replayResults = await Promise.all(replayRacePromises);
+    const freshWrites = replayResults.filter((r) => r.replayedIdempotent === false);
+    const replayedWrites = replayResults.filter((r) => r.replayedIdempotent === true);
+    assert.equal(freshWrites.length, 1, 'Exactly 1 concurrent identical idempotency request performs the initial write');
+    assert.equal(replayedWrites.length, 4, 'Remaining 4 concurrent identical requests return idempotent replay');
+
+    const walletAfterReplay = await db.query(
+      `SELECT balance_minor, version FROM public.ledger_accounts WHERE account_id = $1`,
+      [acctAAssetWallet]
+    );
+    assert.equal(BigInt(walletAfterReplay.rows[0].balance_minor), 1500n, '4000n - 2500n = 1500n (debited only once)');
+    assert.equal(Number(walletAfterReplay.rows[0].version), 2);
+
+    // Reusing sharedIdemKey with a mutated amount (1000n instead of 2500n) must reject with LEDGER_IDEMPOTENCY_PAYLOAD_MISMATCH
+    await assert.rejects(
+      () =>
+        mod01.persistBalancedJournalAtomically({
+          journalId: '0195f8a0-0000-7000-8000-00000000ce99',
+          tenantId: tenantA,
+          idempotencyKey: sharedIdemKey,
+          postings: [
+            { accountId: acctAAssetWallet, direction: 'CREDIT', amountMinor: 1000n, currencyCode: 'USD' },
+            { accountId: acctAClearing, direction: 'DEBIT', amountMinor: 1000n, currencyCode: 'USD' },
+          ],
+          ledgerPort: portA,
+        }),
+      /LEDGER_IDEMPOTENCY_PAYLOAD_MISMATCH/
+    );
+
+    // ------------------------------------------------------------------------
+    // 3. CONCURRENT INTERLEAVED MULTI-TENANT TRANSACTIONS OVER SHARED POOL
+    // ------------------------------------------------------------------------
+    const portB = createPgLedgerPort(tenantB, userB);
+    const interleavedResults = await Promise.all(
+      Array.from({ length: 6 }, (_, i) => {
+        const isTenantA = i % 2 === 0;
+        return mod01.persistBalancedJournalAtomically({
+          journalId: `0195f8a0-0000-7000-8000-00000000cf0${i + 1}`,
+          tenantId: isTenantA ? tenantA : tenantB,
+          idempotencyKey: `idem-interleaved-mt-00${i + 1}`,
+          postings: [
+            {
+              accountId: isTenantA ? acctAAssetWallet : acctBAssetWallet,
+              direction: 'CREDIT',
+              amountMinor: 200n,
+              currencyCode: 'USD',
+            },
+            {
+              accountId: isTenantA ? acctAClearing : acctBClearing,
+              direction: 'DEBIT',
+              amountMinor: 200n,
+              currencyCode: 'USD',
+            },
+          ],
+          ledgerPort: isTenantA ? portA : portB,
+        });
+      })
+    );
+    assert.equal(interleavedResults.length, 6);
+
+    const finalBalances = await db.query(
+      `SELECT account_id, tenant_id, balance_minor, version
+       FROM public.ledger_accounts
+       WHERE account_id IN ($1, $2)
+       ORDER BY account_id`,
+      [acctAAssetWallet, acctBAssetWallet]
+    );
+    // Tenant A wallet: 1500n - (3 * 200n) = 900n, version = 2 + 3 = 5
+    // Tenant B wallet: 20000n - (3 * 200n) = 19400n, version = 0 + 3 = 3
+    assert.equal(BigInt(finalBalances.rows[0].balance_minor), 900n);
+    assert.equal(Number(finalBalances.rows[0].version), 5);
+    assert.equal(BigInt(finalBalances.rows[1].balance_minor), 19400n);
+    assert.equal(Number(finalBalances.rows[1].version), 3);
+
+    // Verify all committed journals across both tenants have lifecycle_status = 'FINALIZED'
+    const unfinalizedCount = await db.query(
+      `SELECT COUNT(*)::int AS cnt FROM public.journal_entries WHERE lifecycle_status <> 'FINALIZED'`
+    );
+    assert.equal(unfinalizedCount.rows[0].cnt, 0, 'Every committed journal must have lifecycle_status = FINALIZED');
+  } finally {
+    await db.close();
+  }
+});
+
+
 
 

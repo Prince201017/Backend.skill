@@ -1,0 +1,60 @@
+name: PostgreSQL 16 & Backend.skill Adversarial Verification
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify-postgres16-and-modules:
+    name: PostgreSQL 16 + Node 22 Adversarial Verification
+    runs-on: ubuntu-latest
+
+    services:
+      postgres16:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres_ci_verification_password
+          POSTGRES_DB: backend_skill_verify
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d backend_skill_verify"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+
+    env:
+      DATABASE_URL: postgresql://postgres:postgres_ci_verification_password@localhost:5432/backend_skill_verify
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies (supply-chain hardened)
+        run: npm ci --ignore-scripts
+
+      - name: Verify PostgreSQL 16 service connectivity & pgcrypto extension
+        run: |
+          PGPASSWORD=postgres_ci_verification_password psql -h localhost -U postgres -d backend_skill_verify -c "SELECT version();"
+          PGPASSWORD=postgres_ci_verification_password psql -h localhost -U postgres -d backend_skill_verify -c "CREATE EXTENSION IF NOT EXISTS pgcrypto;"
+
+      - name: Run full ARGON adversarial verification suite (VERIFY-01 through VERIFY-25)
+        run: npm test
+
+      - name: TypeScript & ESLint verification
+        run: npm run lint
+
+      - name: Production Next.js build verification
+        run: npm run build
