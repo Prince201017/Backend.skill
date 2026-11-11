@@ -1060,22 +1060,225 @@ export async function persistBalancedJournalAtomically(params: {
 }
 ```
 
-### C. Authoritative Database-Level Ledger Immutability, Privilege Lockdown & Deferred Balance Trigger (`DEVIL-11`)
-TypeScript validation alone does not protect the database if a bug or raw SQL query attempts to `UPDATE`/`DELETE` ledger rows or insert an unbalanced journal. Enforce append-only immutability, least-privilege grants, and deferred transaction-commit balance verification inside PostgreSQL:
+### C. Authoritative Database-Level Ledger Schema, Lifecycle, RLS & Canonical Role Architecture (`ARGON-LEDGER-001`, `ARGON-LEDGER-002`, `ARGON-LEDGER-003`, `ARGON-ROLE-004`)
+Application validation alone cannot protect financial integrity if a bug, migration, or direct SQL statement attempts to post a journal line to an account owned by another tenant (`ARGON-LEDGER-001`), modify/delete postings on a finalized journal or move postings between journals (`ARGON-LEDGER-002`), read/write cross-tenant ledger accounts without cryptographic RLS MAC enforcement (`ARGON-LEDGER-003`), or use unsegregated database roles (`ARGON-ROLE-004`).
+
+Enforce composite tenant-account-currency referential integrity, explicit journal lifecycle states (`POSTING` -> `FINALIZED`), OLD/NEW deferred commit-time posting triggers across `INSERT`, `UPDATE`, and `DELETE`, append-only finalized immutability, tenant-scoped Row Level Security (`FORCE ROW LEVEL SECURITY`), and a canonical least-privilege 3-role architecture (`db_migrator`, `app_runtime`, `app_login`):
 
 ```sql
 SET lock_timeout = '3s';
 SET statement_timeout = '10s';
 
--- 0. Idempotent Role & Ledger Base Schema (Installs cleanly on an empty PostgreSQL 16 database)
+-- ============================================================================
+-- 0. CANONICAL DATABASE ROLE ARCHITECTURE (ARGON-ROLE-004)
+-- Separation of schema migration owner (db_migrator), privilege group (app_runtime),
+-- and authentication connection role (app_login). Fails safely on incompatible configs.
+-- ============================================================================
 DO $$
 BEGIN
+  -- 1. Schema migration owner role: NOLOGIN, owns tables and security definer functions
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'db_migrator') THEN
+    CREATE ROLE db_migrator NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+  ELSE
+    IF EXISTS (
+      SELECT 1 FROM pg_roles
+      WHERE rolname = 'db_migrator'
+        AND (rolsuper OR rolbypassrls OR rolcreatedb OR rolcreaterole OR rolcanlogin)
+    ) THEN
+      RAISE EXCEPTION 'ROLE_SECURITY_INVARIANT_VIOLATION: db_migrator has conflicting attributes (must be NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS)'
+        USING ERRCODE = '28000';
+    END IF;
+  END IF;
+
+  -- 2. Privilege-group role: NOLOGIN, holds explicit SELECT/INSERT/UPDATE grants, NOBYPASSRLS
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_runtime') THEN
     CREATE ROLE app_runtime NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+  ELSE
+    IF EXISTS (
+      SELECT 1 FROM pg_roles
+      WHERE rolname = 'app_runtime'
+        AND (rolsuper OR rolbypassrls OR rolcreatedb OR rolcreaterole OR rolcanlogin)
+    ) OR pg_has_role('app_runtime', 'db_migrator', 'MEMBER') THEN
+      RAISE EXCEPTION 'ROLE_SECURITY_INVARIANT_VIOLATION: app_runtime has conflicting attributes or inherits db_migrator'
+        USING ERRCODE = '28000';
+    END IF;
+  END IF;
+
+  -- 3. Application connection role: LOGIN role inheriting app_runtime, NOBYPASSRLS
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_login') THEN
+    CREATE ROLE app_login LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS IN ROLE app_runtime;
+  ELSE
+    IF EXISTS (
+      SELECT 1 FROM pg_roles
+      WHERE rolname = 'app_login'
+        AND (rolsuper OR rolbypassrls OR rolcreatedb OR rolcreaterole OR NOT rolcanlogin)
+    ) OR pg_has_role('app_login', 'db_migrator', 'MEMBER') THEN
+      RAISE EXCEPTION 'ROLE_SECURITY_INVARIANT_VIOLATION: app_login has conflicting attributes or inherits db_migrator'
+        USING ERRCODE = '28000';
+    END IF;
+    IF NOT pg_has_role('app_login', 'app_runtime', 'MEMBER') THEN
+      GRANT app_runtime TO app_login;
+    END IF;
   END IF;
 END
 $$;
 
+-- Create cryptographic extension schema
+CREATE SCHEMA IF NOT EXISTS extensions;
+CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA extensions;
+GRANT USAGE ON SCHEMA public TO db_migrator, app_runtime;
+GRANT USAGE ON SCHEMA extensions TO db_migrator, app_runtime;
+
+-- Create restricted security schema for HMAC verification keys
+CREATE SCHEMA IF NOT EXISTS security AUTHORIZATION db_migrator;
+REVOKE ALL ON SCHEMA security FROM PUBLIC;
+GRANT USAGE ON SCHEMA security TO db_migrator, app_runtime;
+
+CREATE TABLE IF NOT EXISTS security.guc_hmac_keys (
+  key_id INT PRIMARY KEY DEFAULT 1 CHECK (key_id = 1),
+  hmac_secret TEXT NOT NULL CHECK (char_length(hmac_secret) >= 32)
+);
+ALTER TABLE security.guc_hmac_keys OWNER TO db_migrator;
+REVOKE ALL ON TABLE security.guc_hmac_keys FROM PUBLIC, app_runtime, app_login;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE security.guc_hmac_keys TO db_migrator;
+
+-- Cryptographic GUC user & tenant verifiers (ARGON-LEDGER-003)
+CREATE OR REPLACE FUNCTION security.constant_time_hex_equal_32(expected_hex TEXT, actual_hex TEXT)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+IMMUTABLE
+PARALLEL SAFE
+SET search_path = pg_catalog
+AS $$
+DECLARE
+  v_expected BYTEA;
+  v_actual BYTEA;
+  v_diff INT := 0;
+  v_i INT;
+BEGIN
+  IF expected_hex IS NULL OR actual_hex IS NULL THEN
+    RETURN FALSE;
+  END IF;
+  IF pg_catalog.char_length(expected_hex) <> 64 OR pg_catalog.char_length(actual_hex) <> 64 THEN
+    RETURN FALSE;
+  END IF;
+  IF expected_hex !~ '^[0-9a-fA-F]{64}$' OR actual_hex !~ '^[0-9a-fA-F]{64}$' THEN
+    RETURN FALSE;
+  END IF;
+  v_expected := pg_catalog.decode(expected_hex, 'hex');
+  v_actual := pg_catalog.decode(actual_hex, 'hex');
+  IF pg_catalog.octet_length(v_expected) <> 32 OR pg_catalog.octet_length(v_actual) <> 32 THEN
+    RETURN FALSE;
+  END IF;
+  FOR v_i IN 0..31 LOOP
+    v_diff := v_diff | (pg_catalog.get_byte(v_expected, v_i) # pg_catalog.get_byte(v_actual, v_i));
+  END LOOP;
+  RETURN v_diff = 0;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION security.verify_active_user_context(row_user_id UUID)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  v_user_id TEXT;
+  v_user_mac TEXT;
+  v_secret TEXT;
+  v_expected_mac TEXT;
+BEGIN
+  v_user_id := NULLIF(current_setting('app.current_user_id', true), '');
+  v_user_mac := NULLIF(current_setting('app.current_user_mac', true), '');
+  IF v_user_id IS NULL OR v_user_mac IS NULL OR row_user_id IS NULL THEN
+    RETURN FALSE;
+  END IF;
+  IF v_user_id::uuid <> row_user_id THEN
+    RETURN FALSE;
+  END IF;
+  SELECT hmac_secret INTO v_secret FROM security.guc_hmac_keys WHERE key_id = 1;
+  IF v_secret IS NULL OR char_length(v_secret) < 32 THEN
+    RETURN FALSE;
+  END IF;
+  v_expected_mac := encode(
+    extensions.hmac(
+      convert_to('user:' || v_user_id || ':' || txid_current()::text, 'UTF8'),
+      convert_to(v_secret, 'UTF8'),
+      'sha256'
+    ),
+    'hex'
+  );
+  RETURN security.constant_time_hex_equal_32(v_expected_mac, v_user_mac);
+EXCEPTION
+  WHEN OTHERS THEN
+    RETURN FALSE;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION security.verify_active_tenant_context(row_tenant_id UUID)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  v_tenant_id TEXT;
+  v_tenant_mac TEXT;
+  v_user_id TEXT;
+  v_secret TEXT;
+  v_expected_mac TEXT;
+BEGIN
+  v_tenant_id := NULLIF(current_setting('app.current_tenant_id', true), '');
+  v_tenant_mac := NULLIF(current_setting('app.current_tenant_mac', true), '');
+  IF v_tenant_id IS NULL OR v_tenant_mac IS NULL OR row_tenant_id IS NULL THEN
+    RETURN FALSE;
+  END IF;
+  IF v_tenant_id::uuid <> row_tenant_id THEN
+    RETURN FALSE;
+  END IF;
+  -- If app.current_user_id is present in the session/transaction, verify its cryptographic MAC too (fail-closed on forged user GUC)
+  v_user_id := NULLIF(current_setting('app.current_user_id', true), '');
+  IF v_user_id IS NOT NULL THEN
+    IF NOT security.verify_active_user_context(v_user_id::uuid) THEN
+      RETURN FALSE;
+    END IF;
+  END IF;
+  SELECT hmac_secret INTO v_secret FROM security.guc_hmac_keys WHERE key_id = 1;
+  IF v_secret IS NULL OR char_length(v_secret) < 32 THEN
+    RETURN FALSE;
+  END IF;
+  v_expected_mac := encode(
+    extensions.hmac(
+      convert_to(v_tenant_id || ':' || txid_current()::text, 'UTF8'),
+      convert_to(v_secret, 'UTF8'),
+      'sha256'
+    ),
+    'hex'
+  );
+  RETURN security.constant_time_hex_equal_32(v_expected_mac, v_tenant_mac);
+EXCEPTION
+  WHEN OTHERS THEN
+    RETURN FALSE;
+END;
+$$;
+
+ALTER FUNCTION security.constant_time_hex_equal_32(TEXT, TEXT) OWNER TO db_migrator;
+ALTER FUNCTION security.verify_active_user_context(UUID) OWNER TO db_migrator;
+ALTER FUNCTION security.verify_active_tenant_context(UUID) OWNER TO db_migrator;
+
+REVOKE ALL ON FUNCTION security.constant_time_hex_equal_32(TEXT, TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION security.verify_active_user_context(UUID) FROM PUBLIC;
+REVOKE ALL ON FUNCTION security.verify_active_tenant_context(UUID) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION security.constant_time_hex_equal_32(TEXT, TEXT) TO db_migrator;
+GRANT EXECUTE ON FUNCTION security.verify_active_user_context(UUID) TO app_runtime, db_migrator;
+GRANT EXECUTE ON FUNCTION security.verify_active_tenant_context(UUID) TO app_runtime, db_migrator;
+
+-- ============================================================================
+-- 1. BASE LEDGER SCHEMAS WITH LIFECYCLE & RATIONAL FX SETTLEMENTS (ARGON-LEDGER-001, 002, 005)
+-- ============================================================================
 CREATE TABLE IF NOT EXISTS public.ledger_accounts (
   account_id UUID PRIMARY KEY,
   tenant_id UUID NOT NULL,
@@ -1086,7 +1289,19 @@ CREATE TABLE IF NOT EXISTS public.ledger_accounts (
   version INT NOT NULL DEFAULT 0 CHECK (version >= 0),
   allow_negative_balance BOOLEAN NOT NULL DEFAULT FALSE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-  CONSTRAINT chk_ledger_non_negative_balance CHECK (allow_negative_balance OR balance_minor >= 0)
+  CONSTRAINT chk_ledger_accounts_supported_currency CHECK (
+    currency_code IN (
+      'JPY', 'KRW', 'VND', 'CLP', 'ISK',
+      'USD', 'EUR', 'GBP', 'INR', 'CAD', 'AUD', 'SGD', 'CHF',
+      'BHD', 'KWD', 'OMR', 'JOD', 'TND'
+    )
+  ),
+  CONSTRAINT chk_ledger_accounts_safe_bigint CHECK (
+    balance_minor >= -900000000000000 AND balance_minor <= 900000000000000
+  ),
+  CONSTRAINT chk_ledger_non_negative_balance CHECK (allow_negative_balance OR balance_minor >= 0),
+  CONSTRAINT uq_ledger_accounts_tenant_account UNIQUE (tenant_id, account_id),
+  CONSTRAINT uq_ledger_accounts_tenant_account_currency UNIQUE (tenant_id, account_id, currency_code)
 );
 
 CREATE TABLE IF NOT EXISTS public.journal_entries (
@@ -1095,71 +1310,560 @@ CREATE TABLE IF NOT EXISTS public.journal_entries (
   idempotency_key VARCHAR(128) NOT NULL,
   request_hash CHAR(64) NOT NULL,
   currency_code CHAR(3) NOT NULL,
-  total_debit_minor BIGINT NOT NULL CHECK (total_debit_minor > 0),
+  total_debit_minor BIGINT NOT NULL,
+  total_credit_minor BIGINT NOT NULL,
+  -- ARGON-LEDGER-002: Explicit Journal Lifecycle State (POSTING -> FINALIZED)
+  lifecycle_status VARCHAR(16) NOT NULL DEFAULT 'POSTING' CHECK (lifecycle_status IN ('POSTING', 'FINALIZED')),
+  finalized_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-  UNIQUE (tenant_id, idempotency_key),
-  UNIQUE (tenant_id, journal_id)
+  CONSTRAINT chk_journal_entries_idempotency_key CHECK (
+    char_length(btrim(idempotency_key)) BETWEEN 8 AND 128
+  ),
+  CONSTRAINT chk_journal_entries_request_hash CHECK (
+    request_hash ~ '^[0-9a-fA-F]{64}$'
+  ),
+  CONSTRAINT chk_journal_entries_supported_currency CHECK (
+    currency_code IN (
+      'JPY', 'KRW', 'VND', 'CLP', 'ISK',
+      'USD', 'EUR', 'GBP', 'INR', 'CAD', 'AUD', 'SGD', 'CHF',
+      'BHD', 'KWD', 'OMR', 'JOD', 'TND'
+    )
+  ),
+  CONSTRAINT chk_journal_entries_totals_balanced CHECK (
+    total_debit_minor > 0
+    AND total_debit_minor <= 900000000000000
+    AND total_credit_minor > 0
+    AND total_credit_minor <= 900000000000000
+    AND total_debit_minor = total_credit_minor
+  ),
+  CONSTRAINT uq_journal_entries_tenant_idempotency UNIQUE (tenant_id, idempotency_key),
+  CONSTRAINT uq_journal_entries_tenant_journal UNIQUE (tenant_id, journal_id),
+  CONSTRAINT uq_journal_entries_tenant_journal_currency UNIQUE (tenant_id, journal_id, currency_code)
 );
 
 CREATE TABLE IF NOT EXISTS public.journal_postings (
   posting_id BIGSERIAL PRIMARY KEY,
   journal_id UUID NOT NULL,
   tenant_id UUID NOT NULL,
-  account_id UUID NOT NULL REFERENCES public.ledger_accounts (account_id),
+  account_id UUID NOT NULL,
   direction VARCHAR(6) NOT NULL CHECK (direction IN ('DEBIT', 'CREDIT')),
-  amount_minor BIGINT NOT NULL CHECK (amount_minor > 0),
+  amount_minor BIGINT NOT NULL CHECK (amount_minor > 0 AND amount_minor <= 900000000000000),
   currency_code CHAR(3) NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-  FOREIGN KEY (tenant_id, journal_id) REFERENCES public.journal_entries (tenant_id, journal_id)
+  CONSTRAINT chk_journal_postings_supported_currency CHECK (
+    currency_code IN (
+      'JPY', 'KRW', 'VND', 'CLP', 'ISK',
+      'USD', 'EUR', 'GBP', 'INR', 'CAD', 'AUD', 'SGD', 'CHF',
+      'BHD', 'KWD', 'OMR', 'JOD', 'TND'
+    )
+  ),
+  CONSTRAINT uq_journal_postings_journal_account UNIQUE (journal_id, account_id),
+  CONSTRAINT fk_journal_postings_tenant_account
+    FOREIGN KEY (tenant_id, account_id)
+    REFERENCES public.ledger_accounts (tenant_id, account_id)
+    ON UPDATE RESTRICT ON DELETE RESTRICT,
+  CONSTRAINT fk_journal_postings_tenant_account_currency
+    FOREIGN KEY (tenant_id, account_id, currency_code)
+    REFERENCES public.ledger_accounts (tenant_id, account_id, currency_code)
+    ON UPDATE RESTRICT ON DELETE RESTRICT,
+  CONSTRAINT fk_journal_postings_tenant_journal
+    FOREIGN KEY (tenant_id, journal_id)
+    REFERENCES public.journal_entries (tenant_id, journal_id)
+    ON UPDATE RESTRICT ON DELETE RESTRICT,
+  CONSTRAINT fk_journal_postings_tenant_journal_currency
+    FOREIGN KEY (tenant_id, journal_id, currency_code)
+    REFERENCES public.journal_entries (tenant_id, journal_id, currency_code)
+    ON UPDATE RESTRICT ON DELETE RESTRICT
 );
 
--- 1. Least-Privilege Grants: app_runtime can only SELECT and INSERT on ledger tables (never UPDATE, DELETE, or TRUNCATE)
-REVOKE ALL ON public.journal_entries, public.journal_postings FROM PUBLIC, app_runtime;
-GRANT SELECT, INSERT ON public.journal_entries, public.journal_postings TO app_runtime;
+-- Explicit Cross-Currency FX Settlement Bridge (ARGON-LEDGER-005):
+-- Each journal remains strictly single-currency; cross-currency conversion links two same-tenant
+-- single-currency journals via exact integer rational conversion (rate_numerator / rate_denominator).
+CREATE TABLE IF NOT EXISTS public.fx_conversion_settlements (
+  settlement_id UUID PRIMARY KEY,
+  tenant_id UUID NOT NULL,
+  source_journal_id UUID NOT NULL,
+  source_currency_code CHAR(3) NOT NULL,
+  source_amount_minor BIGINT NOT NULL CHECK (source_amount_minor > 0 AND source_amount_minor <= 900000000000000),
+  target_journal_id UUID NOT NULL,
+  target_currency_code CHAR(3) NOT NULL,
+  target_amount_minor BIGINT NOT NULL CHECK (target_amount_minor > 0 AND target_amount_minor <= 900000000000000),
+  rate_numerator BIGINT NOT NULL CHECK (rate_numerator > 0 AND rate_numerator <= 900000000000000),
+  rate_denominator BIGINT NOT NULL CHECK (rate_denominator > 0 AND rate_denominator <= 900000000000000),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  CONSTRAINT chk_fx_distinct_currencies CHECK (source_currency_code <> target_currency_code),
+  CONSTRAINT chk_fx_distinct_journals CHECK (source_journal_id <> target_journal_id),
+  CONSTRAINT chk_fx_exact_rational_conversion CHECK (
+    (source_amount_minor::numeric * rate_numerator::numeric) = (target_amount_minor::numeric * rate_denominator::numeric)
+  ),
+  CONSTRAINT fk_fx_source_journal
+    FOREIGN KEY (tenant_id, source_journal_id, source_currency_code)
+    REFERENCES public.journal_entries (tenant_id, journal_id, currency_code)
+    ON UPDATE RESTRICT ON DELETE RESTRICT,
+  CONSTRAINT fk_fx_target_journal
+    FOREIGN KEY (tenant_id, target_journal_id, target_currency_code)
+    REFERENCES public.journal_entries (tenant_id, journal_id, currency_code)
+    ON UPDATE RESTRICT ON DELETE RESTRICT
+);
 
--- 2. Append-Only Immutability Trigger (Blocks even table owners / migrations from mutating posted ledger rows)
-CREATE OR REPLACE FUNCTION public.prevent_ledger_mutation()
+CREATE INDEX IF NOT EXISTS idx_journal_postings_tenant_journal
+  ON public.journal_postings (tenant_id, journal_id);
+CREATE INDEX IF NOT EXISTS idx_journal_postings_tenant_account
+  ON public.journal_postings (tenant_id, account_id);
+
+-- ============================================================================
+-- 2. OWNERSHIP & LEAST-PRIVILEGE GRANTS (ARGON-ROLE-004)
+-- ============================================================================
+REVOKE ALL ON public.journal_entries, public.journal_postings, public.ledger_accounts FROM PUBLIC, app_runtime;
+REVOKE ALL ON public.fx_conversion_settlements FROM PUBLIC, app_runtime;
+
+ALTER TABLE public.ledger_accounts OWNER TO db_migrator;
+ALTER TABLE public.journal_entries OWNER TO db_migrator;
+ALTER TABLE public.journal_postings OWNER TO db_migrator;
+ALTER TABLE public.fx_conversion_settlements OWNER TO db_migrator;
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.ledger_accounts, public.journal_entries, public.journal_postings, public.fx_conversion_settlements TO db_migrator;
+GRANT USAGE, SELECT ON SEQUENCE public.journal_postings_posting_id_seq TO db_migrator;
+
+GRANT SELECT, INSERT, UPDATE (balance_minor, version, status, allow_negative_balance) ON public.ledger_accounts TO app_runtime;
+GRANT SELECT, INSERT, UPDATE (lifecycle_status, finalized_at) ON public.journal_entries TO app_runtime;
+GRANT SELECT, INSERT ON public.journal_postings TO app_runtime;
+GRANT SELECT, INSERT ON public.fx_conversion_settlements TO app_runtime;
+GRANT USAGE, SELECT ON SEQUENCE public.journal_postings_posting_id_seq TO app_runtime;
+
+-- ============================================================================
+-- 3. ROW LEVEL SECURITY POLICIES (ARGON-LEDGER-003)
+-- Enforce tenant-scoped cryptographic verification on all ledger tables
+-- ============================================================================
+ALTER TABLE public.ledger_accounts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.ledger_accounts FORCE ROW LEVEL SECURITY;
+
+ALTER TABLE public.journal_entries ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.journal_entries FORCE ROW LEVEL SECURITY;
+
+ALTER TABLE public.journal_postings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.journal_postings FORCE ROW LEVEL SECURITY;
+
+ALTER TABLE public.fx_conversion_settlements ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.fx_conversion_settlements FORCE ROW LEVEL SECURITY;
+
+-- ledger_accounts RLS Policies (Permissive + Restrictive defense-in-depth)
+CREATE POLICY ledger_accounts_tenant_isolation ON public.ledger_accounts
+  AS PERMISSIVE
+  FOR ALL
+  TO app_runtime, db_migrator
+  USING (security.verify_active_tenant_context(tenant_id))
+  WITH CHECK (security.verify_active_tenant_context(tenant_id));
+
+CREATE POLICY ledger_accounts_tenant_restrictive ON public.ledger_accounts
+  AS RESTRICTIVE
+  FOR ALL
+  TO PUBLIC
+  USING (security.verify_active_tenant_context(tenant_id))
+  WITH CHECK (security.verify_active_tenant_context(tenant_id));
+
+-- journal_entries RLS Policies
+CREATE POLICY journal_entries_tenant_isolation ON public.journal_entries
+  AS PERMISSIVE
+  FOR ALL
+  TO app_runtime, db_migrator
+  USING (security.verify_active_tenant_context(tenant_id))
+  WITH CHECK (security.verify_active_tenant_context(tenant_id));
+
+CREATE POLICY journal_entries_tenant_restrictive ON public.journal_entries
+  AS RESTRICTIVE
+  FOR ALL
+  TO PUBLIC
+  USING (security.verify_active_tenant_context(tenant_id))
+  WITH CHECK (security.verify_active_tenant_context(tenant_id));
+
+-- journal_postings RLS Policies
+CREATE POLICY journal_postings_tenant_isolation ON public.journal_postings
+  AS PERMISSIVE
+  FOR ALL
+  TO app_runtime, db_migrator
+  USING (security.verify_active_tenant_context(tenant_id))
+  WITH CHECK (security.verify_active_tenant_context(tenant_id));
+
+CREATE POLICY journal_postings_tenant_restrictive ON public.journal_postings
+  AS RESTRICTIVE
+  FOR ALL
+  TO PUBLIC
+  USING (security.verify_active_tenant_context(tenant_id))
+  WITH CHECK (security.verify_active_tenant_context(tenant_id));
+
+-- fx_conversion_settlements RLS Policies
+CREATE POLICY fx_settlements_tenant_isolation ON public.fx_conversion_settlements
+  AS PERMISSIVE
+  FOR ALL
+  TO app_runtime, db_migrator
+  USING (security.verify_active_tenant_context(tenant_id))
+  WITH CHECK (security.verify_active_tenant_context(tenant_id));
+
+CREATE POLICY fx_settlements_tenant_restrictive ON public.fx_conversion_settlements
+  AS RESTRICTIVE
+  FOR ALL
+  TO PUBLIC
+  USING (security.verify_active_tenant_context(tenant_id))
+  WITH CHECK (security.verify_active_tenant_context(tenant_id));
+
+-- ============================================================================
+-- 4. ACCOUNT IDENTITY & JOURNAL IMMUTABILITY TRIGGERS
+-- ============================================================================
+CREATE OR REPLACE FUNCTION public.prevent_ledger_account_identity_mutation()
 RETURNS trigger
 LANGUAGE plpgsql
 SET search_path = pg_catalog, public
 AS $$
 BEGIN
-  RAISE EXCEPTION 'LEDGER_IMMUTABLE_VIOLATION: Updates and deletes are forbidden on table %', TG_TABLE_NAME
-    USING ERRCODE = '55000';
+  IF TG_OP = 'DELETE' THEN
+    RAISE EXCEPTION 'LEDGER_ACCOUNT_IMMUTABLE_VIOLATION: Deleting ledger_accounts rows is forbidden (account_id=%)', OLD.account_id
+      USING ERRCODE = '55000';
+  END IF;
+
+  IF NEW.account_id <> OLD.account_id
+     OR NEW.tenant_id <> OLD.tenant_id
+     OR NEW.currency_code <> OLD.currency_code
+     OR NEW.normal_balance <> OLD.normal_balance
+     OR NEW.created_at <> OLD.created_at
+  THEN
+    RAISE EXCEPTION 'LEDGER_ACCOUNT_IDENTITY_IMMUTABLE: Cannot reassign tenant_id, currency_code, normal_balance, or account_id on ledger_accounts (account_id=%)', OLD.account_id
+      USING ERRCODE = '55000';
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_ledger_accounts_protect_identity
+  BEFORE UPDATE OR DELETE ON public.ledger_accounts
+  FOR EACH ROW EXECUTE FUNCTION public.prevent_ledger_account_identity_mutation();
+
+-- Journal Entries Lifecycle & Immutability Trigger (ARGON-LEDGER-002)
+CREATE OR REPLACE FUNCTION public.prevent_journal_entry_mutation()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, public
+AS $$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    RAISE EXCEPTION 'LEDGER_IMMUTABLE_VIOLATION: Deleting journal_entries rows is forbidden (journal_id=%)', OLD.journal_id
+      USING ERRCODE = '55000';
+  END IF;
+
+  -- Disallow modifying core financial metadata
+  IF NEW.journal_id <> OLD.journal_id
+     OR NEW.tenant_id <> OLD.tenant_id
+     OR NEW.idempotency_key <> OLD.idempotency_key
+     OR NEW.request_hash <> OLD.request_hash
+     OR NEW.currency_code <> OLD.currency_code
+     OR NEW.total_debit_minor <> OLD.total_debit_minor
+     OR NEW.total_credit_minor <> OLD.total_credit_minor
+     OR NEW.created_at <> OLD.created_at
+  THEN
+    RAISE EXCEPTION 'LEDGER_JOURNAL_CORE_IMMUTABLE: Core metadata on journal_entries cannot be updated (journal_id=%)', OLD.journal_id
+      USING ERRCODE = '55000';
+  END IF;
+
+  -- Lifecycle state transition checks: POSTING -> FINALIZED permitted once; no downgrades
+  IF OLD.lifecycle_status = 'FINALIZED' THEN
+    IF NEW.lifecycle_status <> 'FINALIZED' THEN
+      RAISE EXCEPTION 'LEDGER_LIFECYCLE_VIOLATION: Cannot downgrade journal % from FINALIZED to %', OLD.journal_id, NEW.lifecycle_status
+        USING ERRCODE = '55000';
+    END IF;
+  ELSIF OLD.lifecycle_status = 'POSTING' AND NEW.lifecycle_status = 'FINALIZED' THEN
+    NEW.finalized_at := clock_timestamp();
+  END IF;
+
+  RETURN NEW;
 END;
 $$;
 
 CREATE TRIGGER trg_journal_entries_immutable
   BEFORE UPDATE OR DELETE ON public.journal_entries
-  FOR EACH ROW EXECUTE FUNCTION public.prevent_ledger_mutation();
+  FOR EACH ROW EXECUTE FUNCTION public.prevent_journal_entry_mutation();
 
-CREATE TRIGGER trg_journal_postings_immutable
-  BEFORE UPDATE OR DELETE ON public.journal_postings
-  FOR EACH ROW EXECUTE FUNCTION public.prevent_ledger_mutation();
-
--- 3. Deferred Commit-Time Double-Entry Balance Invariant Trigger
-CREATE OR REPLACE FUNCTION public.verify_journal_balanced_at_commit()
+-- Journal Postings Mutation & Finalization Guard (ARGON-LEDGER-002)
+CREATE OR REPLACE FUNCTION public.guard_journal_posting_mutation()
 RETURNS trigger
 LANGUAGE plpgsql
 SET search_path = pg_catalog, public
 AS $$
 DECLARE
+  v_journal public.journal_entries%ROWTYPE;
+BEGIN
+  -- If updating or deleting, ensure the associated journal is not FINALIZED
+  IF TG_OP IN ('UPDATE', 'DELETE') THEN
+    SELECT * INTO v_journal
+    FROM public.journal_entries
+    WHERE tenant_id = OLD.tenant_id AND journal_id = OLD.journal_id;
+
+    IF FOUND AND v_journal.lifecycle_status = 'FINALIZED' THEN
+      RAISE EXCEPTION 'LEDGER_POSTING_FINALIZED_IMMUTABLE: Cannot modify or delete postings of FINALIZED journal %', OLD.journal_id
+        USING ERRCODE = '55000';
+    END IF;
+  END IF;
+
+  -- If inserting or updating to a new journal, ensure target journal is not FINALIZED
+  IF TG_OP IN ('INSERT', 'UPDATE') THEN
+    SELECT * INTO v_journal
+    FROM public.journal_entries
+    WHERE tenant_id = NEW.tenant_id AND journal_id = NEW.journal_id;
+
+    IF FOUND AND v_journal.lifecycle_status = 'FINALIZED' THEN
+      RAISE EXCEPTION 'LEDGER_POSTING_FINALIZED_CLOSED: Cannot add or move postings to FINALIZED journal %', NEW.journal_id
+        USING ERRCODE = '55000';
+    END IF;
+  END IF;
+
+  RETURN COALESCE(NEW, OLD);
+END;
+$$;
+
+CREATE TRIGGER trg_journal_postings_guard_mutation
+  BEFORE INSERT OR UPDATE OR DELETE ON public.journal_postings
+  FOR EACH ROW EXECUTE FUNCTION public.guard_journal_posting_mutation();
+
+-- Default Header Credit Total & Initial Lifecycle State Guard Trigger
+CREATE OR REPLACE FUNCTION public.normalize_journal_entry_header_totals()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, public
+AS $$
+BEGIN
+  IF NEW.total_credit_minor IS NULL THEN
+    NEW.total_credit_minor := NEW.total_debit_minor;
+  END IF;
+  IF NEW.lifecycle_status <> 'POSTING' OR NEW.finalized_at IS NOT NULL THEN
+    RAISE EXCEPTION 'LEDGER_LIFECYCLE_VIOLATION: New journal_entries row % must start in POSTING state before postings are verified at commit',
+      NEW.journal_id
+      USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_journal_entries_default_credit_total
+  BEFORE INSERT ON public.journal_entries
+  FOR EACH ROW EXECUTE FUNCTION public.normalize_journal_entry_header_totals();
+
+-- Pre-Insert/Update Posting Guard Trigger: Locks parent journal & account, rejects inactive accounts
+CREATE OR REPLACE FUNCTION public.guard_journal_posting_before_insert()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  v_account public.ledger_accounts%ROWTYPE;
+  v_journal public.journal_entries%ROWTYPE;
+BEGIN
+  IF TG_OP = 'UPDATE' AND (OLD.journal_id IS DISTINCT FROM NEW.journal_id OR OLD.tenant_id IS DISTINCT FROM NEW.tenant_id) THEN
+    PERFORM 1
+    FROM public.journal_entries
+    WHERE tenant_id = OLD.tenant_id
+      AND journal_id = OLD.journal_id
+    FOR UPDATE;
+  END IF;
+
+  SELECT * INTO v_journal
+  FROM public.journal_entries
+  WHERE tenant_id = NEW.tenant_id
+    AND journal_id = NEW.journal_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'LEDGER_JOURNAL_NOT_FOUND_OR_TENANT_MISMATCH: Journal % not found for tenant %',
+      NEW.journal_id, NEW.tenant_id
+      USING ERRCODE = '23503';
+  END IF;
+
+  IF v_journal.lifecycle_status = 'FINALIZED' THEN
+    RAISE EXCEPTION 'LEDGER_POSTING_FINALIZED_CLOSED: Cannot insert or move postings into FINALIZED journal %',
+      NEW.journal_id
+      USING ERRCODE = '55000';
+  END IF;
+
+  IF v_journal.currency_code <> NEW.currency_code THEN
+    RAISE EXCEPTION 'LEDGER_CURRENCY_MISMATCH: Posting currency (%) does not match journal currency (%)',
+      NEW.currency_code, v_journal.currency_code
+      USING ERRCODE = '23514';
+  END IF;
+
+  SELECT * INTO v_account
+  FROM public.ledger_accounts
+  WHERE tenant_id = NEW.tenant_id
+    AND account_id = NEW.account_id
+  FOR NO KEY UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'LEDGER_CROSS_TENANT_ACCOUNT_DENIED: Account % does not exist in tenant %',
+      NEW.account_id, NEW.tenant_id
+      USING ERRCODE = '23503';
+  END IF;
+
+  IF v_account.currency_code <> NEW.currency_code THEN
+    RAISE EXCEPTION 'LEDGER_CURRENCY_MISMATCH: Posting currency (%) does not match account currency (%)',
+      NEW.currency_code, v_account.currency_code
+      USING ERRCODE = '23514';
+  END IF;
+
+  IF v_account.status <> 'ACTIVE' THEN
+    RAISE EXCEPTION 'LEDGER_ACCOUNT_INACTIVE: Cannot post to non-active account % (status=%)',
+      NEW.account_id, v_account.status
+      USING ERRCODE = '23514';
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_journal_postings_guard_before_insert
+  BEFORE INSERT OR UPDATE ON public.journal_postings
+  FOR EACH ROW EXECUTE FUNCTION public.guard_journal_posting_before_insert();
+
+-- ============================================================================
+-- 5. DEFERRED COMMIT-TIME JOURNAL INTEGRITY & AGGREGATE TRIGGER (ARGON-LEDGER-002 & 005)
+-- Validates balanced debits/credits, stored totals, currency, and account ownership.
+-- Validates both OLD and NEW journal IDs when postings move between journals.
+-- Auto-finalizes valid journals upon successful verification.
+-- ============================================================================
+CREATE OR REPLACE FUNCTION public.verify_single_journal_integrity_at_commit(p_tenant_id UUID, p_journal_id UUID)
+RETURNS VOID
+LANGUAGE plpgsql
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  v_entry public.journal_entries%ROWTYPE;
   v_debit_sum BIGINT;
   v_credit_sum BIGINT;
   v_line_count INT;
+  v_currency_mismatch_count INT;
+  v_account_mismatch_count INT;
 BEGIN
+  IF p_tenant_id IS NULL OR p_journal_id IS NULL THEN
+    RETURN;
+  END IF;
+
+  SELECT * INTO v_entry
+  FROM public.journal_entries
+  WHERE tenant_id = p_tenant_id
+    AND journal_id = p_journal_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'LEDGER_DB_INVARIANT_VIOLATION: Parent journal_entries row % missing for tenant %',
+      p_journal_id, p_tenant_id
+      USING ERRCODE = '23503';
+  END IF;
+
   SELECT
     COUNT(*),
-    COALESCE(SUM(CASE WHEN direction = 'DEBIT' THEN amount_minor ELSE 0 END), 0),
-    COALESCE(SUM(CASE WHEN direction = 'CREDIT' THEN amount_minor ELSE 0 END), 0)
-  INTO v_line_count, v_debit_sum, v_credit_sum
-  FROM public.journal_postings
-  WHERE journal_id = NEW.journal_id
-    AND tenant_id = NEW.tenant_id;
+    COALESCE(SUM(CASE WHEN p.direction = 'DEBIT' THEN p.amount_minor ELSE 0 END), 0),
+    COALESCE(SUM(CASE WHEN p.direction = 'CREDIT' THEN p.amount_minor ELSE 0 END), 0),
+    COUNT(*) FILTER (WHERE p.currency_code <> v_entry.currency_code),
+    COUNT(*) FILTER (
+      WHERE a.account_id IS NULL
+         OR a.tenant_id <> v_entry.tenant_id
+         OR a.currency_code <> v_entry.currency_code
+         OR a.status <> 'ACTIVE'
+    )
+  INTO
+    v_line_count,
+    v_debit_sum,
+    v_credit_sum,
+    v_currency_mismatch_count,
+    v_account_mismatch_count
+  FROM public.journal_postings p
+  LEFT JOIN public.ledger_accounts a
+    ON a.tenant_id = p.tenant_id
+   AND a.account_id = p.account_id
+  WHERE p.journal_id = v_entry.journal_id
+    AND p.tenant_id = v_entry.tenant_id;
 
-  IF v_line_count < 2 OR v_debit_sum <= 0 OR v_debit_sum <> v_credit_sum THEN
+  IF v_line_count < 2 OR v_line_count > 500 OR v_debit_sum <= 0 OR v_debit_sum <> v_credit_sum THEN
     RAISE EXCEPTION 'LEDGER_DB_INVARIANT_VIOLATION: Journal % is unbalanced at commit (debits=%, credits=%, lines=%)',
-      NEW.journal_id, v_debit_sum, v_credit_sum, v_line_count
+      v_entry.journal_id, v_debit_sum, v_credit_sum, v_line_count
+      USING ERRCODE = '23514';
+  END IF;
+
+  IF v_debit_sum <> v_entry.total_debit_minor OR v_credit_sum <> v_entry.total_credit_minor THEN
+    RAISE EXCEPTION 'LEDGER_STORED_AGGREGATE_MISMATCH: Journal % stored totals (debit=%, credit=%) do not match actual postings (debit=%, credit=%)',
+      v_entry.journal_id, v_entry.total_debit_minor, v_entry.total_credit_minor, v_debit_sum, v_credit_sum
+      USING ERRCODE = '23514';
+  END IF;
+
+  IF v_currency_mismatch_count > 0 OR v_account_mismatch_count > 0 THEN
+    RAISE EXCEPTION 'LEDGER_OWNERSHIP_OR_CURRENCY_INVARIANT_VIOLATION: Journal % has currency_mismatches=% or account_mismatches=%',
+      v_entry.journal_id, v_currency_mismatch_count, v_account_mismatch_count
+      USING ERRCODE = '23514';
+  END IF;
+
+  -- Automatically seal verified journal to FINALIZED state to prevent post-commit append attacks
+  IF v_entry.lifecycle_status = 'POSTING' THEN
+    UPDATE public.journal_entries
+       SET lifecycle_status = 'FINALIZED',
+           finalized_at = clock_timestamp()
+     WHERE tenant_id = v_entry.tenant_id
+       AND journal_id = v_entry.journal_id;
+  END IF;
+END;
+$$;
+
+-- Constraint Trigger Function on journal_entries (Fires deferred at COMMIT)
+CREATE OR REPLACE FUNCTION public.verify_journal_balanced_at_commit()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, public
+AS $$
+BEGIN
+  PERFORM public.verify_single_journal_integrity_at_commit(NEW.tenant_id, NEW.journal_id);
+  RETURN NULL;
+END;
+$$;
+
+-- Constraint Trigger Function on journal_postings (Fires deferred at COMMIT on INSERT, UPDATE, DELETE)
+-- Checks both OLD and NEW journal IDs when postings move or delete (ARGON-LEDGER-002)
+CREATE OR REPLACE FUNCTION public.verify_postings_journal_balanced_at_commit()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, public
+AS $$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    PERFORM public.verify_single_journal_integrity_at_commit(NEW.tenant_id, NEW.journal_id);
+  ELSIF TG_OP = 'DELETE' THEN
+    PERFORM public.verify_single_journal_integrity_at_commit(OLD.tenant_id, OLD.journal_id);
+  ELSIF TG_OP = 'UPDATE' THEN
+    IF OLD.journal_id IS DISTINCT FROM NEW.journal_id OR OLD.tenant_id IS DISTINCT FROM NEW.tenant_id THEN
+      PERFORM public.verify_single_journal_integrity_at_commit(OLD.tenant_id, OLD.journal_id);
+    END IF;
+    PERFORM public.verify_single_journal_integrity_at_commit(NEW.tenant_id, NEW.journal_id);
+  END IF;
+  RETURN NULL;
+END;
+$$;
+
+-- Constraint Trigger Function on fx_conversion_settlements (Fires deferred at COMMIT)
+CREATE OR REPLACE FUNCTION public.verify_fx_settlement_at_commit()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  v_src public.journal_entries%ROWTYPE;
+  v_dst public.journal_entries%ROWTYPE;
+BEGIN
+  PERFORM public.verify_single_journal_integrity_at_commit(NEW.tenant_id, NEW.source_journal_id);
+  PERFORM public.verify_single_journal_integrity_at_commit(NEW.tenant_id, NEW.target_journal_id);
+
+  SELECT * INTO v_src FROM public.journal_entries
+   WHERE tenant_id = NEW.tenant_id AND journal_id = NEW.source_journal_id;
+  SELECT * INTO v_dst FROM public.journal_entries
+   WHERE tenant_id = NEW.tenant_id AND journal_id = NEW.target_journal_id;
+
+  IF v_src.total_debit_minor <> NEW.source_amount_minor OR v_dst.total_debit_minor <> NEW.target_amount_minor THEN
+    RAISE EXCEPTION 'LEDGER_FX_SETTLEMENT_AMOUNT_MISMATCH: FX settlement % amounts (src=%, dst=%) do not match journal totals (src=%, dst=%)',
+      NEW.settlement_id, NEW.source_amount_minor, NEW.target_amount_minor, v_src.total_debit_minor, v_dst.total_debit_minor
       USING ERRCODE = '23514';
   END IF;
   RETURN NULL;
@@ -1167,10 +1871,331 @@ END;
 $$;
 
 CREATE CONSTRAINT TRIGGER trg_verify_journal_balanced_commit
-  AFTER INSERT ON public.journal_entries
+  AFTER INSERT OR UPDATE ON public.journal_entries
   DEFERRABLE INITIALLY DEFERRED
   FOR EACH ROW EXECUTE FUNCTION public.verify_journal_balanced_at_commit();
+
+CREATE CONSTRAINT TRIGGER trg_verify_posting_journal_balanced_commit
+  AFTER INSERT OR UPDATE OR DELETE ON public.journal_postings
+  DEFERRABLE INITIALLY DEFERRED
+  FOR EACH ROW EXECUTE FUNCTION public.verify_postings_journal_balanced_at_commit();
+
+CREATE CONSTRAINT TRIGGER trg_verify_fx_settlement_commit
+  AFTER INSERT OR UPDATE ON public.fx_conversion_settlements
+  DEFERRABLE INITIALLY DEFERRED
+  FOR EACH ROW EXECUTE FUNCTION public.verify_fx_settlement_at_commit();
 ```
+
+---
+
+### D. Read-Only Data Preflight Detection Queries (`ARGON-LEDGER-001` & `ARGON-LEDGER-005`)
+Before adding composite unique keys, composite foreign keys, or `CHECK` constraints to an existing production database, run these read-only diagnostic queries on a read replica or under `SET TRANSACTION READ ONLY` to identify any historical anomalies **without modifying or deleting financial records**:
+
+```sql
+-- PREFLIGHT-01: Detect NULL keys, duplicate (tenant_id, account_id), or unsupported currency codes in ledger_accounts
+SELECT
+  account_id,
+  tenant_id,
+  currency_code,
+  balance_minor,
+  allow_negative_balance,
+  CASE
+    WHEN account_id IS NULL OR tenant_id IS NULL THEN 'NULL_TENANT_OR_ACCOUNT_KEY'
+    WHEN currency_code NOT IN ('JPY','KRW','VND','CLP','ISK','USD','EUR','GBP','INR','CAD','AUD','SGD','CHF','BHD','KWD','OMR','JOD','TND')
+      THEN 'UNSUPPORTED_ACCOUNT_CURRENCY'
+    WHEN NOT allow_negative_balance AND balance_minor < 0 THEN 'UNAUTHORIZED_NEGATIVE_ACCOUNT_BALANCE'
+    WHEN balance_minor < -900000000000000 OR balance_minor > 900000000000000 THEN 'ACCOUNT_BALANCE_OUTSIDE_SAFE_BIGINT'
+    ELSE 'DUPLICATE_TENANT_ACCOUNT_KEY'
+  END AS anomaly_type
+FROM public.ledger_accounts a
+WHERE account_id IS NULL
+   OR tenant_id IS NULL
+   OR currency_code NOT IN ('JPY','KRW','VND','CLP','ISK','USD','EUR','GBP','INR','CAD','AUD','SGD','CHF','BHD','KWD','OMR','JOD','TND')
+   OR (NOT allow_negative_balance AND balance_minor < 0)
+   OR balance_minor < -900000000000000
+   OR balance_minor > 900000000000000
+   OR EXISTS (
+     SELECT 1
+     FROM public.ledger_accounts a2
+     WHERE a2.tenant_id = a.tenant_id
+       AND a2.account_id = a.account_id
+       AND a2.ctid <> a.ctid
+   );
+
+-- PREFLIGHT-02: Detect cross-tenant or orphan journal_postings -> ledger_accounts references (ARGON-LEDGER-001)
+SELECT
+  p.posting_id,
+  p.journal_id,
+  p.tenant_id AS posting_tenant_id,
+  p.account_id,
+  a.tenant_id AS account_owner_tenant_id,
+  p.currency_code AS posting_currency,
+  a.currency_code AS account_currency,
+  CASE
+    WHEN a.account_id IS NULL THEN 'ORPHAN_ACCOUNT_REFERENCE'
+    WHEN a.tenant_id <> p.tenant_id THEN 'CROSS_TENANT_ACCOUNT_POSTING'
+    WHEN a.currency_code <> p.currency_code THEN 'ACCOUNT_CURRENCY_MISMATCH'
+  END AS anomaly_type
+FROM public.journal_postings p
+LEFT JOIN public.ledger_accounts a
+  ON a.account_id = p.account_id
+WHERE a.account_id IS NULL
+   OR a.tenant_id <> p.tenant_id
+   OR a.currency_code <> p.currency_code;
+
+-- PREFLIGHT-03: Detect cross-tenant, orphan, or currency-mismatched journal_postings -> journal_entries (ARGON-LEDGER-005)
+SELECT
+  p.posting_id,
+  p.journal_id,
+  p.tenant_id AS posting_tenant_id,
+  j.tenant_id AS journal_tenant_id,
+  p.currency_code AS posting_currency,
+  j.currency_code AS journal_currency,
+  CASE
+    WHEN j.journal_id IS NULL THEN 'ORPHAN_JOURNAL_REFERENCE'
+    WHEN j.tenant_id <> p.tenant_id THEN 'CROSS_TENANT_JOURNAL_POSTING'
+    WHEN j.currency_code <> p.currency_code THEN 'JOURNAL_CURRENCY_MISMATCH'
+  END AS anomaly_type
+FROM public.journal_postings p
+LEFT JOIN public.journal_entries j
+  ON j.journal_id = p.journal_id
+WHERE j.journal_id IS NULL
+   OR j.tenant_id <> p.tenant_id
+   OR j.currency_code <> p.currency_code;
+
+-- PREFLIGHT-04: Detect historical journals violating double-entry balance, stored aggregate equality, or self-wash (ARGON-LEDGER-005)
+SELECT
+  j.journal_id,
+  j.tenant_id,
+  j.currency_code,
+  j.total_debit_minor AS stored_total_debit_minor,
+  COUNT(p.posting_id) AS posting_count,
+  COALESCE(SUM(CASE WHEN p.direction = 'DEBIT' THEN p.amount_minor ELSE 0 END), 0) AS actual_debit_minor,
+  COALESCE(SUM(CASE WHEN p.direction = 'CREDIT' THEN p.amount_minor ELSE 0 END), 0) AS actual_credit_minor,
+  COUNT(p.posting_id) - COUNT(DISTINCT p.account_id) AS duplicate_account_postings
+FROM public.journal_entries j
+LEFT JOIN public.journal_postings p
+  ON p.tenant_id = j.tenant_id
+ AND p.journal_id = j.journal_id
+GROUP BY j.journal_id, j.tenant_id, j.currency_code, j.total_debit_minor
+HAVING COUNT(p.posting_id) < 2
+    OR COALESCE(SUM(CASE WHEN p.direction = 'DEBIT' THEN p.amount_minor ELSE 0 END), 0) <= 0
+    OR COALESCE(SUM(CASE WHEN p.direction = 'DEBIT' THEN p.amount_minor ELSE 0 END), 0)
+       <> COALESCE(SUM(CASE WHEN p.direction = 'CREDIT' THEN p.amount_minor ELSE 0 END), 0)
+    OR COALESCE(SUM(CASE WHEN p.direction = 'DEBIT' THEN p.amount_minor ELSE 0 END), 0)
+       <> j.total_debit_minor
+    OR COUNT(p.posting_id) <> COUNT(DISTINCT p.account_id);
+
+-- PREFLIGHT-05: Detect unfinalized journals with invalid line counts, unbalanced totals, or lifecycle inconsistency (ARGON-LEDGER-002)
+SELECT
+  j.journal_id,
+  j.tenant_id,
+  j.lifecycle_status,
+  j.total_debit_minor,
+  j.total_credit_minor,
+  COUNT(p.posting_id) AS posting_count,
+  COALESCE(SUM(CASE WHEN p.direction = 'DEBIT' THEN p.amount_minor ELSE 0 END), 0) AS total_debit,
+  COALESCE(SUM(CASE WHEN p.direction = 'CREDIT' THEN p.amount_minor ELSE 0 END), 0) AS total_credit,
+  CASE
+    WHEN j.lifecycle_status NOT IN ('POSTING', 'FINALIZED') THEN 'INVALID_LIFECYCLE_STATUS'
+    WHEN COUNT(p.posting_id) < 2 THEN 'UNFINALIZED_INSUFFICIENT_POSTING_LINES'
+    WHEN COALESCE(SUM(CASE WHEN p.direction = 'DEBIT' THEN p.amount_minor ELSE 0 END), 0) <> COALESCE(SUM(CASE WHEN p.direction = 'CREDIT' THEN p.amount_minor ELSE 0 END), 0)
+      THEN 'UNFINALIZED_UNBALANCED_TOTALS'
+    WHEN j.total_credit_minor IS NULL OR j.total_credit_minor <> j.total_debit_minor
+      THEN 'MISSING_OR_UNBALANCED_HEADER_CREDIT_TOTAL'
+    ELSE 'UNFINALIZED_POSTING_DEFECT'
+  END AS anomaly_type
+FROM public.journal_entries j
+LEFT JOIN public.journal_postings p
+  ON p.tenant_id = j.tenant_id
+ AND p.journal_id = j.journal_id
+GROUP BY j.journal_id, j.tenant_id, j.lifecycle_status, j.total_debit_minor, j.total_credit_minor
+HAVING j.lifecycle_status NOT IN ('POSTING', 'FINALIZED')
+    OR (j.lifecycle_status = 'FINALIZED' AND (COUNT(p.posting_id) < 2 OR COALESCE(SUM(CASE WHEN p.direction = 'DEBIT' THEN p.amount_minor ELSE 0 END), 0) <> COALESCE(SUM(CASE WHEN p.direction = 'CREDIT' THEN p.amount_minor ELSE 0 END), 0)))
+    OR j.total_credit_minor IS NULL
+    OR j.total_credit_minor <> j.total_debit_minor;
+
+-- PREFLIGHT-06: Detect tables with missing FORCE ROW LEVEL SECURITY or missing RLS policies (ARGON-LEDGER-003)
+SELECT
+  c.relname AS table_name,
+  c.relrowsecurity AS rls_enabled,
+  c.relforcerowsecurity AS rls_forced,
+  CASE
+    WHEN NOT c.relrowsecurity THEN 'RLS_NOT_ENABLED'
+    WHEN NOT c.relforcerowsecurity THEN 'RLS_NOT_FORCED'
+    ELSE 'RLS_CONFIG_DEFECT'
+  END AS anomaly_type
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'public'
+  AND c.relname IN ('ledger_accounts', 'journal_entries', 'journal_postings')
+  AND (NOT c.relrowsecurity OR NOT c.relforcerowsecurity);
+
+-- PREFLIGHT-07: Detect roles with unexpected SUPERUSER, BYPASSRLS, CREATEDB, CREATEROLE, or conflicting LOGIN attributes (ARGON-ROLE-004)
+SELECT
+  rolname,
+  rolsuper,
+  rolbypassrls,
+  rolcreatedb,
+  rolcreaterole,
+  rolcanlogin,
+  CASE
+    WHEN rolsuper THEN 'UNAUTHORIZED_SUPERUSER_ROLE'
+    WHEN rolbypassrls THEN 'UNAUTHORIZED_BYPASSRLS_ROLE'
+    WHEN rolcreatedb OR rolcreaterole THEN 'UNAUTHORIZED_DDL_ADMIN_ROLE'
+    WHEN rolname IN ('db_migrator', 'app_runtime') AND rolcanlogin THEN 'UNEXPECTED_LOGIN_ON_NOLOGIN_ROLE'
+    WHEN rolname = 'app_login' AND NOT rolcanlogin THEN 'MISSING_LOGIN_ON_APP_LOGIN_ROLE'
+  END AS anomaly_type
+FROM pg_roles
+WHERE rolname IN ('db_migrator', 'app_runtime', 'app_login')
+  AND (
+    rolsuper
+    OR rolbypassrls
+    OR rolcreatedb
+    OR rolcreaterole
+    OR (rolname IN ('db_migrator', 'app_runtime') AND rolcanlogin)
+    OR (rolname = 'app_login' AND NOT rolcanlogin)
+  );
+```
+
+---
+
+### E. Staged Production Migration, Lock-Duration Analysis & Failure Recovery Plan (`ARGON-LEDGER-001` & `ARGON-LEDGER-005`)
+
+#### 1. Lock Duration & Table-Size Impact Analysis
+| Migration Step | SQL Operation | PostgreSQL Lock Acquired | Concurrent Read/Write Impact | Table-Size Scaling Behavior |
+| :--- | :--- | :--- | :--- | :--- |
+| **Step 1 (Concurrent Candidate Indexes)** | `CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS idx_ledger_accounts_tenant_account ...` | `SHARE UPDATE EXCLUSIVE` | **Non-blocking**: Concurrent `SELECT`, `INSERT`, `UPDATE` continue normally. | Two table scans in background; safe on $10^8+$ rows. |
+| **Step 2 (Attach Unique Constraints)** | `ALTER TABLE ... ADD CONSTRAINT ... UNIQUE USING INDEX ...` | Brief `ACCESS EXCLUSIVE` (`< 50ms` metadata catalog update, guarded by `SET lock_timeout = '3s'`) | Instant metadata-only attachment because uniqueness is already proven by the concurrent index. | $O(1)$ constant time regardless of table size. |
+| **Step 3 (Add `NOT VALID` Composite FKs & `CHECK`s)** | `ALTER TABLE public.journal_postings ADD CONSTRAINT fk_journal_postings_tenant_account FOREIGN KEY (tenant_id, account_id) REFERENCES public.ledger_accounts (tenant_id, account_id) ON UPDATE RESTRICT ON DELETE RESTRICT NOT VALID;` | Brief `SHARE ROW EXCLUSIVE` / `ACCESS EXCLUSIVE` (`< 50ms` catalog update) | Immediately enforces the constraint on all **new** `INSERT`/`UPDATE` writes without scanning historical rows. | $O(1)$ constant time regardless of table size. |
+| **Step 4 (Online Constraint Validation)** | `ALTER TABLE public.journal_postings VALIDATE CONSTRAINT fk_journal_postings_tenant_account;` | `SHARE UPDATE EXCLUSIVE` | **Non-blocking**: Scans historical rows while allowing concurrent reads and writes. | Linear scan $O(N)$ with zero write downtime. |
+
+#### 2. Staged Production Migration Script (Expand -> Validate -> Contract, Idempotent)
+```sql
+-- ============================================================================
+-- PHASE 1: Build Unique Candidate Indexes Concurrently (Outside Transaction Block)
+-- ============================================================================
+CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS idx_ledger_accounts_tenant_account
+  ON public.ledger_accounts (tenant_id, account_id);
+
+CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS idx_ledger_accounts_tenant_account_currency
+  ON public.ledger_accounts (tenant_id, account_id, currency_code);
+
+CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS idx_journal_entries_tenant_journal_currency
+  ON public.journal_entries (tenant_id, journal_id, currency_code);
+
+CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS idx_journal_postings_journal_account
+  ON public.journal_postings (journal_id, account_id);
+
+-- ============================================================================
+-- PHASE 2: Attach Candidate Keys & NOT VALID Composite FKs / CHECKs (Fast Metadata Lock, Idempotent)
+-- ============================================================================
+BEGIN;
+SET LOCAL lock_timeout = '3s';
+SET LOCAL statement_timeout = '15s';
+
+ALTER TABLE public.journal_entries
+  ADD COLUMN IF NOT EXISTS total_credit_minor BIGINT,
+  ADD COLUMN IF NOT EXISTS lifecycle_status VARCHAR(16) NOT NULL DEFAULT 'POSTING',
+  ADD COLUMN IF NOT EXISTS finalized_at TIMESTAMPTZ;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'uq_ledger_accounts_tenant_account') THEN
+    ALTER TABLE public.ledger_accounts
+      ADD CONSTRAINT uq_ledger_accounts_tenant_account UNIQUE USING INDEX idx_ledger_accounts_tenant_account;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'uq_ledger_accounts_tenant_account_currency') THEN
+    ALTER TABLE public.ledger_accounts
+      ADD CONSTRAINT uq_ledger_accounts_tenant_account_currency UNIQUE USING INDEX idx_ledger_accounts_tenant_account_currency;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_ledger_accounts_supported_currency') THEN
+    ALTER TABLE public.ledger_accounts
+      ADD CONSTRAINT chk_ledger_accounts_supported_currency
+        CHECK (currency_code IN ('JPY','KRW','VND','CLP','ISK','USD','EUR','GBP','INR','CAD','AUD','SGD','CHF','BHD','KWD','OMR','JOD','TND')) NOT VALID;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_ledger_accounts_safe_bigint') THEN
+    ALTER TABLE public.ledger_accounts
+      ADD CONSTRAINT chk_ledger_accounts_safe_bigint
+        CHECK (balance_minor >= -900000000000000 AND balance_minor <= 900000000000000) NOT VALID;
+  END IF;
+
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'uq_journal_entries_tenant_journal_currency') THEN
+    ALTER TABLE public.journal_entries
+      ADD CONSTRAINT uq_journal_entries_tenant_journal_currency UNIQUE USING INDEX idx_journal_entries_tenant_journal_currency;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_journal_entries_supported_currency') THEN
+    ALTER TABLE public.journal_entries
+      ADD CONSTRAINT chk_journal_entries_supported_currency
+        CHECK (currency_code IN ('JPY','KRW','VND','CLP','ISK','USD','EUR','GBP','INR','CAD','AUD','SGD','CHF','BHD','KWD','OMR','JOD','TND')) NOT VALID;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_journal_entries_totals_balanced') THEN
+    ALTER TABLE public.journal_entries
+      ADD CONSTRAINT chk_journal_entries_totals_balanced
+        CHECK (
+          total_debit_minor > 0
+          AND total_debit_minor <= 900000000000000
+          AND total_credit_minor > 0
+          AND total_credit_minor <= 900000000000000
+          AND total_debit_minor = total_credit_minor
+        ) NOT VALID;
+  END IF;
+
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'uq_journal_postings_journal_account') THEN
+    ALTER TABLE public.journal_postings
+      ADD CONSTRAINT uq_journal_postings_journal_account UNIQUE USING INDEX idx_journal_postings_journal_account;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_journal_postings_supported_currency') THEN
+    ALTER TABLE public.journal_postings
+      ADD CONSTRAINT chk_journal_postings_supported_currency
+        CHECK (currency_code IN ('JPY','KRW','VND','CLP','ISK','USD','EUR','GBP','INR','CAD','AUD','SGD','CHF','BHD','KWD','OMR','JOD','TND')) NOT VALID;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_journal_postings_tenant_account') THEN
+    ALTER TABLE public.journal_postings
+      ADD CONSTRAINT fk_journal_postings_tenant_account
+        FOREIGN KEY (tenant_id, account_id)
+        REFERENCES public.ledger_accounts (tenant_id, account_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT NOT VALID;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_journal_postings_tenant_account_currency') THEN
+    ALTER TABLE public.journal_postings
+      ADD CONSTRAINT fk_journal_postings_tenant_account_currency
+        FOREIGN KEY (tenant_id, account_id, currency_code)
+        REFERENCES public.ledger_accounts (tenant_id, account_id, currency_code)
+        ON UPDATE RESTRICT ON DELETE RESTRICT NOT VALID;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_journal_postings_tenant_journal_currency') THEN
+    ALTER TABLE public.journal_postings
+      ADD CONSTRAINT fk_journal_postings_tenant_journal_currency
+        FOREIGN KEY (tenant_id, journal_id, currency_code)
+        REFERENCES public.journal_entries (tenant_id, journal_id, currency_code)
+        ON UPDATE RESTRICT ON DELETE RESTRICT NOT VALID;
+  END IF;
+END
+$$;
+COMMIT;
+
+-- ============================================================================
+-- PHASE 3: Validate Constraints Online (SHARE UPDATE EXCLUSIVE — Non-Blocking)
+-- ============================================================================
+ALTER TABLE public.ledger_accounts VALIDATE CONSTRAINT chk_ledger_accounts_supported_currency;
+ALTER TABLE public.ledger_accounts VALIDATE CONSTRAINT chk_ledger_accounts_safe_bigint;
+ALTER TABLE public.journal_entries VALIDATE CONSTRAINT chk_journal_entries_supported_currency;
+ALTER TABLE public.journal_entries VALIDATE CONSTRAINT chk_journal_entries_totals_balanced;
+ALTER TABLE public.journal_postings VALIDATE CONSTRAINT chk_journal_postings_supported_currency;
+ALTER TABLE public.journal_postings VALIDATE CONSTRAINT fk_journal_postings_tenant_account;
+ALTER TABLE public.journal_postings VALIDATE CONSTRAINT fk_journal_postings_tenant_account_currency;
+ALTER TABLE public.journal_postings VALIDATE CONSTRAINT fk_journal_postings_tenant_journal_currency;
+```
+
+#### 3. Non-Destructive Exception Handling & Failed Migration Recovery Strategy
+1. **Strict Prohibition on Silent Rewrites**: Never `DELETE` or `UPDATE` historical rows in `journal_entries` or `journal_postings` to force a constraint to validate. If `PREFLIGHT-01`..`PREFLIGHT-04` return rows:
+   - Abort Phase 3 (`VALIDATE CONSTRAINT`) while keeping Phase 2 (`NOT VALID` constraints) active so **all new writes are immediately protected**.
+   - Record detected historical anomalies in an immutable audit table `public.ledger_migration_exceptions` for Finance Controller + Security Architect review and formal **compensating journal entry** resolution.
+2. **Recovering from Interrupted `CREATE UNIQUE INDEX CONCURRENTLY`**:
+   - Inspect `SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid;` and run `DROP INDEX CONCURRENTLY IF EXISTS public.idx_ledger_accounts_tenant_account;` before re-running Phase 1.
+3. **Rolling Back Phase 2 `NOT VALID` Constraints Without Table Rewrite**:
+   - Executing `ALTER TABLE public.journal_postings DROP CONSTRAINT IF EXISTS fk_journal_postings_tenant_account;` is a metadata-only operation requiring zero table rewrite.
 
 ---
 
@@ -1182,11 +2207,34 @@ CREATE CONSTRAINT TRIGGER trg_verify_journal_balanced_commit
    - Assert that `verifyOtpCodeConstantTime(..., new Date('invalid'))` returns `false`.
    - Assert that submitting a valid OTP twice to `verifyAndConsumeOtpAtomically` succeeds on the first call and returns `ALREADY_CONSUMED_REPLAY_BLOCKED` on the second call.
    - Assert that 5 failed OTP attempts transition the challenge to `LOCKED_MAX_ATTEMPTS`, rejecting a subsequent 6th attempt even with the correct OTP code.
-4. **Journal Direction, Cross-Tenant Account & Idempotency Test**:
-   - Assert that passing `direction: 'INVALID' as any` throws `LEDGER_REJECTED: Invalid posting direction`.
-   - Assert that referencing an `accountId` owned by `tenant_B` inside `persistBalancedJournalAtomically` for `tenant_A` throws `LEDGER_CROSS_TENANT_ACCOUNT_DENIED`.
+4. **PostgreSQL Database-Layer Ledger Acceptance Suite (`ARGON-LEDGER-001` & `ARGON-LEDGER-005` — `VERIFY-22`)**:
+   - Execute the complete ledger DDL, preflight queries, composite foreign keys, `CHECK` constraints, and deferred constraint triggers against PostgreSQL (`@electric-sql/pglite` / PostgreSQL 16+) and verify all 10 acceptance criteria:
+     1. Cross-tenant account posting rejected (`23503` / `LEDGER_CROSS_TENANT_ACCOUNT_DENIED`).
+     2. Valid same-tenant balanced posting accepted.
+     3. Invalid historical records detected by `PREFLIGHT-01`..`PREFLIGHT-04` without mutating rows.
+     4. Account tenant reassignment rejected when referenced (`LEDGER_ACCOUNT_IDENTITY_IMMUTABLE` / `ON UPDATE RESTRICT`).
+     5. Mismatched journal/account currency rejected (`LEDGER_CURRENCY_MISMATCH` / `fk_journal_postings_tenant_journal_currency`).
+     6. Unsupported account/journal currency rejected (`chk_ledger_accounts_supported_currency`).
+     7. Incorrect stored header totals (`total_debit_minor <> SUM(DEBIT)` or `total_debit_minor <> total_credit_minor`) rejected at commit (`LEDGER_STORED_AGGREGATE_MISMATCH`).
+     8. Floating-point monetary columns/arithmetic absent (`BIGINT` minor units verified via `information_schema.columns`).
+     9. Valid multi-line balanced journal accepted at `COMMIT`.
+     10. Out-of-band / concurrent posting appended to an existing journal rejected at `COMMIT` without corrupting aggregate integrity.
+5. **PostgreSQL Database-Layer Deferred Enforcement, RLS & Canonical Roles (`ARGON-LEDGER-002`, `ARGON-LEDGER-003`, `ARGON-ROLE-004` — `VERIFY-23`)**:
+   - Execute the complete canonical role setup, `security.verify_active_tenant_context()`, forced RLS policies, journal lifecycle state engine, and deferred commit triggers against PostgreSQL (`@electric-sql/pglite` / PostgreSQL 16+):
+     1. Unbalanced postings deferred failure at transaction `COMMIT` (`LEDGER_DB_INVARIANT_VIOLATION` / `23514`).
+     2. Balanced journal auto-finalizes to `FINALIZED` and stamps `finalized_at`.
+     3. Appending postings to a `FINALIZED` journal blocked immediately (`LEDGER_POSTING_FINALIZED_CLOSED`).
+     4. Modifying or deleting postings on a `FINALIZED` journal blocked (`LEDGER_POSTING_FINALIZED_IMMUTABLE`).
+     5. Relocating a posting between journals evaluates both `OLD` and `NEW` parent journals at `COMMIT`.
+     6. Restrictive tenant RLS isolation: `app_runtime` / `app_login` sees 0 rows from other tenants.
+     7. Cross-tenant mutation blocked by RLS `WITH CHECK`.
+     8. Missing or forged GUC HMAC (`app.current_tenant_mac`) fails closed (0 rows returned).
+     9. Direct access to `security.guc_hmac_keys` denied to `app_runtime` (`42501`).
+     10. Runtime roles verify `NOBYPASSRLS` and `NOSUPERUSER` in `pg_roles`.
 
 ### Authoritative References
 - **ISO 4217 Currency Codes & Minor Unit Exponents**: https://www.iso.org/iso-4217-currency-codes.html
 - **PostgreSQL 16 Numeric Types (`bigint` 8-byte signed range)**: https://www.postgresql.org/docs/current/datatype-numeric.html
+- **PostgreSQL 16 `CREATE CONSTRAINT TRIGGER ... DEFERRABLE INITIALLY DEFERRED`**: https://www.postgresql.org/docs/current/sql-createtrigger.html
 - **RFC 9562 — Universally Unique IDentifiers (UUIDv7)**: https://datatracker.ietf.org/doc/html/rfc9562
+

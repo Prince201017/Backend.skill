@@ -463,20 +463,56 @@ SET statement_timeout = '10s';
 CREATE SCHEMA IF NOT EXISTS extensions;
 CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA extensions;
 
--- 1. Dedicated Migration Owner vs. Least-Privilege Runtime Role (Idempotent for Clean DB Install)
+-- 1. Canonical 3-Role Architecture (ARGON-ROLE-004 — Idempotent & Order-Independent with Module 01)
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'db_migrator') THEN
     CREATE ROLE db_migrator NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+  ELSE
+    IF EXISTS (
+      SELECT 1 FROM pg_roles
+      WHERE rolname = 'db_migrator'
+        AND (rolsuper OR rolbypassrls OR rolcreatedb OR rolcreaterole OR rolcanlogin)
+    ) THEN
+      RAISE EXCEPTION 'ROLE_SECURITY_INVARIANT_VIOLATION: db_migrator has conflicting attributes (must be NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS)'
+        USING ERRCODE = '28000';
+    END IF;
   END IF;
+
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_runtime') THEN
-    CREATE ROLE app_runtime LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+    CREATE ROLE app_runtime NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+  ELSE
+    IF EXISTS (
+      SELECT 1 FROM pg_roles
+      WHERE rolname = 'app_runtime'
+        AND (rolsuper OR rolbypassrls OR rolcreatedb OR rolcreaterole OR rolcanlogin)
+    ) OR pg_has_role('app_runtime', 'db_migrator', 'MEMBER') THEN
+      RAISE EXCEPTION 'ROLE_SECURITY_INVARIANT_VIOLATION: app_runtime has conflicting attributes or inherits db_migrator'
+        USING ERRCODE = '28000';
+    END IF;
+  END IF;
+
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_login') THEN
+    CREATE ROLE app_login LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS IN ROLE app_runtime;
+  ELSE
+    IF EXISTS (
+      SELECT 1 FROM pg_roles
+      WHERE rolname = 'app_login'
+        AND (rolsuper OR rolbypassrls OR rolcreatedb OR rolcreaterole OR NOT rolcanlogin)
+    ) OR pg_has_role('app_login', 'db_migrator', 'MEMBER') THEN
+      RAISE EXCEPTION 'ROLE_SECURITY_INVARIANT_VIOLATION: app_login has conflicting attributes or inherits db_migrator'
+        USING ERRCODE = '28000';
+    END IF;
+    IF NOT pg_has_role('app_login', 'app_runtime', 'MEMBER') THEN
+      GRANT app_runtime TO app_login;
+    END IF;
   END IF;
 END
 $$;
 
 REVOKE ALL ON SCHEMA public FROM PUBLIC;
-GRANT USAGE ON SCHEMA public TO app_runtime;
+GRANT USAGE ON SCHEMA public TO db_migrator, app_runtime;
+GRANT USAGE ON SCHEMA extensions TO db_migrator, app_runtime;
 
 -- 1b. Prerequisite Base Domain Tables & Tenant-Bounded Search Index
 CREATE TABLE IF NOT EXISTS public.tenants (
@@ -516,19 +552,24 @@ CREATE INDEX IF NOT EXISTS idx_orders_tenant_created_at
 CREATE INDEX IF NOT EXISTS idx_orders_tenant_search_gin
   ON public.orders USING GIN (search_vector);
 
-GRANT SELECT, INSERT, UPDATE, DELETE ON public.tenants, public.tenant_members, public.orders TO app_runtime;
+ALTER TABLE public.tenants OWNER TO db_migrator;
+ALTER TABLE public.tenant_members OWNER TO db_migrator;
+ALTER TABLE public.orders OWNER TO db_migrator;
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.tenants, public.tenant_members, public.orders TO db_migrator, app_runtime;
 
 -- 2. Restricted Security Schema & Protected HMAC Key Table (Inaccessible to app_runtime)
 CREATE SCHEMA IF NOT EXISTS security AUTHORIZATION db_migrator;
 REVOKE ALL ON SCHEMA security FROM PUBLIC;
-GRANT USAGE ON SCHEMA security TO app_runtime;
+GRANT USAGE ON SCHEMA security TO db_migrator, app_runtime;
 
 CREATE TABLE IF NOT EXISTS security.guc_hmac_keys (
     key_id INT PRIMARY KEY DEFAULT 1 CHECK (key_id = 1),
     hmac_secret TEXT NOT NULL CHECK (char_length(hmac_secret) >= 32)
 );
-REVOKE ALL ON TABLE security.guc_hmac_keys FROM PUBLIC;
-REVOKE ALL ON TABLE security.guc_hmac_keys FROM app_runtime;
+ALTER TABLE security.guc_hmac_keys OWNER TO db_migrator;
+REVOKE ALL ON TABLE security.guc_hmac_keys FROM PUBLIC, app_runtime, app_login;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE security.guc_hmac_keys TO db_migrator;
 
 CREATE OR REPLACE FUNCTION security.constant_time_hex_equal_32(expected_hex TEXT, actual_hex TEXT)
 RETURNS BOOLEAN
@@ -614,6 +655,7 @@ AS $$
 DECLARE
   v_tenant_id TEXT;
   v_tenant_mac TEXT;
+  v_user_id TEXT;
   v_secret TEXT;
   v_expected_mac TEXT;
 BEGIN
@@ -624,6 +666,12 @@ BEGIN
   END IF;
   IF v_tenant_id::uuid <> row_tenant_id THEN
     RETURN FALSE;
+  END IF;
+  v_user_id := NULLIF(current_setting('app.current_user_id', true), '');
+  IF v_user_id IS NOT NULL THEN
+    IF NOT security.verify_active_user_context(v_user_id::uuid) THEN
+      RETURN FALSE;
+    END IF;
   END IF;
   SELECT hmac_secret INTO v_secret FROM security.guc_hmac_keys WHERE key_id = 1;
   IF v_secret IS NULL OR char_length(v_secret) < 32 THEN
@@ -644,35 +692,52 @@ EXCEPTION
 END;
 $$;
 
+ALTER FUNCTION security.constant_time_hex_equal_32(TEXT, TEXT) OWNER TO db_migrator;
+ALTER FUNCTION security.verify_active_user_context(UUID) OWNER TO db_migrator;
+ALTER FUNCTION security.verify_active_tenant_context(UUID) OWNER TO db_migrator;
+
 REVOKE ALL ON FUNCTION security.constant_time_hex_equal_32(TEXT, TEXT) FROM PUBLIC;
 REVOKE ALL ON FUNCTION security.verify_active_user_context(UUID) FROM PUBLIC;
 REVOKE ALL ON FUNCTION security.verify_active_tenant_context(UUID) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION security.verify_active_user_context(UUID) TO app_runtime;
-GRANT EXECUTE ON FUNCTION security.verify_active_tenant_context(UUID) TO app_runtime;
+GRANT EXECUTE ON FUNCTION security.constant_time_hex_equal_32(TEXT, TEXT) TO db_migrator;
+GRANT EXECUTE ON FUNCTION security.verify_active_user_context(UUID) TO app_runtime, db_migrator;
+GRANT EXECUTE ON FUNCTION security.verify_active_tenant_context(UUID) TO app_runtime, db_migrator;
 
 -- 3. Solve the tenant_members Bootstrap Paradox Securely (DEVIL-02 Remediation):
 -- During withTenantTransaction() bootstrap, ONLY app.current_user_id + app.current_user_mac are set
--- while app.current_tenant_id remains empty (''). This policy verifies the cryptographic MAC on
--- app.current_user_id (for self-membership lookup) OR app.current_tenant_id (after tenant activation).
+-- while app.current_tenant_id remains empty (''). Note that PostgreSQL evaluates UPDATE USING policies
+-- on SELECT ... FOR SHARE / FOR UPDATE queries, so the policy is FOR ALL with USING permitting self-lookup
+-- (for SELECT / FOR SHARE) and WITH CHECK requiring active tenant context for any INSERT/UPDATE mutation.
 ALTER TABLE public.tenant_members ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.tenant_members FORCE ROW LEVEL SECURITY;
 
 CREATE POLICY tenant_members_self_or_active_tenant_policy ON public.tenant_members
-  FOR SELECT
-  TO app_runtime
+  AS PERMISSIVE
+  FOR ALL
+  TO app_runtime, db_migrator
   USING (
     security.verify_active_user_context(user_id)
     OR security.verify_active_tenant_context(tenant_id)
+  )
+  WITH CHECK (
+    security.verify_active_tenant_context(tenant_id)
   );
 
 -- 4. Strict Cryptographic Tenant Isolation Policy on Domain Tables (Fail-Closed on Missing/Forged MAC)
 ALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.orders FORCE ROW LEVEL SECURITY;
 
+CREATE POLICY orders_tenant_permissive_policy ON public.orders
+  AS PERMISSIVE
+  FOR ALL
+  TO app_runtime, db_migrator
+  USING (security.verify_active_tenant_context(tenant_id))
+  WITH CHECK (security.verify_active_tenant_context(tenant_id));
+
 CREATE POLICY tenant_isolation_policy ON public.orders
   AS RESTRICTIVE
   FOR ALL
-  TO app_runtime
+  TO PUBLIC
   USING (security.verify_active_tenant_context(tenant_id))
   WITH CHECK (security.verify_active_tenant_context(tenant_id));
 ```

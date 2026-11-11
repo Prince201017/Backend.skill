@@ -82,6 +82,11 @@ const FORBIDDEN_CODE_BLOCK_ANTI_PATTERNS: ReadonlyArray<{
     description: 'Invalid PostgreSQL syntax: direct ORDER BY / LIMIT on an UPDATE statement without a CTE or subquery',
     regex: /\bUPDATE\s+[a-zA-Z0-9_.]+\s+SET\s+[^;()]*?\bORDER\s+BY\b[^;()]*?\bLIMIT\b/i,
   },
+  {
+    id: 'NON_COMPOSITE_LEDGER_ACCOUNT_FK',
+    description: 'Single-column foreign key to ledger_accounts(account_id) without composite (tenant_id, account_id) binding (ARGON-LEDGER-001)',
+    regex: /\baccount_id\s+UUID\s+NOT\s+NULL\s+REFERENCES\s+(?:public\.)?ledger_accounts\s*\(\s*account_id\s*\)/i,
+  },
 ];
 
 export interface ExtractedCodeBlock {
@@ -185,7 +190,8 @@ export function extractFencedCodeBlocks(markdown: string): string[] {
   return extractFencedCodeBlocksDetailed(markdown).blocks.map((b) => b.code);
 }
 
-const CANONICAL_EVIDENCE_ID_REGEX = /^(?:TEST-\d{2,3}|DEVIL-\d{2,3}|VERIFY-\d{2})$/;
+const CANONICAL_EVIDENCE_ID_REGEX =
+  /^(?:TEST-\d{2,3}|DEVIL-\d{2,3}|VERIFY-\d{2}|ARGON-[A-Z]+-\d{3})$/;
 
 export function validateEvidenceIdentifiers(ids: Iterable<string>): {
   validIds: string[];
