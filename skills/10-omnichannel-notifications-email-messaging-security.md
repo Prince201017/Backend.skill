@@ -101,26 +101,52 @@ export interface SmsQuotaBudgetStore {
 }
 
 const E164_REGEX = /^\+[1-9]\d{7,14}$/;
-const BLOCKED_PREMIUM_PREFIXES = ['+1900', '+1976', '+4490', '+4470'] as const;
+const VALID_COUNTRY_PREFIX_REGEX = /^\+[1-9]\d{0,3}$/;
+const BLOCKED_PREMIUM_PREFIXES = [
+  '+1900',
+  '+1976',
+  '+4490',
+  '+4470',
+  // High-cost NANP international revenue-share / toll-fraud area codes
+  '+1809',
+  '+1829',
+  '+1849',
+  '+1876',
+  '+1473',
+  '+1649',
+  '+1284',
+  '+1767',
+] as const;
 
 export function validateRecipientAndConsent(params: {
   profile: RecipientChannelProfile | null;
+  expectedTenantId?: string;
   classification: NotificationClassification;
   e164Phone: string;
   allowedCountryPrefixes: readonly string[];
 }): void {
-  const { profile, classification, e164Phone, allowedCountryPrefixes } = params;
+  const { profile, expectedTenantId, classification, e164Phone, allowedCountryPrefixes } = params;
   if (!E164_REGEX.test(e164Phone)) {
     throw new Error('SMS_INVALID_E164_PHONE');
   }
   if (BLOCKED_PREMIUM_PREFIXES.some((prefix) => e164Phone.startsWith(prefix))) {
     throw new Error('SMS_PREMIUM_NUMBER_BLOCKED');
   }
-  if (!allowedCountryPrefixes.some((prefix) => e164Phone.startsWith(prefix))) {
+  // Reject wildcard/empty/'+' country prefixes that would bypass geo-fencing allowlists
+  const validCountryPrefixes = allowedCountryPrefixes.filter((prefix) =>
+    VALID_COUNTRY_PREFIX_REGEX.test(prefix)
+  );
+  if (
+    validCountryPrefixes.length === 0 ||
+    !validCountryPrefixes.some((prefix) => e164Phone.startsWith(prefix))
+  ) {
     throw new Error('SMS_COUNTRY_PREFIX_NOT_ALLOWED');
   }
   if (!profile || profile.e164Phone !== e164Phone) {
     throw new Error('SMS_RECIPIENT_PROFILE_MISMATCH');
+  }
+  if (expectedTenantId !== undefined && profile.tenantId !== expectedTenantId) {
+    throw new Error('SMS_RECIPIENT_TENANT_MISMATCH');
   }
   if (!profile.phoneVerified) {
     throw new Error('SMS_RECIPIENT_PHONE_NOT_VERIFIED');
@@ -212,9 +238,22 @@ export async function dispatchSmsWithBudgetAndFailover(params: {
   providerMessageSid?: string;
   providerUsed?: string;
 }> {
+  if (!Number.isInteger(params.costCents) || params.costCents <= 0) {
+    throw new Error('SMS_INVALID_COST_CENTS');
+  }
+  if (
+    typeof params.body !== 'string' ||
+    params.body.trim().length === 0 ||
+    params.body.length > 1600 ||
+    params.body.includes('\0')
+  ) {
+    throw new Error('SMS_INVALID_MESSAGE_BODY');
+  }
+
   const profile = await params.store.getRecipientProfile(params.tenantId, params.recipientId);
   validateRecipientAndConsent({
     profile,
+    expectedTenantId: params.tenantId,
     classification: params.classification,
     e164Phone: params.e164Phone,
     allowedCountryPrefixes: params.allowedCountryPrefixes,
@@ -255,6 +294,7 @@ export async function dispatchSmsWithBudgetAndFailover(params: {
     const freshProfile = await params.store.getRecipientProfile(params.tenantId, params.recipientId);
     validateRecipientAndConsent({
       profile: freshProfile,
+      expectedTenantId: params.tenantId,
       classification: params.classification,
       e164Phone: params.e164Phone,
       allowedCountryPrefixes: params.allowedCountryPrefixes,
@@ -414,34 +454,55 @@ export async function reconcileStaleSmsBudgetReservations(params: {
     | { found: false }
     | { indeterminate: true }
   >;
-}): Promise<{ committedCount: number; releasedCount: number; pendingCount: number }> {
+}): Promise<{
+  committedCount: number;
+  releasedCount: number;
+  pendingCount: number;
+  failedCount: number;
+  skippedCount: number;
+}> {
   let committedCount = 0;
   let releasedCount = 0;
   let pendingCount = 0;
+  let failedCount = 0;
+  let skippedCount = 0;
 
   for (const rec of params.staleRecords) {
+    if (
+      rec.status !== 'BUDGET_RESERVED' &&
+      rec.status !== 'AMBIGUOUS_RECONCILIATION_REQUIRED'
+    ) {
+      skippedCount += 1;
+      continue;
+    }
+
     const providerKey =
       rec.providerIdempotencyKey || `${rec.tenantId}:${rec.reservationId}:${rec.idempotencyKey}`;
-    const lookup = await params.queryProviderStatusByIdempotencyKey(providerKey);
-    if ('found' in lookup && lookup.found) {
-      await params.store.commitReservation({
-        reservationId: rec.reservationId,
-        tenantId: rec.tenantId,
-        providerMessageSid: lookup.providerMessageSid,
-      });
-      committedCount += 1;
-    } else if ('found' in lookup && !lookup.found) {
-      await params.store.releaseReservation({
-        reservationId: rec.reservationId,
-        tenantId: rec.tenantId,
-        reason: 'STALE_RESERVATION_RECONCILED_NOT_SENT',
-      });
-      releasedCount += 1;
-    } else {
-      pendingCount += 1;
+    try {
+      const lookup = await params.queryProviderStatusByIdempotencyKey(providerKey);
+      if ('found' in lookup && lookup.found) {
+        await params.store.commitReservation({
+          reservationId: rec.reservationId,
+          tenantId: rec.tenantId,
+          providerMessageSid: lookup.providerMessageSid,
+        });
+        committedCount += 1;
+      } else if ('found' in lookup && !lookup.found) {
+        await params.store.releaseReservation({
+          reservationId: rec.reservationId,
+          tenantId: rec.tenantId,
+          reason: 'STALE_RESERVATION_RECONCILED_NOT_SENT',
+        });
+        releasedCount += 1;
+      } else {
+        pendingCount += 1;
+      }
+    } catch {
+      // Isolate per-record provider/store errors so one broken reservation never stalls the sweeper batch
+      failedCount += 1;
     }
   }
-  return { committedCount, releasedCount, pendingCount };
+  return { committedCount, releasedCount, pendingCount, failedCount, skippedCount };
 }
 ```
 
@@ -452,3 +513,47 @@ export async function reconcileStaleSmsBudgetReservations(params: {
 - **CRLF Header Guard**: Every `To`, `Cc`, `Bcc`, `Subject`, `Reply-To`, and custom header value MUST reject `\r`, `\n`, `%0a`, `%0d`, and null bytes (`\0`).
 - **Context-Aware HTML Escaping**: Never concatenate user fields (`firstName`, `organizationName`, `invoiceMemo`) into HTML templates without escaping `&`, `<`, `>`, `"`, `'`, and `` ` ``. URLs injected into `href` attributes must be parsed with `new URL()` and restricted to `https:` (never `javascript:` or `data:`).
 - **Authenticated Domain Alignment**: Enforce SPF (`-all`), DKIM (2048-bit RSA), and DMARC (`p=reject; pct=100`).
+
+```typescript
+// Executable TypeScript — Email Header Injection, HTML Escaping & Href Validation Helpers
+export function validateSafeEmailHeaderValue(headerName: string, rawValue: string): string {
+  if (
+    typeof rawValue !== 'string' ||
+    /[\r\n\0]/.test(rawValue) ||
+    /%0[ad]/i.test(rawValue) ||
+    rawValue.length > 998
+  ) {
+    throw new Error(`EMAIL_HEADER_INJECTION_BLOCKED: Unsafe value for header "${headerName}"`);
+  }
+  return rawValue.trim();
+}
+
+export function escapeHtmlEmailValue(raw: string): string {
+  return raw
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+    .replace(/`/g, '&#96;');
+}
+
+export function validateSafeEmailHrefUrl(rawUrl: string): string {
+  if (typeof rawUrl !== 'string' || /[\r\n\0]/.test(rawUrl)) {
+    throw new Error('EMAIL_UNSAFE_HREF_URL: Control characters forbidden in email link');
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl.trim());
+  } catch {
+    throw new Error('EMAIL_UNSAFE_HREF_URL: Malformed URL');
+  }
+  if (parsed.protocol !== 'https:') {
+    throw new Error(`EMAIL_UNSAFE_HREF_URL: Protocol "${parsed.protocol}" is forbidden; only https: is allowed`);
+  }
+  if (parsed.username || parsed.password) {
+    throw new Error('EMAIL_UNSAFE_HREF_URL: Embedded credentials are forbidden in email links');
+  }
+  return parsed.toString();
+}
+```

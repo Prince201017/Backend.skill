@@ -52,6 +52,24 @@ export function extractCanonicalNetworkPrefix(rawIp: string): string {
       ...right,
     ].map((h) => h.padStart(4, '0').toLowerCase());
 
+    // Normalize IPv4-mapped IPv6 (::ffff:w.x.y.z) back to canonical IPv4 /24 prefix
+    // so dual-stack Node.js servers do not collapse all IPv4 users into 0000:0000:0000::/48!
+    if (
+      fullHextets[0] === '0000' &&
+      fullHextets[1] === '0000' &&
+      fullHextets[2] === '0000' &&
+      fullHextets[3] === '0000' &&
+      fullHextets[4] === '0000' &&
+      fullHextets[5] === 'ffff'
+    ) {
+      const hi = Number.parseInt(fullHextets[6], 16);
+      const lo = Number.parseInt(fullHextets[7], 16);
+      const o1 = (hi >> 8) & 0xff;
+      const o2 = hi & 0xff;
+      const o3 = (lo >> 8) & 0xff;
+      return `${o1}.${o2}.${o3}.0/24`;
+    }
+
     return `${fullHextets[0]}:${fullHextets[1]}:${fullHextets[2]}::/48`;
   }
 
@@ -374,7 +392,15 @@ export async function authorizeActionFromTrustedStore(params: {
     const hasValidRebacForAction = tuples.some((tuple) => {
       if (tuple.status !== 'ACTIVE') return false;
       if (tuple.tenantId !== resource.tenantId) return false;
-      if (tuple.expiresAtMs !== undefined && nowMs >= tuple.expiresAtMs) return false;
+      if (tuple.subjectUserId !== subject.userId) return false;
+      if (tuple.resourceId !== resource.resourceId) return false;
+      if (tuple.resourceType !== resource.resourceType) return false;
+      if (
+        tuple.expiresAtMs !== undefined &&
+        (!Number.isFinite(tuple.expiresAtMs) || nowMs >= tuple.expiresAtMs)
+      ) {
+        return false;
+      }
       return allowedRelationsForAction?.[tuple.relation]?.has(params.action) ?? false;
     });
 
@@ -413,15 +439,22 @@ export async function authorizeActionFromTrustedStore(params: {
     return { allowed: false, reason: 'KYC_IDENTITY_VERIFICATION_REQUIRED' };
   }
 
-  // 8. Enforce fresh Step-Up MFA (within 5 minutes) for sensitive operations
+  // 8. Enforce fresh Step-Up MFA (within 5 minutes, rejecting future timestamps & missing refund amounts fail-closed)
   const requiresFreshMfa =
     params.action === 'ledger:export' ||
     params.action === 'member:invite' ||
-    (params.action === 'order:refund' && (resource.amountMinor ?? 0n) >= 100_000n);
+    (params.action === 'order:refund' &&
+      (resource.amountMinor === undefined || resource.amountMinor >= 100_000n));
 
   if (requiresFreshMfa) {
     const fiveMinutesAgo = nowMs - 5 * 60 * 1000;
-    if (!subject.mfaVerifiedAtMs || subject.mfaVerifiedAtMs < fiveMinutesAgo) {
+    const maxFutureSkewMs = nowMs + 60 * 1000;
+    if (
+      typeof subject.mfaVerifiedAtMs !== 'number' ||
+      !Number.isFinite(subject.mfaVerifiedAtMs) ||
+      subject.mfaVerifiedAtMs < fiveMinutesAgo ||
+      subject.mfaVerifiedAtMs > maxFutureSkewMs
+    ) {
       return { allowed: false, reason: 'STEP_UP_MFA_REQUIRED' };
     }
   }
@@ -439,33 +472,95 @@ export async function authorizeActionFromTrustedStore(params: {
 import crypto from 'node:crypto';
 import { promisify } from 'node:util';
 
-const scryptAsync = promisify(crypto.scrypt);
+function deriveScryptAsync(
+  password: string,
+  salt: Buffer,
+  keylen: number,
+  options: crypto.ScryptOptions
+): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    crypto.scrypt(password, salt, keylen, options, (err, derivedKey) => {
+      if (err) reject(err);
+      else resolve(derivedKey);
+    });
+  });
+}
+
+const DEFAULT_SCRYPT_PARAMS = {
+  N: 32768, // OWASP-recommended minimum work factor (2^15)
+  r: 8,
+  p: 1,
+  maxmem: 64 * 1024 * 1024,
+} as const;
 
 export interface PasswordHashRecord {
   saltHex: string;
   derivedKeyHex: string;
+  scryptN?: number;
+  scryptR?: number;
+  scryptP?: number;
 }
 
 const DUMMY_SALT_HEX = crypto.randomBytes(16).toString('hex');
 const DUMMY_DERIVED_HEX = crypto
-  .scryptSync('dummy-penetration-defense-secret', Buffer.from(DUMMY_SALT_HEX, 'hex'), 64)
+  .scryptSync(
+    'dummy-penetration-defense-secret',
+    Buffer.from(DUMMY_SALT_HEX, 'hex'),
+    64,
+    DEFAULT_SCRYPT_PARAMS
+  )
   .toString('hex');
 
 let activeScryptWorkers = 0;
 const activeScryptByCaller = new Map<string, number>();
 const DEFAULT_MAX_CONCURRENT_SCRYPT = 8;
 
-export async function hashPasswordScrypt(rawPassword: string): Promise<PasswordHashRecord> {
+function acquireScryptSlot(maxConcurrentHashes: number, callerKey?: string): void {
+  if (activeScryptWorkers >= maxConcurrentHashes) {
+    throw new Error('AUTH_HASH_CONCURRENCY_LIMIT_EXCEEDED: Too many concurrent password operations');
+  }
+  const maxPerCaller = Math.max(1, Math.floor(maxConcurrentHashes / 2));
+  if (callerKey && (activeScryptByCaller.get(callerKey) ?? 0) >= maxPerCaller) {
+    throw new Error('AUTH_CALLER_HASH_CONCURRENCY_LIMIT_EXCEEDED: Caller exceeded per-source hash quota');
+  }
+  activeScryptWorkers += 1;
+  if (callerKey) {
+    activeScryptByCaller.set(callerKey, (activeScryptByCaller.get(callerKey) ?? 0) + 1);
+  }
+}
+
+function releaseScryptSlot(callerKey?: string): void {
+  activeScryptWorkers = Math.max(0, activeScryptWorkers - 1);
+  if (callerKey) {
+    const nextCaller = (activeScryptByCaller.get(callerKey) ?? 1) - 1;
+    if (nextCaller <= 0) activeScryptByCaller.delete(callerKey);
+    else activeScryptByCaller.set(callerKey, nextCaller);
+  }
+}
+
+export async function hashPasswordScrypt(
+  rawPassword: string,
+  maxConcurrentHashes = DEFAULT_MAX_CONCURRENT_SCRYPT,
+  callerKey?: string
+): Promise<PasswordHashRecord> {
   const normalized = rawPassword.normalize('NFKC');
   if (Buffer.byteLength(normalized, 'utf8') < 8 || Buffer.byteLength(normalized, 'utf8') > 1024) {
     throw new Error('AUTH_PASSWORD_LENGTH_INVALID: Password must be between 8 and 1024 UTF-8 bytes');
   }
-  const saltBuf = crypto.randomBytes(16);
-  const derivedBuf = (await scryptAsync(normalized, saltBuf, 64)) as Buffer;
-  return {
-    saltHex: saltBuf.toString('hex'),
-    derivedKeyHex: derivedBuf.toString('hex'),
-  };
+  acquireScryptSlot(maxConcurrentHashes, callerKey);
+  try {
+    const saltBuf = crypto.randomBytes(16);
+    const derivedBuf = await deriveScryptAsync(normalized, saltBuf, 64, DEFAULT_SCRYPT_PARAMS);
+    return {
+      saltHex: saltBuf.toString('hex'),
+      derivedKeyHex: derivedBuf.toString('hex'),
+      scryptN: DEFAULT_SCRYPT_PARAMS.N,
+      scryptR: DEFAULT_SCRYPT_PARAMS.r,
+      scryptP: DEFAULT_SCRYPT_PARAMS.p,
+    };
+  } finally {
+    releaseScryptSlot(callerKey);
+  }
 }
 
 export async function verifyPasswordTimingSafe(
@@ -474,15 +569,6 @@ export async function verifyPasswordTimingSafe(
   maxConcurrentHashes = DEFAULT_MAX_CONCURRENT_SCRYPT,
   callerKey?: string
 ): Promise<boolean> {
-  // Defeat libuv threadpool starvation DoS: enforce both global and per-caller concurrency limits
-  if (activeScryptWorkers >= maxConcurrentHashes) {
-    throw new Error('AUTH_HASH_CONCURRENCY_LIMIT_EXCEEDED: Too many concurrent password verifications');
-  }
-  const maxPerCaller = Math.max(1, Math.floor(maxConcurrentHashes / 2));
-  if (callerKey && (activeScryptByCaller.get(callerKey) ?? 0) >= maxPerCaller) {
-    throw new Error('AUTH_CALLER_HASH_CONCURRENCY_LIMIT_EXCEEDED: Caller exceeded per-source hash quota');
-  }
-
   const normalizedPassword = candidatePassword.normalize('NFKC');
   if (Buffer.byteLength(normalizedPassword, 'utf8') > 1024) {
     return false;
@@ -494,16 +580,33 @@ export async function verifyPasswordTimingSafe(
     throw new Error('AUTH_INVALID_STORED_HASH_FORMAT');
   }
 
-  activeScryptWorkers += 1;
-  if (callerKey) {
-    activeScryptByCaller.set(callerKey, (activeScryptByCaller.get(callerKey) ?? 0) + 1);
+  const scryptN = userHashRecord?.scryptN ?? (userHashRecord ? 16384 : DEFAULT_SCRYPT_PARAMS.N);
+  const scryptR = userHashRecord?.scryptR ?? DEFAULT_SCRYPT_PARAMS.r;
+  const scryptP = userHashRecord?.scryptP ?? DEFAULT_SCRYPT_PARAMS.p;
+  if (
+    !Number.isInteger(scryptN) ||
+    scryptN < 16384 ||
+    scryptN > 131072 ||
+    (scryptN & (scryptN - 1)) !== 0 ||
+    !Number.isInteger(scryptR) ||
+    scryptR < 8 ||
+    scryptR > 16 ||
+    !Number.isInteger(scryptP) ||
+    scryptP < 1 ||
+    scryptP > 4
+  ) {
+    throw new Error('AUTH_INVALID_STORED_HASH_PARAMETERS');
   }
+
+  // Defeat libuv threadpool starvation DoS: enforce both global and per-caller concurrency limits
+  acquireScryptSlot(maxConcurrentHashes, callerKey);
   try {
-    const derivedBuffer = (await scryptAsync(
+    const derivedBuffer = await deriveScryptAsync(
       normalizedPassword,
       Buffer.from(targetSaltHex, 'hex'),
-      64
-    )) as Buffer;
+      64,
+      { N: scryptN, r: scryptR, p: scryptP, maxmem: Math.max(64 * 1024 * 1024, 256 * scryptN * scryptR) }
+    );
 
     const expectedBuffer = Buffer.from(targetKeyHex, 'hex');
     if (derivedBuffer.length !== expectedBuffer.length) {
@@ -513,12 +616,7 @@ export async function verifyPasswordTimingSafe(
     const hashesMatch = crypto.timingSafeEqual(derivedBuffer, expectedBuffer);
     return userHashRecord !== null && hashesMatch;
   } finally {
-    activeScryptWorkers = Math.max(0, activeScryptWorkers - 1);
-    if (callerKey) {
-      const nextCaller = (activeScryptByCaller.get(callerKey) ?? 1) - 1;
-      if (nextCaller <= 0) activeScryptByCaller.delete(callerKey);
-      else activeScryptByCaller.set(callerKey, nextCaller);
-    }
+    releaseScryptSlot(callerKey);
   }
 }
 ```
@@ -554,7 +652,9 @@ export interface VerifiedJwtClaims {
   cnf?: { 'x5t#S256'?: string; jkt?: string; sidHash?: string };
 }
 
-export function verifyJwtPenetrationSafe(opts: HardenedJwtVerifyOptions): VerifiedJwtClaims {
+const STRICT_B64URL_SEGMENT_REGEX = /^[A-Za-z0-9_-]+$/;
+
+function verifyJwtCoreWithoutRevocation(opts: Omit<HardenedJwtVerifyOptions, 'isJtiRevoked'>): VerifiedJwtClaims {
   if (!opts.token || opts.token.length > 8192) {
     throw new Error('JWT_REJECTED: Token missing or exceeds 8KB maximum size');
   }
@@ -564,13 +664,21 @@ export function verifyJwtPenetrationSafe(opts: HardenedJwtVerifyOptions): Verifi
   }
 
   const [headerB64, payloadB64, signatureB64] = parts;
-  if (!signatureB64 || signatureB64.length === 0) {
-    throw new Error('JWT_REJECTED: Empty signature (alg:none attack blocked)');
+  if (
+    !STRICT_B64URL_SEGMENT_REGEX.test(headerB64) ||
+    !STRICT_B64URL_SEGMENT_REGEX.test(payloadB64) ||
+    !STRICT_B64URL_SEGMENT_REGEX.test(signatureB64)
+  ) {
+    throw new Error('JWT_REJECTED: Non-canonical or empty base64url segment (alg:none or smuggling blocked)');
   }
 
   let header: Record<string, unknown>;
   try {
-    header = JSON.parse(Buffer.from(headerB64, 'base64url').toString('utf8')) as Record<string, unknown>;
+    const parsedHeader: unknown = JSON.parse(Buffer.from(headerB64, 'base64url').toString('utf8'));
+    if (!parsedHeader || typeof parsedHeader !== 'object' || Array.isArray(parsedHeader)) {
+      throw new Error('Header is not a JSON object');
+    }
+    header = parsedHeader as Record<string, unknown>;
   } catch {
     throw new Error('JWT_REJECTED: Malformed JWT header JSON');
   }
@@ -615,7 +723,11 @@ export function verifyJwtPenetrationSafe(opts: HardenedJwtVerifyOptions): Verifi
 
   let claims: VerifiedJwtClaims;
   try {
-    claims = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8')) as VerifiedJwtClaims;
+    const parsedClaims: unknown = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
+    if (!parsedClaims || typeof parsedClaims !== 'object' || Array.isArray(parsedClaims)) {
+      throw new Error('Claims payload is not a JSON object');
+    }
+    claims = parsedClaims as VerifiedJwtClaims;
   } catch {
     throw new Error('JWT_REJECTED: Malformed JWT payload JSON');
   }
@@ -633,38 +745,84 @@ export function verifyJwtPenetrationSafe(opts: HardenedJwtVerifyOptions): Verifi
   if (!audMatch) {
     throw new Error('JWT_REJECTED: Audience mismatch');
   }
-  if (typeof claims.exp !== 'number' || nowSec >= claims.exp + leeway) {
+  if (typeof claims.exp !== 'number' || !Number.isFinite(claims.exp) || nowSec >= claims.exp + leeway) {
     throw new Error('JWT_REJECTED: Token has expired');
   }
-  if (typeof claims.iat !== 'number' || claims.iat > nowSec + leeway) {
+  if (typeof claims.iat !== 'number' || !Number.isFinite(claims.iat) || claims.iat > nowSec + leeway) {
     throw new Error('JWT_REJECTED: Token iat is in the future');
   }
   if (claims.exp <= claims.iat || claims.exp - claims.iat > maxLifetimeSec) {
     throw new Error(`JWT_REJECTED: Token lifetime exceeds maximum allowed TTL (${maxLifetimeSec}s)`);
   }
-  if (claims.nbf !== undefined && (typeof claims.nbf !== 'number' || nowSec + leeway < claims.nbf)) {
+  if (
+    claims.nbf !== undefined &&
+    (typeof claims.nbf !== 'number' || !Number.isFinite(claims.nbf) || nowSec + leeway < claims.nbf)
+  ) {
     throw new Error('JWT_REJECTED: Token is not yet valid (nbf)');
   }
-  if (!claims.sub) {
-    throw new Error('JWT_REJECTED: Missing required sub claim');
+  if (typeof claims.sub !== 'string' || claims.sub.trim().length === 0) {
+    throw new Error('JWT_REJECTED: Missing or invalid required sub claim');
   }
-  if (opts.requireTenantIdClaim !== false && (!claims.jti || !claims.tenantId)) {
+  if (
+    opts.requireTenantIdClaim !== false &&
+    (typeof claims.jti !== 'string' ||
+      claims.jti.trim().length === 0 ||
+      typeof claims.tenantId !== 'string' ||
+      claims.tenantId.trim().length === 0)
+  ) {
     throw new Error('JWT_REJECTED: Missing required jti or tenantId claim');
-  }
-  if (claims.jti && opts.isJtiRevoked && opts.isJtiRevoked(claims.jti)) {
-    throw new Error('JWT_REJECTED: Token jti has been revoked');
   }
 
   if (opts.expectedSessionBindingCookie !== undefined) {
-    const expectedSidHash = crypto
-      .createHash('sha256')
-      .update(opts.expectedSessionBindingCookie, 'utf8')
-      .digest('hex');
-    if (!claims.cnf?.sidHash || claims.cnf.sidHash !== expectedSidHash) {
+    const expectedSidHashBuf = Buffer.from(
+      crypto
+        .createHash('sha256')
+        .update(opts.expectedSessionBindingCookie, 'utf8')
+        .digest('hex'),
+      'hex'
+    );
+    const actualSidHash = claims.cnf?.sidHash;
+    if (typeof actualSidHash !== 'string' || !/^[0-9a-fA-F]{64}$/.test(actualSidHash)) {
+      throw new Error('JWT_REJECTED: Session binding cookie hash missing or malformed');
+    }
+    const actualSidHashBuf = Buffer.from(actualSidHash, 'hex');
+    if (
+      actualSidHashBuf.length !== expectedSidHashBuf.length ||
+      !crypto.timingSafeEqual(actualSidHashBuf, expectedSidHashBuf)
+    ) {
       throw new Error('JWT_REJECTED: Session binding cookie hash mismatch');
     }
   }
 
+  return claims;
+}
+
+export function verifyJwtPenetrationSafe(opts: HardenedJwtVerifyOptions): VerifiedJwtClaims {
+  const claims = verifyJwtCoreWithoutRevocation(opts);
+  if (claims.jti && opts.isJtiRevoked) {
+    const revokedResult: unknown = opts.isJtiRevoked(claims.jti);
+    if (typeof revokedResult !== 'boolean') {
+      throw new Error('JWT_REJECTED: Async isJtiRevoked callback requires verifyJwtPenetrationSafeAsync');
+    }
+    if (revokedResult) {
+      throw new Error('JWT_REJECTED: Token jti has been revoked');
+    }
+  }
+  return claims;
+}
+
+export async function verifyJwtPenetrationSafeAsync(
+  opts: Omit<HardenedJwtVerifyOptions, 'isJtiRevoked'> & {
+    isJtiRevoked?: (jti: string) => boolean | Promise<boolean>;
+  }
+): Promise<VerifiedJwtClaims> {
+  const claims = verifyJwtCoreWithoutRevocation(opts);
+  if (claims.jti && opts.isJtiRevoked) {
+    const revoked = await opts.isJtiRevoked(claims.jti);
+    if (revoked) {
+      throw new Error('JWT_REJECTED: Token jti has been revoked');
+    }
+  }
   return claims;
 }
 ```
@@ -692,6 +850,7 @@ export async function rotateRefreshTokenWithReuseDetection(params: {
   rollingTtlMs?: number; // Default 14 days
   nowMs?: number;
   findTokenByHash: (tokenHash: string) => Promise<RefreshTokenRecord | null>;
+  verifySubjectAndTenantActive?: (tenantId: string, userId: string) => Promise<boolean>;
   markTokenRotatedAndInsertChild: (oldHash: string, newRecord: RefreshTokenRecord) => Promise<boolean>;
   revokeEntireTokenFamily: (familyId: string, reason: string) => Promise<void>;
 }): Promise<{
@@ -704,6 +863,9 @@ export async function rotateRefreshTokenWithReuseDetection(params: {
 }> {
   const nowMs = params.nowMs ?? Date.now();
   const rollingTtlMs = params.rollingTtlMs ?? 14 * 24 * 60 * 60 * 1000;
+  if (!Number.isFinite(nowMs) || !Number.isFinite(rollingTtlMs) || rollingTtlMs <= 0) {
+    throw new Error('REFRESH_TOKEN_CONFIG_INVALID: nowMs and rollingTtlMs must be positive finite numbers');
+  }
   const tokenHash = crypto.createHash('sha256').update(params.rawRefreshToken, 'utf8').digest('hex');
   const existing = await params.findTokenByHash(tokenHash);
 
@@ -723,13 +885,22 @@ export async function rotateRefreshTokenWithReuseDetection(params: {
     throw new Error('REFRESH_TOKEN_DEVICE_MISMATCH_FAMILY_REVOKED');
   }
 
-  // 3. Enforce BOTH rolling expiry AND hard absolute session lifetime!
-  if (nowMs >= existing.expiresAtMs) {
+  // 3. Enforce BOTH rolling expiry AND hard absolute session lifetime (fail closed on NaN/Infinity)!
+  if (!Number.isFinite(existing.expiresAtMs) || nowMs >= existing.expiresAtMs) {
     throw new Error('REFRESH_TOKEN_EXPIRED');
   }
-  if (nowMs >= existing.absoluteSessionExpiresAtMs) {
+  if (!Number.isFinite(existing.absoluteSessionExpiresAtMs) || nowMs >= existing.absoluteSessionExpiresAtMs) {
     await params.revokeEntireTokenFamily(existing.familyId, 'ABSOLUTE_SESSION_LIFETIME_EXCEEDED');
     throw new Error('SESSION_ABSOLUTE_LIFETIME_EXCEEDED_REAUTH_REQUIRED');
+  }
+
+  // 4. Verify user account and tenant membership are still ACTIVE before issuing a rotated token
+  if (params.verifySubjectAndTenantActive) {
+    const stillActive = await params.verifySubjectAndTenantActive(existing.tenantId, existing.userId);
+    if (!stillActive) {
+      await params.revokeEntireTokenFamily(existing.familyId, 'SUBJECT_OR_TENANT_INACTIVE');
+      throw new Error('REFRESH_TOKEN_SUBJECT_INACTIVE_FAMILY_REVOKED');
+    }
   }
 
   // Clamp child token expiry so rolling renewals can NEVER extend past absoluteSessionExpiresAtMs

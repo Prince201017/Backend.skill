@@ -79,28 +79,15 @@ export function isPrivateOrReservedIp(ip: string): boolean {
     // :: (Unspecified) or ::1 (Loopback)
     if (isAllZeroPrefix && h[5] === 0 && h[6] === 0 && (h[7] === 0 || h[7] === 1)) return true;
 
-    // IPv4-mapped (::ffff:0:0/96) or IPv4-compatible (::0:0/96)
-    if (isAllZeroPrefix && (h[5] === 0xffff || h[5] === 0)) {
-      return isReservedIpv4Octets(h[6] >> 8, h[6] & 0xff, h[7] >> 8, h[7] & 0xff);
-    }
-
-    // IPv4-translated (::ffff:0:w.x.y.z /96)
-    if (h[0] === 0 && h[1] === 0 && h[2] === 0 && h[3] === 0 && h[4] === 0xffff && h[5] === 0) {
-      return isReservedIpv4Octets(h[6] >> 8, h[6] & 0xff, h[7] >> 8, h[7] & 0xff);
-    }
+    // Check non-global / special-purpose IPv6 ranges FIRST so embedded ISATAP/transition suffixes
+    // inside link-local (fe80::5efe:1.1.1.1) or ULA (fd00::5efe:1.1.1.1) NEVER bypass classification!
+    if ((h[0] & 0xffc0) === 0xfe80) return true; // Link-local fe80::/10
+    if ((h[0] & 0xffc0) === 0xfec0) return true; // Deprecated Site-local fec0::/10
+    if ((h[0] & 0xfe00) === 0xfc00) return true; // Unique Local fc00::/7
+    if ((h[0] & 0xff00) === 0xff00) return true; // Multicast ff00::/8
 
     // Discard-Only Address Block (100::/64)
     if (h[0] === 0x0100 && h[1] === 0 && h[2] === 0 && h[3] === 0) return true;
-
-    // NAT64 Well-Known (64:ff9b::/96) & Local-Use (64:ff9b:1::/48)
-    if (h[0] === 0x0064 && h[1] === 0xff9b) {
-      return isReservedIpv4Octets(h[6] >> 8, h[6] & 0xff, h[7] >> 8, h[7] & 0xff);
-    }
-
-    // 6to4 (2002::/16)
-    if (h[0] === 0x2002) {
-      return isReservedIpv4Octets(h[1] >> 8, h[1] & 0xff, h[2] >> 8, h[2] & 0xff);
-    }
 
     // Teredo (2001:0000::/32)
     if (h[0] === 0x2001 && h[1] === 0x0000) return true;
@@ -110,15 +97,22 @@ export function isPrivateOrReservedIp(ip: string): boolean {
       return true;
     }
 
-    // ISATAP (::0000:5efe:w.x.y.z or ::0200:5efe:w.x.y.z)
-    if ((h[4] === 0x0000 || h[4] === 0x0200) && h[5] === 0x5efe) {
+    // Canonical IPv4-mapped IPv6 (::ffff:w.x.y.z /96) -> validate embedded IPv4 octets strictly
+    if (isAllZeroPrefix && h[5] === 0xffff) {
       return isReservedIpv4Octets(h[6] >> 8, h[6] & 0xff, h[7] >> 8, h[7] & 0xff);
     }
 
-    if ((h[0] & 0xffc0) === 0xfe80) return true; // Link-local fe80::/10
-    if ((h[0] & 0xffc0) === 0xfec0) return true; // Deprecated Site-local fec0::/10
-    if ((h[0] & 0xfe00) === 0xfc00) return true; // Unique Local fc00::/7
-    if ((h[0] & 0xff00) === 0xff00) return true; // Multicast ff00::/8
+    // Fail closed on ALL IPv6 tunneling / translation / deprecated transition mechanisms:
+    // - Deprecated IPv4-compatible (::/96)
+    if (isAllZeroPrefix && h[5] === 0) return true;
+    // - IPv4-translated (::ffff:0:0/96)
+    if (h[0] === 0 && h[1] === 0 && h[2] === 0 && h[3] === 0 && h[4] === 0xffff && h[5] === 0) return true;
+    // - NAT64 Well-Known (64:ff9b::/96) & Local-Use (64:ff9b:1::/48)
+    if (h[0] === 0x0064 && h[1] === 0xff9b) return true;
+    // - 6to4 (2002::/16)
+    if (h[0] === 0x2002) return true;
+    // - ISATAP interface identifiers (::0000:5efe:w.x.y.z or ::0200:5efe:w.x.y.z)
+    if ((h[4] === 0x0000 || h[4] === 0x0200) && h[5] === 0x5efe) return true;
 
     // Require Global Unicast range (2000::/3 -> first 3 bits 001)
     if ((h[0] & 0xe000) !== 0x2000) return true;
@@ -138,7 +132,10 @@ const defaultDnsResolver: DnsResolverFn = async (hostname) => {
 };
 
 export function isAmbiguousIpv4Hostname(hostname: string): boolean {
-  const clean = hostname.trim().toLowerCase();
+  if (/[\s\0]/.test(hostname)) return true;
+  // Strip trailing FQDN root dot(s) so "0177.0.0.1." or "127.1." cannot evade octal/short IPv4 detection
+  const clean = hostname.trim().toLowerCase().replace(/\.+$/, '');
+  if (clean.length === 0) return true;
   if (net.isIP(clean) === 4) return false; // Standard canonical dotted-quad is unambiguous
   // Reject integer/dword IPv4 (e.g. 2130706433), hex IPv4 (0x7f000001 or 0x7f.0.0.1),
   // octal IPv4 (0177.0.0.1), or short-form 2/3-part IPv4 (127.1, 127.0.1)
@@ -244,9 +241,10 @@ export async function resolveAndPinSafeTarget(
     callback(null, pinnedIp, pinnedFamily);
   };
 
+  // RFC 6066: TLS SNI servername MUST NOT be an IP literal; omit servername when connecting to an IP literal
   const httpsAgent = new https.Agent({
     keepAlive: false,
-    servername: cleanHost,
+    ...(literalVersion === 0 ? { servername: cleanHost } : {}),
     rejectUnauthorized: true,
     minVersion: 'TLSv1.2',
     lookup: pinnedLookup,
@@ -258,9 +256,15 @@ export async function resolveAndPinSafeTarget(
 const SENSITIVE_OUTBOUND_HEADERS = new Set([
   'authorization',
   'cookie',
+  'host',
   'proxy-authorization',
   'x-api-key',
   'x-apigateway-api-userinfo',
+  'x-csrf-token',
+  'x-xsrf-token',
+  'x-forwarded-for',
+  'x-real-ip',
+  'forwarded',
 ]);
 
 const SAFE_CROSS_ORIGIN_REDIRECT_HEADERS = new Set([
@@ -351,6 +355,7 @@ export async function executePinnedSafeHttpsRequest(params: {
       const pinned = await resolveAndPinSafeTarget(currentUrl, {
         dnsResolver: params.dnsResolver,
       });
+      const pinnedCleanHost = pinned.parsedUrl.hostname.replace(/^\[|\]$/g, '');
 
       // DEVIL-09 Guard: If a redirect crossed to a different origin, strip all custom/application headers!
       if (pinned.parsedUrl.origin !== initialOrigin) {
@@ -370,92 +375,97 @@ export async function executePinnedSafeHttpsRequest(params: {
 
       const hopTimeoutMs = Math.min(timeoutMs, Math.max(1, totalDeadlineMs - (Date.now() - startedAtMs)));
 
-      const hopResponse = params.transportOverride
-        ? await Promise.race([
-            params.transportOverride({
-              parsedUrl: pinned.parsedUrl,
-              pinnedIp: pinned.pinnedIp,
-              headers: requestHeaders,
-              signal: deadlineController.signal,
-            }),
-            new Promise<never>((_, reject) => {
-              const onAbort = () =>
-                reject(
-                  deadlineController.signal.reason ??
-                    new Error(`SSRF_HARD_DEADLINE_EXCEEDED: Exceeded total deadline of ${totalDeadlineMs}ms`)
-                );
-              if (deadlineController.signal.aborted) {
-                onAbort();
-                return;
-              }
-              deadlineController.signal.addEventListener('abort', onAbort, { once: true });
-            }),
-          ])
-        : await new Promise<{ statusCode: number; headers: Record<string, string>; body: Buffer }>(
-            (resolve, reject) => {
-              const req = https.request(
-                {
-                  protocol: 'https:',
-                  hostname: pinned.parsedUrl.hostname,
-                  port: pinned.parsedUrl.port || 443,
-                  path: `${pinned.parsedUrl.pathname}${pinned.parsedUrl.search}`,
-                  method: currentMethod,
-                  headers: requestHeaders,
-                  agent: pinned.httpsAgent,
-                  servername: pinned.parsedUrl.hostname,
-                  timeout: hopTimeoutMs,
-                  signal: deadlineController.signal,
-                },
-                (res) => {
-                  const chunks: Buffer[] = [];
-                  let totalBytes = 0;
-
-                  res.on('data', (chunk: Buffer) => {
-                    if (Date.now() - startedAtMs > totalDeadlineMs) {
-                      req.destroy(
-                        new Error(`SSRF_HARD_DEADLINE_EXCEEDED: Exceeded total deadline of ${totalDeadlineMs}ms`)
-                      );
-                      return;
-                    }
-                    totalBytes += chunk.byteLength;
-                    if (totalBytes > maxResponseBytes) {
-                      req.destroy(
-                        new Error(`SSRF_RESPONSE_TOO_LARGE: Exceeded ${maxResponseBytes} bytes`)
-                      );
-                      return;
-                    }
-                    chunks.push(chunk);
-                  });
-
-                  res.on('end', () => {
-                    if (totalBytes > maxResponseBytes) return;
-                    const normHeaders: Record<string, string> = {};
-                    for (const [hk, hv] of Object.entries(res.headers)) {
-                      if (typeof hv === 'string') normHeaders[hk.toLowerCase()] = hv;
-                      else if (Array.isArray(hv)) normHeaders[hk.toLowerCase()] = hv.join(', ');
-                    }
-                    resolve({
-                      statusCode: res.statusCode ?? 500,
-                      headers: normHeaders,
-                      body: Buffer.concat(chunks),
-                    });
-                  });
-
-                  res.on('error', reject);
+      let hopResponse: { statusCode: number; headers: Record<string, string>; body: Buffer };
+      try {
+        hopResponse = params.transportOverride
+          ? await Promise.race([
+              params.transportOverride({
+                parsedUrl: pinned.parsedUrl,
+                pinnedIp: pinned.pinnedIp,
+                headers: requestHeaders,
+                signal: deadlineController.signal,
+              }),
+              new Promise<never>((_, reject) => {
+                const onAbort = () =>
+                  reject(
+                    deadlineController.signal.reason ??
+                      new Error(`SSRF_HARD_DEADLINE_EXCEEDED: Exceeded total deadline of ${totalDeadlineMs}ms`)
+                  );
+                if (deadlineController.signal.aborted) {
+                  onAbort();
+                  return;
                 }
-              );
+                deadlineController.signal.addEventListener('abort', onAbort, { once: true });
+              }),
+            ])
+          : await new Promise<{ statusCode: number; headers: Record<string, string>; body: Buffer }>(
+              (resolve, reject) => {
+                const req = https.request(
+                  {
+                    protocol: 'https:',
+                    hostname: pinnedCleanHost,
+                    port: pinned.parsedUrl.port || 443,
+                    path: `${pinned.parsedUrl.pathname}${pinned.parsedUrl.search}`,
+                    method: currentMethod,
+                    headers: requestHeaders,
+                    agent: pinned.httpsAgent,
+                    ...(net.isIP(pinnedCleanHost) === 0 ? { servername: pinnedCleanHost } : {}),
+                    timeout: hopTimeoutMs,
+                    signal: deadlineController.signal,
+                  },
+                  (res) => {
+                    const chunks: Buffer[] = [];
+                    let totalBytes = 0;
 
-              req.on('timeout', () => {
-                req.destroy(new Error('SSRF_REQUEST_TIMEOUT'));
-              });
-              req.on('error', reject);
+                    res.on('data', (chunk: Buffer) => {
+                      if (Date.now() - startedAtMs > totalDeadlineMs) {
+                        req.destroy(
+                          new Error(`SSRF_HARD_DEADLINE_EXCEEDED: Exceeded total deadline of ${totalDeadlineMs}ms`)
+                        );
+                        return;
+                      }
+                      totalBytes += chunk.byteLength;
+                      if (totalBytes > maxResponseBytes) {
+                        req.destroy(
+                          new Error(`SSRF_RESPONSE_TOO_LARGE: Exceeded ${maxResponseBytes} bytes`)
+                        );
+                        return;
+                      }
+                      chunks.push(chunk);
+                    });
 
-              if (currentBody && currentBody.byteLength > 0) {
-                req.write(currentBody);
+                    res.on('end', () => {
+                      if (totalBytes > maxResponseBytes) return;
+                      const normHeaders: Record<string, string> = {};
+                      for (const [hk, hv] of Object.entries(res.headers)) {
+                        if (typeof hv === 'string') normHeaders[hk.toLowerCase()] = hv;
+                        else if (Array.isArray(hv)) normHeaders[hk.toLowerCase()] = hv.join(', ');
+                      }
+                      resolve({
+                        statusCode: res.statusCode ?? 500,
+                        headers: normHeaders,
+                        body: Buffer.concat(chunks),
+                      });
+                    });
+
+                    res.on('error', reject);
+                  }
+                );
+
+                req.on('timeout', () => {
+                  req.destroy(new Error('SSRF_REQUEST_TIMEOUT'));
+                });
+                req.on('error', reject);
+
+                if (currentBody && currentBody.byteLength > 0) {
+                  req.write(currentBody);
+                }
+                req.end();
               }
-              req.end();
-            }
-          );
+            );
+      } finally {
+        pinned.httpsAgent.destroy();
+      }
 
       if (hopResponse.body.byteLength > maxResponseBytes) {
         throw new Error(`SSRF_RESPONSE_TOO_LARGE: Exceeded ${maxResponseBytes} bytes`);
@@ -533,9 +543,33 @@ function ipv6ToBigInt(ip: string): bigint | null {
   return val;
 }
 
+export function normalizeDualStackIp(rawIp: string): string {
+  const cleaned = rawIp.trim();
+  if (net.isIP(cleaned) === 6) {
+    const h = parseIpv6Hextets(cleaned);
+    if (
+      h &&
+      h[0] === 0 &&
+      h[1] === 0 &&
+      h[2] === 0 &&
+      h[3] === 0 &&
+      h[4] === 0 &&
+      h[5] === 0xffff
+    ) {
+      return `${h[6] >> 8}.${h[6] & 0xff}.${h[7] >> 8}.${h[7] & 0xff}`;
+    }
+  }
+  return cleaned;
+}
+
 export function isIpInCidr(rawIp: string, cidr: string): boolean {
-  const ip = rawIp.trim();
-  const [rangeIp, prefixStr] = cidr.trim().split('/');
+  const ip = normalizeDualStackIp(rawIp);
+  const parts = cidr.trim().split('/');
+  if (parts.length !== 2) return false;
+  const [rawRangeIp, prefixStr] = parts;
+  if (!prefixStr || !/^\d{1,3}$/.test(prefixStr)) return false;
+
+  const rangeIp = normalizeDualStackIp(rawRangeIp);
   const prefixLen = Number(prefixStr);
   const ipVer = net.isIP(ip);
   const rangeVer = net.isIP(rangeIp);
@@ -565,12 +599,16 @@ export function isTrustedProxyIp(ip: string, trustedProxyCidrs: readonly string[
   return trustedProxyCidrs.some((cidr) => isIpInCidr(ip, cidr));
 }
 
+const MAX_XFF_HEADER_LENGTH = 2048;
+const MAX_XFF_HOP_COUNT = 32;
+
 /**
  * CIDR-Verified Right-to-Left Client IP Extractor:
- * 1. Verifies that the immediate TCP peer (`socketRemoteAddress`) belongs to `trustedProxyCidrs`.
+ * 1. Normalizes dual-stack IPv4-mapped IPv6 addresses (`::ffff:10.0.0.5` -> `10.0.0.5`).
+ * 2. Verifies that the immediate TCP peer (`socketRemoteAddress`) belongs to `trustedProxyCidrs`.
  *    If not, `X-Forwarded-For` is untrusted and ignored immediately.
- * 2. Parses `X-Forwarded-For` and rejects malformed/ambiguous chains (failing closed to `socketRemoteAddress`).
- * 3. Walks right-to-left across the chain, skipping hops that belong to `trustedProxyCidrs`,
+ * 3. Bounds `X-Forwarded-For` header length and hop count, rejecting malformed chains fail-closed.
+ * 4. Walks right-to-left across the chain, skipping hops that belong to `trustedProxyCidrs`,
  *    and returns the first IP outside `trustedProxyCidrs` (the true client IP that connected to our edge).
  */
 export function extractTrustedClientIpByCidr(params: {
@@ -578,7 +616,7 @@ export function extractTrustedClientIpByCidr(params: {
   xForwardedForHeader?: string;
   trustedProxyCidrs: readonly string[];
 }): string {
-  const peerIp = params.socketRemoteAddress.trim();
+  const peerIp = normalizeDualStackIp(params.socketRemoteAddress);
   if (net.isIP(peerIp) === 0) {
     throw new Error(`INVALID_SOCKET_PEER_IP: "${params.socketRemoteAddress}"`);
   }
@@ -592,7 +630,15 @@ export function extractTrustedClientIpByCidr(params: {
     return peerIp;
   }
 
-  const rawEntries = params.xForwardedForHeader.split(',').map((s) => s.trim());
+  if (params.xForwardedForHeader.length > MAX_XFF_HEADER_LENGTH) {
+    throw new Error(`X_FORWARDED_FOR_LIMIT_EXCEEDED: Header exceeds ${MAX_XFF_HEADER_LENGTH} bytes`);
+  }
+
+  const rawEntries = params.xForwardedForHeader.split(',').map((s) => normalizeDualStackIp(s));
+  if (rawEntries.length > MAX_XFF_HOP_COUNT) {
+    throw new Error(`X_FORWARDED_FOR_LIMIT_EXCEEDED: Chain exceeds ${MAX_XFF_HOP_COUNT} hops`);
+  }
+
   // 2. Reject malformed or ambiguous X-Forwarded-For chains (every entry must be a valid IPv4/IPv6 literal)
   for (const entry of rawEntries) {
     if (!entry || net.isIP(entry) === 0) {
@@ -624,13 +670,24 @@ const FORBIDDEN_OBJECT_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
 
 export function sanitizeUntrustedJsonInput(
   input: unknown,
-  options: { maxDepth?: number; maxKeysPerObject?: number; forbidDollarKeys?: boolean } = {},
-  currentDepth = 0
+  options: {
+    maxDepth?: number;
+    maxKeysPerObject?: number;
+    maxTotalNodes?: number;
+    forbidDollarKeys?: boolean;
+  } = {},
+  currentDepth = 0,
+  nodeBudget: { visited: number } = { visited: 0 }
 ): unknown {
   const maxDepth = options.maxDepth ?? 12;
   const maxKeys = options.maxKeysPerObject ?? 250;
+  const maxTotalNodes = options.maxTotalNodes ?? 10_000;
   const forbidDollar = options.forbidDollarKeys ?? true;
 
+  nodeBudget.visited += 1;
+  if (nodeBudget.visited > maxTotalNodes) {
+    throw new Error(`PAYLOAD_REJECTED: Total JSON node count exceeds maximum budget of ${maxTotalNodes}`);
+  }
   if (currentDepth > maxDepth) {
     throw new Error(`PAYLOAD_REJECTED: JSON nesting depth exceeds maximum of ${maxDepth}`);
   }
@@ -645,7 +702,9 @@ export function sanitizeUntrustedJsonInput(
     if (input.length > 1000) {
       throw new Error('PAYLOAD_REJECTED: Array length exceeds maximum bound');
     }
-    return input.map((item) => sanitizeUntrustedJsonInput(item, options, currentDepth + 1));
+    return input.map((item) =>
+      sanitizeUntrustedJsonInput(item, options, currentDepth + 1, nodeBudget)
+    );
   }
 
   const entries = Object.entries(input as Record<string, unknown>);
@@ -655,6 +714,9 @@ export function sanitizeUntrustedJsonInput(
 
   const cleanObj: Record<string, unknown> = Object.create(null);
   for (const [rawKey, value] of entries) {
+    if (rawKey.includes('\0')) {
+      throw new Error('PAYLOAD_REJECTED: Null byte in object key');
+    }
     const key = rawKey.normalize('NFKC');
     if (FORBIDDEN_OBJECT_KEYS.has(key)) {
       throw new Error(`PAYLOAD_REJECTED: Prototype pollution key "${key}" is forbidden`);
@@ -662,7 +724,7 @@ export function sanitizeUntrustedJsonInput(
     if (forbidDollar && (key.startsWith('$') || key.includes('.'))) {
       throw new Error(`PAYLOAD_REJECTED: NoSQL operator or dotted key "${key}" is forbidden`);
     }
-    cleanObj[key] = sanitizeUntrustedJsonInput(value, options, currentDepth + 1);
+    cleanObj[key] = sanitizeUntrustedJsonInput(value, options, currentDepth + 1, nodeBudget);
   }
   return { ...cleanObj };
 }

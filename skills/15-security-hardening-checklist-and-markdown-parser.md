@@ -87,6 +87,21 @@ const FORBIDDEN_CODE_BLOCK_ANTI_PATTERNS: ReadonlyArray<{
     description: 'Single-column foreign key to ledger_accounts(account_id) without composite (tenant_id, account_id) binding (ARGON-LEDGER-001)',
     regex: /\baccount_id\s+UUID\s+NOT\s+NULL\s+REFERENCES\s+(?:public\.)?ledger_accounts\s*\(\s*account_id\s*\)/i,
   },
+  {
+    id: 'FAIL_OPEN_REDACTION_DEPTH_GUARD',
+    description: 'Recursive secret redactor returning unredacted object when exceeding max depth instead of truncating fail-closed',
+    regex: /if\s*\(\s*depth\s*>\s*\d+\s*(?:\|\|[^)]*)?\)\s*return\s+obj\b/,
+  },
+  {
+    id: 'ZERO_TXID_FALLBACK_GUC_FORGERY',
+    description: 'Falling back to constant "0" when txid_current() is unavailable, enabling cross-transaction GUC MAC replay',
+    regex: /txid\s*[^;\n]*\?\?\s*['"]0['"]/,
+  },
+  {
+    id: 'PUBLIC_SERVER_ACTION_CALLER_CLOCK',
+    description: 'Exposing caller-controlled nowSec parameter on public server-action mutation boundary',
+    regex: /export\s+function\s+createAuthenticatedServerMutation[\s\S]{0,400}\bnowSec\s*\?\s*:\s*number/,
+  },
 ];
 
 export interface ExtractedCodeBlock {
@@ -242,8 +257,8 @@ export function parseMarkdownSecurityChecklist(
       });
     }
 
-    // Skip scanning Module 15's own detector definition block
-    if (!file.fileName.startsWith('15-')) {
+    // Skip scanning Module 15's own detector definition block (supports bare or path-prefixed file names)
+    if (!/(?:^|[\\/])15-/.test(file.fileName)) {
       const codeBlocks = extracted.blocks.map((b) => b.code).join('\n');
       for (const rule of FORBIDDEN_CODE_BLOCK_ANTI_PATTERNS) {
         if (rule.regex.test(codeBlocks)) {
@@ -281,7 +296,7 @@ export function parseMarkdownSecurityChecklist(
 
       const itemId = `${file.fileName}::${sectionTitle.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
       const rawMatches = (sectionTitle + '\n' + joined).match(
-        /\b(?:TEST-\d{2,3}|DEVIL-\d{2,3}|VERIFY-\d{2})\b/g
+        /\b(?:TEST-\d{2,3}|DEVIL-\d{2,3}|VERIFY-\d{2}|ARGON-[A-Z]+-\d{3})\b/g
       ) ?? [];
       const { validIds: sectionTestMatches } = validateEvidenceIdentifiers(new Set(rawMatches));
 

@@ -891,7 +891,7 @@ export interface LedgerTransactionPort {
         journalId: string;
         totalDebitMinor: bigint;
         currencyCode: string;
-        requestHash?: string;
+        requestHash: string;
       } | null>;
       lockAccountsSortedForUpdate: (sortedAccountIds: readonly string[]) => Promise<LedgerAccountRow[]>;
       insertJournalAndUpdateBalances: (data: {
@@ -954,9 +954,9 @@ export async function persistBalancedJournalAtomically(params: {
     // 1. Check unique (tenant_id, idempotency_key) inside the transaction and verify payload hash match!
     const existing = await tx.findJournalByIdempotencyKey(params.tenantId, params.idempotencyKey);
     if (existing) {
-      if (existing.requestHash !== undefined && existing.requestHash !== requestHash) {
+      if (!existing.requestHash || existing.requestHash !== requestHash) {
         throw new Error(
-          `LEDGER_IDEMPOTENCY_PAYLOAD_MISMATCH: Idempotency key "${params.idempotencyKey}" was already used with a different journal payload`
+          `LEDGER_IDEMPOTENCY_PAYLOAD_MISMATCH: Idempotency key "${params.idempotencyKey}" is missing a verified requestHash or was already used with a different journal payload`
         );
       }
       if (
@@ -1425,7 +1425,7 @@ ALTER TABLE public.fx_conversion_settlements OWNER TO db_migrator;
 GRANT SELECT, INSERT, UPDATE, DELETE ON public.ledger_accounts, public.journal_entries, public.journal_postings, public.fx_conversion_settlements TO db_migrator;
 GRANT USAGE, SELECT ON SEQUENCE public.journal_postings_posting_id_seq TO db_migrator;
 
-GRANT SELECT, INSERT, UPDATE (balance_minor, version, status, allow_negative_balance) ON public.ledger_accounts TO app_runtime;
+GRANT SELECT, INSERT, UPDATE (balance_minor, version, status) ON public.ledger_accounts TO app_runtime;
 GRANT SELECT, INSERT, UPDATE (lifecycle_status, finalized_at) ON public.journal_entries TO app_runtime;
 GRANT SELECT, INSERT ON public.journal_postings TO app_runtime;
 GRANT SELECT, INSERT ON public.fx_conversion_settlements TO app_runtime;
@@ -1531,6 +1531,13 @@ BEGIN
       USING ERRCODE = '55000';
   END IF;
 
+  IF NEW.allow_negative_balance <> OLD.allow_negative_balance
+     AND pg_has_role(current_user, 'app_runtime', 'MEMBER')
+  THEN
+    RAISE EXCEPTION 'LEDGER_ACCOUNT_POLICY_IMMUTABLE: Runtime role cannot mutate allow_negative_balance on ledger_accounts (account_id=%)', OLD.account_id
+      USING ERRCODE = '42501';
+  END IF;
+
   RETURN NEW;
 END;
 $$;
@@ -1565,10 +1572,10 @@ BEGIN
       USING ERRCODE = '55000';
   END IF;
 
-  -- Lifecycle state transition checks: POSTING -> FINALIZED permitted once; no downgrades
+  -- Lifecycle state transition checks: POSTING -> FINALIZED permitted once; no downgrades or finalized_at tampering
   IF OLD.lifecycle_status = 'FINALIZED' THEN
-    IF NEW.lifecycle_status <> 'FINALIZED' THEN
-      RAISE EXCEPTION 'LEDGER_LIFECYCLE_VIOLATION: Cannot downgrade journal % from FINALIZED to %', OLD.journal_id, NEW.lifecycle_status
+    IF NEW.lifecycle_status <> 'FINALIZED' OR NEW.finalized_at IS DISTINCT FROM OLD.finalized_at THEN
+      RAISE EXCEPTION 'LEDGER_LIFECYCLE_VIOLATION: Cannot mutate lifecycle_status or finalized_at on FINALIZED journal %', OLD.journal_id
         USING ERRCODE = '55000';
     END IF;
   ELSIF OLD.lifecycle_status = 'POSTING' AND NEW.lifecycle_status = 'FINALIZED' THEN

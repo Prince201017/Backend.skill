@@ -272,6 +272,9 @@ export async function executeVerifiedBusinessApprovalAndReservation(params: {
       if (!approval) {
         throw new Error('APPROVAL_RECORD_NOT_FOUND');
       }
+      if (approval.tenantId !== operation.tenantId) {
+        throw new Error('APPROVAL_CROSS_TENANT_MISMATCH');
+      }
       if (approval.state === 'EXECUTED') {
         throw new Error('APPROVAL_ALREADY_EXECUTED');
       }
@@ -292,7 +295,8 @@ export async function executeVerifiedBusinessApprovalAndReservation(params: {
         };
       }
 
-      // 3. Re-verify Maker-Checker separation AND verify that BOTH Maker and Checker are still ACTIVE in the tenant
+      // 3. Re-verify Maker-Checker separation AND verify that BOTH Maker and Checker are still ACTIVE in the tenant.
+      // If either actor's authority was revoked prior to execution, durably commit REVOKED state before throwing!
       if (!approval.checkerUserId || approval.checkerUserId === approval.makerUserId) {
         throw new Error('MAKER_CHECKER_SEPARATION_VIOLATION');
       }
@@ -302,7 +306,16 @@ export async function executeVerifiedBusinessApprovalAndReservation(params: {
         makerMember.membershipStatus !== 'ACTIVE' ||
         (!makerMember.roles.includes('FINANCE_INITIATOR') && !makerMember.roles.includes('TENANT_ADMIN'))
       ) {
-        throw new Error('MAKER_AUTHORITY_REVOKED_BEFORE_EXECUTION');
+        await txStore.markApprovalState({
+          tenantId: operation.tenantId,
+          approvalId,
+          expectedCurrentState: 'APPROVED',
+          nextState: 'REVOKED',
+        });
+        return {
+          outcome: 'COMMITTED_TERMINAL_REJECTION',
+          errorToThrow: 'MAKER_AUTHORITY_REVOKED_BEFORE_EXECUTION',
+        };
       }
 
       const checkerMember = await txStore.getActorMembership(operation.tenantId, approval.checkerUserId);
@@ -311,7 +324,16 @@ export async function executeVerifiedBusinessApprovalAndReservation(params: {
         checkerMember.membershipStatus !== 'ACTIVE' ||
         !checkerMember.roles.includes('FINANCE_CHECKER')
       ) {
-        throw new Error('CHECKER_AUTHORITY_REVOKED_BEFORE_EXECUTION');
+        await txStore.markApprovalState({
+          tenantId: operation.tenantId,
+          approvalId,
+          expectedCurrentState: 'APPROVED',
+          nextState: 'REVOKED',
+        });
+        return {
+          outcome: 'COMMITTED_TERMINAL_REJECTION',
+          errorToThrow: 'CHECKER_AUTHORITY_REVOKED_BEFORE_EXECUTION',
+        };
       }
 
       // 4. Verify canonical operation hash binding (if operation details changed, commit REVOKED state!)
@@ -351,8 +373,16 @@ export async function executeVerifiedBusinessApprovalAndReservation(params: {
         throw new Error('APPROVAL_DUPLICATE_CONCURRENT_EXECUTION');
       }
 
-      // 7. Write immutable HMAC-SHA256 audit log inside the same transaction
-      const auditPayload = `${operation.tenantId}|${approvalId}|${approval.makerUserId}|${approval.checkerUserId}|${verifiedExecutorUserId}|${currentHash}|${operation.amountMinor.toString()}`;
+      // 7. Write immutable HMAC-SHA256 audit log inside the same transaction using canonical JSON tuple encoding
+      const auditPayload = JSON.stringify([
+        operation.tenantId,
+        approvalId,
+        approval.makerUserId,
+        approval.checkerUserId,
+        verifiedExecutorUserId,
+        currentHash,
+        operation.amountMinor.toString(),
+      ]);
       const auditHmacSignature = createHmac('sha256', auditHmacSecret)
         .update(auditPayload, 'utf8')
         .digest('hex');
@@ -460,9 +490,9 @@ export function auditOpenApiSecurityAlternatives(spec: OpenApiSpecDocument): str
       def.issuer.startsWith('https://') &&
       Array.isArray(def.audiences) &&
       def.audiences.length > 0 &&
-      (!def.allowedAlgorithms ||
-        (def.allowedAlgorithms.length > 0 &&
-          def.allowedAlgorithms.every((alg) => ASYMMETRIC_JWT_ALGS.has(alg))));
+      Array.isArray(def.allowedAlgorithms) &&
+      def.allowedAlgorithms.length > 0 &&
+      def.allowedAlgorithms.every((alg) => ASYMMETRIC_JWT_ALGS.has(alg));
 
     const hasExplicitOpaqueIntrospection =
       typeof def.tokenIntrospectionUrl === 'string' &&
@@ -530,11 +560,16 @@ export function auditOpenApiSecurityAlternatives(spec: OpenApiSpecDocument): str
  *    - `confirmationNonce` (one-time nonce) and `confirmationExpiresAtMs` (> `nowMs`),
  *    - `consumeConfirmationNonceAtomically` (server-side one-time nonce consumption to block replay!).
  */
+export const MAX_MCP_CONFIRMATION_TTL_MS = 15 * 60 * 1000; // 15-minute ceiling on HITL confirmation tokens
+export const MAX_MCP_ARG_DEPTH = 10;
+export const MAX_MCP_ARG_NODES = 2_000;
+
 export interface McpToolDefinition<TArgs extends Record<string, unknown> & { tenantId: string }, TResult> {
   readonly name: string;
   readonly requiredPermission: string;
   readonly isMutating: boolean;
   readonly allowedArgKeys: readonly string[];
+  readonly requiredArgKeys?: readonly string[];
   readonly argValidators?: Readonly<Record<string, (val: unknown) => boolean>>;
   execute(
     verifiedContext: { userId: string; tenantId: string; permissions: readonly string[] },
@@ -542,7 +577,16 @@ export interface McpToolDefinition<TArgs extends Record<string, unknown> & { ten
   ): Promise<TResult>;
 }
 
-export function canonicalizeMcpArgValue(val: unknown, seen: WeakSet<object> = new WeakSet()): string {
+export function canonicalizeMcpArgValue(
+  val: unknown,
+  seen: WeakSet<object> = new WeakSet(),
+  depth = 0,
+  nodeBudget: { visited: number } = { visited: 0 }
+): string {
+  nodeBudget.visited += 1;
+  if (depth > MAX_MCP_ARG_DEPTH || nodeBudget.visited > MAX_MCP_ARG_NODES) {
+    throw new Error('MCP_ARG_DEPTH_OR_SIZE_LIMIT_EXCEEDED: MCP arguments exceed maximum nesting depth or node budget');
+  }
   if (val === null) return 'null';
   if (val === undefined || typeof val === 'function' || typeof val === 'symbol') {
     throw new Error('MCP_ARG_INVALID_PRIMITIVE_REJECTED: undefined, function, and symbol values are forbidden');
@@ -573,7 +617,7 @@ export function canonicalizeMcpArgValue(val: unknown, seen: WeakSet<object> = ne
   seen.add(val);
 
   if (Array.isArray(val)) {
-    return `[${val.map((v) => canonicalizeMcpArgValue(v, seen)).join(',')}]`;
+    return `[${val.map((v) => canonicalizeMcpArgValue(v, seen, depth + 1, nodeBudget)).join(',')}]`;
   }
 
   const proto = Object.getPrototypeOf(val);
@@ -597,7 +641,7 @@ export function canonicalizeMcpArgValue(val: unknown, seen: WeakSet<object> = ne
     if (normKey === '__proto__' || normKey === 'constructor' || normKey === 'prototype') {
       throw new Error(`MCP_ARG_PROTOTYPE_POLLUTION_REJECTED: Forbidden key "${normKey}"`);
     }
-    normalizedEntries.push([normKey, canonicalizeMcpArgValue(obj[rawKey], seen)]);
+    normalizedEntries.push([normKey, canonicalizeMcpArgValue(obj[rawKey], seen, depth + 1, nodeBudget)]);
   }
 
   normalizedEntries.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
@@ -685,13 +729,15 @@ export async function executeMcpToolWithRuntimeAuthz<
     );
   }
 
-  // DEVIL-03 & DEVIL-04 Guard 1: Mandatory argument key allowlist & deep canonical validation
+  // DEVIL-03 & DEVIL-04 Guard 1: Mandatory argument key allowlist, required keys & deep canonical validation
   if (!tool.allowedArgKeys || tool.allowedArgKeys.length === 0) {
     throw new Error(`MCP_TOOL_SCHEMA_MISSING: Tool "${tool.name}" must define non-empty allowedArgKeys`);
   }
   const allowedSet = new Set(tool.allowedArgKeys);
+  const presentNormalizedKeys = new Set<string>();
   for (const rawKey of Object.keys(args)) {
     const key = rawKey.normalize('NFKC');
+    presentNormalizedKeys.add(key);
     if (!allowedSet.has(key) || key === '__proto__' || key === 'constructor' || key === 'prototype') {
       throw new Error(`MCP_TOOL_UNEXPECTED_ARG_REJECTED:tool=${tool.name}:arg=${key}`);
     }
@@ -702,11 +748,18 @@ export async function executeMcpToolWithRuntimeAuthz<
       }
     }
   }
+  if (tool.requiredArgKeys) {
+    for (const reqKey of tool.requiredArgKeys) {
+      if (!presentNormalizedKeys.has(reqKey.normalize('NFKC'))) {
+        throw new Error(`MCP_TOOL_REQUIRED_ARG_MISSING:tool=${tool.name}:arg=${reqKey}`);
+      }
+    }
+  }
 
-  // Validate canonicalization on all tool calls (blocks NaN, Infinity, circular refs, non-plain objects, getters)
+  // Validate canonicalization on all tool calls (blocks NaN, Infinity, circular refs, non-plain objects, getters, depth/size bombs)
   canonicalizeMcpArgValue(args);
 
-  // DEVIL-03 Fix: Unconditionally require confirmationSecret, valid token, expiry, and one-time nonce consumption
+  // DEVIL-03 Fix: Unconditionally require confirmationSecret, valid token, bounded expiry, and one-time nonce consumption
   // whenever tool.isMutating === true! Never skip confirmation when confirmationSecret is omitted!
   if (tool.isMutating) {
     if (!params.confirmationSecret || params.confirmationSecret.trim().length < 32) {
@@ -726,6 +779,9 @@ export async function executeMcpToolWithRuntimeAuthz<
       params.confirmationExpiresAtMs <= nowMs
     ) {
       throw new Error(`MCP_CONFIRMATION_EXPIRED:${tool.name}`);
+    }
+    if (params.confirmationExpiresAtMs - nowMs > MAX_MCP_CONFIRMATION_TTL_MS) {
+      throw new Error(`MCP_CONFIRMATION_TTL_EXCEEDED:${tool.name}`);
     }
     if (!params.consumeConfirmationNonceAtomically) {
       throw new Error(`MCP_NONCE_STORE_REQUIRED: Mutating tool "${tool.name}" requires consumeConfirmationNonceAtomically`);
@@ -770,5 +826,73 @@ export async function executeMcpToolWithRuntimeAuthz<
     },
     args
   );
+}
+
+/**
+ * Sanitizes and isolates untrusted MCP tool output before feeding it back into an LLM context:
+ * 1. Redacts embedded secrets (Bearer tokens, JWTs, PEM keys, cloud/API keys, connection URI credentials).
+ * 2. Strips ANSI CSI/OSC sequences, control characters, and prompt-injection role/boundary delimiter tokens.
+ * 3. Enforces a strict UTF-8 byte ceiling so oversized tool responses cannot exhaust model context or memory.
+ */
+export function sanitizeMcpToolOutput(
+  rawOutput: unknown,
+  options: { maxBytes?: number } = {}
+): { untrustedToolOutput: string; truncated: boolean } {
+  const maxBytes = options.maxBytes ?? 16_384;
+  if (!Number.isInteger(maxBytes) || maxBytes < 64) {
+    throw new Error('MCP_OUTPUT_MAX_BYTES_INVALID');
+  }
+
+  let serialized: string;
+  if (typeof rawOutput === 'string') {
+    serialized = rawOutput;
+  } else {
+    try {
+      serialized = JSON.stringify(rawOutput, (_k, v) => (typeof v === 'bigint' ? v.toString() : v)) ?? '';
+    } catch {
+      serialized = '[UNSERIALIZABLE_MCP_TOOL_OUTPUT]';
+    }
+  }
+
+  const scrubbed = serialized
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
+    .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '')
+    .replace(
+      /\b((?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|rediss|amqp|amqps):\/\/)[^/\s:@]+:[^/\s@]+@/gi,
+      '$1[REDACTED_URI_CREDENTIALS]@'
+    )
+    .replace(/Bearer\s+[A-Za-z0-9\-._~+/]+=*/gi, 'Bearer [REDACTED_JWT]')
+    .replace(/Basic\s+[A-Za-z0-9+/=]{8,}/gi, 'Basic [REDACTED_BASIC_AUTH]')
+    .replace(/\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, '[REDACTED_JWT]')
+    .replace(
+      /\b(?:sk_live_|sk_test_|rk_live_|whsec_|sk-proj-|sk-ant-|ghp_|xoxb-|xoxp-)[A-Za-z0-9_\-]+\b/g,
+      '[REDACTED_KEY]'
+    )
+    .replace(/\b(?:AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z\-_]{35})\b/g, '[REDACTED_KEY]')
+    .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, '[REDACTED_PEM_KEY]')
+    // Strip common LLM role/boundary control tokens & untrusted wrapper escape tags
+    .replace(/<\|(?:im_start|im_end|system|assistant|user|endoftext)\|>/gi, '[STRIPPED_ROLE_TOKEN]')
+    .replace(/<\/?untrusted_tool_output>/gi, '[STRIPPED_BOUNDARY_TAG]');
+
+  const utf8Buf = Buffer.from(scrubbed, 'utf8');
+  if (utf8Buf.length <= maxBytes) {
+    return {
+      untrustedToolOutput: `<untrusted_tool_output>${scrubbed}</untrusted_tool_output>`,
+      truncated: false,
+    };
+  }
+
+  let sliced = utf8Buf.subarray(0, maxBytes).toString('utf8');
+  while (sliced.endsWith('\uFFFD') && sliced.length > 0) {
+    sliced = sliced.slice(0, -1);
+  }
+  while (Buffer.byteLength(sliced, 'utf8') > maxBytes && sliced.length > 0) {
+    sliced = sliced.slice(0, -1);
+  }
+  return {
+    untrustedToolOutput: `<untrusted_tool_output>${sliced}...[TRUNCATED]</untrusted_tool_output>`,
+    truncated: true,
+  };
 }
 ```

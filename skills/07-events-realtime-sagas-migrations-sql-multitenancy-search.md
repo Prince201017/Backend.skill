@@ -79,6 +79,7 @@ CREATE TABLE saga_instances (
 
 CREATE TABLE saga_step_logs (
     saga_id UUID NOT NULL REFERENCES saga_instances(saga_id) ON DELETE CASCADE,
+    tenant_id UUID NOT NULL,
     step_index INT NOT NULL,
     step_name VARCHAR(64) NOT NULL,
     status VARCHAR(40) NOT NULL CHECK (status IN (
@@ -94,6 +95,24 @@ CREATE TABLE saga_step_logs (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     PRIMARY KEY (saga_id, step_index)
 );
+
+ALTER TABLE saga_instances ENABLE ROW LEVEL SECURITY;
+ALTER TABLE saga_instances FORCE ROW LEVEL SECURITY;
+CREATE POLICY saga_instances_tenant_isolation_policy ON saga_instances
+  AS RESTRICTIVE
+  FOR ALL
+  TO PUBLIC
+  USING (security.verify_active_tenant_context(tenant_id))
+  WITH CHECK (security.verify_active_tenant_context(tenant_id));
+
+ALTER TABLE saga_step_logs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE saga_step_logs FORCE ROW LEVEL SECURITY;
+CREATE POLICY saga_step_logs_tenant_isolation_policy ON saga_step_logs
+  AS RESTRICTIVE
+  FOR ALL
+  TO PUBLIC
+  USING (security.verify_active_tenant_context(tenant_id))
+  WITH CHECK (security.verify_active_tenant_context(tenant_id));
 ```
 
 ```typescript
@@ -163,6 +182,13 @@ export interface DurableSagaStateStore<TContext> {
       }
   >;
 
+  renewSagaLease?(params: {
+    sagaId: string;
+    workerId: string;
+    fencingToken: bigint;
+    leaseDurationMs: number;
+  }): Promise<boolean>;
+
   recordStepStatus(
     sagaId: string,
     stepIndex: number,
@@ -201,12 +227,14 @@ export async function runOrResumeDurableSaga<TContext>(params: {
   maxCompensationAttempts?: number;
 }): Promise<{ finalStatus: DurableSagaStatus }> {
   const maxCompAttempts = params.maxCompensationAttempts ?? 3;
+  const workerId = params.workerId ?? 'default-saga-worker';
+  const leaseDurationMs = params.leaseDurationMs ?? 30_000;
   const lease = await params.store.acquireSagaLease({
     sagaId: params.sagaId,
     tenantId: params.tenantId,
     sagaType: params.sagaType,
-    workerId: params.workerId ?? 'default-saga-worker',
-    leaseDurationMs: params.leaseDurationMs ?? 30_000,
+    workerId,
+    leaseDurationMs,
     initialContext: params.initialContext,
   });
 
@@ -223,6 +251,38 @@ export async function runOrResumeDurableSaga<TContext>(params: {
     return { finalStatus: 'RECONCILIATION_REQUIRED' };
   }
 
+  const leaseAbortController = new AbortController();
+  let leaseHeartbeatInFlight = false;
+  const leaseHeartbeatTimer =
+    typeof params.store.renewSagaLease === 'function'
+      ? setInterval(async () => {
+          if (leaseHeartbeatInFlight || leaseAbortController.signal.aborted) return;
+          leaseHeartbeatInFlight = true;
+          try {
+            const renewed = await params.store.renewSagaLease!({
+              sagaId: params.sagaId,
+              workerId,
+              fencingToken,
+              leaseDurationMs,
+            });
+            if (!renewed) {
+              leaseAbortController.abort(new Error('SAGA_FENCING_LEASE_LOST'));
+            }
+          } catch {
+            leaseAbortController.abort(new Error('SAGA_FENCING_LEASE_LOST'));
+          } finally {
+            leaseHeartbeatInFlight = false;
+          }
+        }, Math.max(250, Math.floor(leaseDurationMs / 3)))
+      : undefined;
+
+  const assertLeaseActive = (): void => {
+    if (leaseAbortController.signal.aborted) {
+      throw new Error('SAGA_FENCING_LEASE_LOST');
+    }
+  };
+
+  try {
   const stepMap = new Map<number, PersistedSagaStepRecord>();
   for (const s of lease.steps) {
     stepMap.set(s.stepIndex, s);
@@ -297,9 +357,12 @@ export async function runOrResumeDurableSaga<TContext>(params: {
         // priorOutcome === 'CONFIRMED_NEVER_EXECUTED_DOWNSTREAM': safe to proceed with forward execution below
       }
 
+      assertLeaseActive();
       await params.store.recordStepStatus(params.sagaId, i, step.stepName, 'FORWARD_STARTED', fencingToken);
       const timeoutMs = step.stepTimeoutMs ?? 10_000;
       const controller = new AbortController();
+      const onLeaseLost = () => controller.abort(new Error('SAGA_FENCING_LEASE_LOST'));
+      leaseAbortController.signal.addEventListener('abort', onLeaseLost, { once: true });
       let timer: ReturnType<typeof setTimeout> | undefined;
       const timeoutPromise = new Promise<never>((_, reject) => {
         timer = setTimeout(() => {
@@ -315,10 +378,16 @@ export async function runOrResumeDurableSaga<TContext>(params: {
           timeoutPromise,
         ]);
         if (timer) clearTimeout(timer);
+        leaseAbortController.signal.removeEventListener('abort', onLeaseLost);
+        assertLeaseActive();
         await params.store.recordStepStatus(params.sagaId, i, step.stepName, 'FORWARD_COMPLETED', fencingToken);
         stepMap.set(i, { stepIndex: i, stepName: step.stepName, status: 'FORWARD_COMPLETED' });
       } catch (err) {
         if (timer) clearTimeout(timer);
+        leaseAbortController.signal.removeEventListener('abort', onLeaseLost);
+        if (leaseAbortController.signal.aborted || (err instanceof Error && err.message === 'SAGA_FENCING_LEASE_LOST')) {
+          throw new Error('SAGA_FENCING_LEASE_LOST');
+        }
         const isTimeoutAbort =
           controller.signal.aborted ||
           err instanceof SagaAmbiguousStepTimeoutError ||
@@ -369,29 +438,55 @@ export async function runOrResumeDurableSaga<TContext>(params: {
       continue;
     }
 
+    assertLeaseActive();
     await params.store.recordStepStatus(params.sagaId, i, step.stepName, 'COMPENSATING', fencingToken);
     let compensated = false;
 
     for (let attempt = 1; attempt <= maxCompAttempts; attempt++) {
+      assertLeaseActive();
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), step.stepTimeoutMs ?? 10_000);
+      const onLeaseLost = () => controller.abort(new Error('SAGA_FENCING_LEASE_LOST'));
+      leaseAbortController.signal.addEventListener('abort', onLeaseLost, { once: true });
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const compTimeoutPromise = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          const timeoutErr = new Error(`SAGA_COMPENSATION_TIMEOUT:${step.stepName}`);
+          controller.abort(timeoutErr);
+          reject(timeoutErr);
+        }, step.stepTimeoutMs ?? 10_000);
+      });
       try {
-        await step.compensateBackward(
-          lease.context,
-          `${params.sagaId}:step:${i}:${step.stepName}:compensate`,
-          controller.signal
-        );
-        clearTimeout(timer);
-        await params.store.recordStepStatus(params.sagaId, i, step.stepName, 'COMPENSATED', fencingToken);
+        await Promise.race([
+          step.compensateBackward(
+            lease.context,
+            `${params.sagaId}:step:${i}:${step.stepName}:compensate`,
+            controller.signal
+          ),
+          compTimeoutPromise,
+        ]);
         compensated = true;
         break;
-      } catch {
-        clearTimeout(timer);
+      } catch (compErr) {
+        if (
+          leaseAbortController.signal.aborted ||
+          (compErr instanceof Error && compErr.message === 'SAGA_FENCING_LEASE_LOST')
+        ) {
+          throw new Error('SAGA_FENCING_LEASE_LOST');
+        }
+      } finally {
+        if (timer) clearTimeout(timer);
+        leaseAbortController.signal.removeEventListener('abort', onLeaseLost);
       }
     }
 
-    if (!compensated) {
+    if (compensated) {
+      // Persist COMPENSATED outside the compensation retry loop so a fencing-token rejection
+      // NEVER re-runs step.compensateBackward()!
+      assertLeaseActive();
+      await params.store.recordStepStatus(params.sagaId, i, step.stepName, 'COMPENSATED', fencingToken);
+    } else {
       anyCompensationFailed = true;
+      assertLeaseActive();
       await params.store.recordStepStatus(
         params.sagaId,
         i,
@@ -405,8 +500,12 @@ export async function runOrResumeDurableSaga<TContext>(params: {
   const finalStatus: DurableSagaStatus = anyCompensationFailed
     ? 'RECONCILIATION_REQUIRED'
     : 'COMPENSATED_ROLLED_BACK';
+  assertLeaseActive();
   await params.store.updateSagaStatus(params.sagaId, finalStatus, fencingToken);
   return { finalStatus };
+  } finally {
+    if (leaseHeartbeatTimer) clearInterval(leaseHeartbeatTimer);
+  }
 }
 ```
 
@@ -525,7 +624,7 @@ CREATE TABLE IF NOT EXISTS public.tenants (
 CREATE TABLE IF NOT EXISTS public.tenant_members (
     tenant_id UUID NOT NULL REFERENCES public.tenants (id) ON DELETE CASCADE,
     user_id UUID NOT NULL,
-    role VARCHAR(32) NOT NULL CHECK (role IN ('OWNER', 'ADMIN', 'BILLING_ADMIN', 'MEMBER', 'READONLY')),
+    role VARCHAR(32) NOT NULL CHECK (role IN ('OWNER', 'ADMIN', 'BILLING_ADMIN', 'MEMBER', 'READONLY', 'READ_ONLY')),
     status VARCHAR(16) NOT NULL CHECK (status IN ('ACTIVE', 'SUSPENDED', 'REVOKED')),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     PRIMARY KEY (tenant_id, user_id)
@@ -556,7 +655,13 @@ ALTER TABLE public.tenants OWNER TO db_migrator;
 ALTER TABLE public.tenant_members OWNER TO db_migrator;
 ALTER TABLE public.orders OWNER TO db_migrator;
 
-GRANT SELECT, INSERT, UPDATE, DELETE ON public.tenants, public.tenant_members, public.orders TO db_migrator, app_runtime;
+-- db_migrator owns full DML; app_runtime has NO DELETE on tenants/tenant_members and NO INSERT on tenants.
+-- Note: PostgreSQL requires UPDATE privilege for SELECT ... FOR SHARE OF t, tm; actual writes on
+-- public.tenants and unauthorized self-escalation on public.tenant_members are blocked by RLS + BEFORE triggers below.
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.tenants, public.tenant_members, public.orders TO db_migrator;
+GRANT SELECT, UPDATE ON public.tenants TO app_runtime;
+GRANT SELECT, INSERT, UPDATE ON public.tenant_members TO app_runtime;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.orders TO app_runtime;
 
 -- 2. Restricted Security Schema & Protected HMAC Key Table (Inaccessible to app_runtime)
 CREATE SCHEMA IF NOT EXISTS security AUTHORIZATION db_migrator;
@@ -703,17 +808,98 @@ GRANT EXECUTE ON FUNCTION security.constant_time_hex_equal_32(TEXT, TEXT) TO db_
 GRANT EXECUTE ON FUNCTION security.verify_active_user_context(UUID) TO app_runtime, db_migrator;
 GRANT EXECUTE ON FUNCTION security.verify_active_tenant_context(UUID) TO app_runtime, db_migrator;
 
--- 3. Solve the tenant_members Bootstrap Paradox Securely (DEVIL-02 Remediation):
+-- 3. Solve the tenants & tenant_members Bootstrap Paradox Securely Without Self-Escalation or Tenant Enumeration:
 -- During withTenantTransaction() bootstrap, ONLY app.current_user_id + app.current_user_mac are set
--- while app.current_tenant_id remains empty (''). Note that PostgreSQL evaluates UPDATE USING policies
--- on SELECT ... FOR SHARE / FOR UPDATE queries, so the policy is FOR ALL with USING permitting self-lookup
--- (for SELECT / FOR SHARE) and WITH CHECK requiring active tenant context for any INSERT/UPDATE mutation.
+-- while app.current_tenant_id remains empty ('').
+-- Split policies by command so SELECT / FOR SHARE permits verified self-membership lookup while
+-- INSERT/UPDATE strictly require a verified active tenant context AND triggers block app_runtime
+-- from mutating public.tenants or self-escalating / deleting public.tenant_members!
+ALTER TABLE public.tenants ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.tenants FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY tenants_member_or_active_tenant_select_policy ON public.tenants
+  AS PERMISSIVE
+  FOR SELECT
+  TO app_runtime, db_migrator
+  USING (
+    security.verify_active_tenant_context(id)
+    OR EXISTS (
+      SELECT 1
+      FROM public.tenant_members tm
+      WHERE tm.tenant_id = tenants.id
+        AND security.verify_active_user_context(tm.user_id)
+    )
+  );
+
+-- PostgreSQL evaluates FOR UPDATE USING policies on SELECT ... FOR SHARE OF t;
+-- WITH CHECK (false) + trg_block_app_runtime_tenants_mutation double-block all actual UPDATEs by app_runtime!
+CREATE POLICY tenants_app_runtime_for_share_lock_policy ON public.tenants
+  AS PERMISSIVE
+  FOR UPDATE
+  TO app_runtime
+  USING (
+    security.verify_active_tenant_context(id)
+    OR EXISTS (
+      SELECT 1
+      FROM public.tenant_members tm
+      WHERE tm.tenant_id = tenants.id
+        AND security.verify_active_user_context(tm.user_id)
+    )
+  )
+  WITH CHECK (false);
+
+CREATE POLICY tenants_db_migrator_write_policy ON public.tenants
+  AS PERMISSIVE
+  FOR ALL
+  TO db_migrator
+  USING (true)
+  WITH CHECK (true);
+
+CREATE OR REPLACE FUNCTION security.block_app_runtime_tenants_mutation()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = pg_catalog, public
+AS $$
+BEGIN
+  IF current_user <> 'db_migrator'
+     AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = current_user AND rolsuper = true)
+     AND pg_has_role(current_user, 'app_runtime', 'MEMBER') THEN
+    RAISE EXCEPTION 'TENANT_GOVERNANCE_MUTATION_FORBIDDEN: app_runtime cannot mutate public.tenants directly'
+      USING ERRCODE = '42501';
+  END IF;
+  RETURN COALESCE(NEW, OLD);
+END;
+$$;
+ALTER FUNCTION security.block_app_runtime_tenants_mutation() OWNER TO db_migrator;
+
+CREATE TRIGGER trg_block_app_runtime_tenants_mutation
+  BEFORE INSERT OR UPDATE OR DELETE ON public.tenants
+  FOR EACH ROW
+  EXECUTE FUNCTION security.block_app_runtime_tenants_mutation();
+
 ALTER TABLE public.tenant_members ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.tenant_members FORCE ROW LEVEL SECURITY;
 
-CREATE POLICY tenant_members_self_or_active_tenant_policy ON public.tenant_members
+CREATE POLICY tenant_members_select_self_or_active_tenant_policy ON public.tenant_members
   AS PERMISSIVE
-  FOR ALL
+  FOR SELECT
+  TO app_runtime, db_migrator
+  USING (
+    security.verify_active_user_context(user_id)
+    OR security.verify_active_tenant_context(tenant_id)
+  );
+
+CREATE POLICY tenant_members_insert_active_tenant_policy ON public.tenant_members
+  AS PERMISSIVE
+  FOR INSERT
+  TO app_runtime, db_migrator
+  WITH CHECK (
+    security.verify_active_tenant_context(tenant_id)
+  );
+
+CREATE POLICY tenant_members_update_active_tenant_policy ON public.tenant_members
+  AS PERMISSIVE
+  FOR UPDATE
   TO app_runtime, db_migrator
   USING (
     security.verify_active_user_context(user_id)
@@ -722,6 +908,51 @@ CREATE POLICY tenant_members_self_or_active_tenant_policy ON public.tenant_membe
   WITH CHECK (
     security.verify_active_tenant_context(tenant_id)
   );
+
+CREATE POLICY tenant_members_delete_migrator_only_policy ON public.tenant_members
+  AS PERMISSIVE
+  FOR DELETE
+  TO db_migrator
+  USING (security.verify_active_tenant_context(tenant_id));
+
+CREATE OR REPLACE FUNCTION security.prevent_tenant_member_self_escalation()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  v_actor_user_id TEXT;
+BEGIN
+  IF current_user = 'db_migrator'
+     OR EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = current_user AND rolsuper = true) THEN
+    RETURN COALESCE(NEW, OLD);
+  END IF;
+  IF TG_OP = 'DELETE' THEN
+    RAISE EXCEPTION 'TENANT_MEMBER_DELETE_FORBIDDEN: Use revocation status updates instead of DELETE'
+      USING ERRCODE = '42501';
+  END IF;
+  v_actor_user_id := NULLIF(current_setting('app.current_user_id', true), '');
+  IF TG_OP = 'UPDATE' THEN
+    IF NEW.tenant_id <> OLD.tenant_id OR NEW.user_id <> OLD.user_id THEN
+      RAISE EXCEPTION 'TENANT_MEMBER_IDENTITY_IMMUTABLE: Cannot reassign tenant_id or user_id'
+        USING ERRCODE = '42501';
+    END IF;
+    IF v_actor_user_id IS NOT NULL
+      AND OLD.user_id::text = v_actor_user_id
+      AND (NEW.role IS DISTINCT FROM OLD.role OR NEW.status IS DISTINCT FROM OLD.status) THEN
+      RAISE EXCEPTION 'TENANT_MEMBER_SELF_ESCALATION_FORBIDDEN: Actor cannot mutate own role or membership status'
+        USING ERRCODE = '42501';
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+ALTER FUNCTION security.prevent_tenant_member_self_escalation() OWNER TO db_migrator;
+
+CREATE TRIGGER trg_prevent_tenant_member_self_escalation
+  BEFORE UPDATE OR DELETE ON public.tenant_members
+  FOR EACH ROW
+  EXECUTE FUNCTION security.prevent_tenant_member_self_escalation();
 
 -- 4. Strict Cryptographic Tenant Isolation Policy on Domain Tables (Fail-Closed on Missing/Forged MAC)
 ALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;

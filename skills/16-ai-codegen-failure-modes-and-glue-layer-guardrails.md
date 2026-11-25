@@ -131,6 +131,8 @@ export async function withPinnedTenantTransaction<T>(params: {
   requiredPermission: TenantPermission;
   gucHmacSecret: string;
   nowSec?: number;
+  maxAssertionLifetimeSec?: number;
+  isSessionRevoked?: (sessionId: string, userId: string) => boolean | Promise<boolean>;
   work: (pinnedTxClient: PinnedTenantDbClient, authContext: AuthorizedTenantTxContext) => Promise<T>;
 }): Promise<T> {
   return withTenantTransaction({
@@ -141,6 +143,8 @@ export async function withPinnedTenantTransaction<T>(params: {
     requiredPermission: params.requiredPermission,
     gucHmacSecret: params.gucHmacSecret,
     nowSec: params.nowSec,
+    maxAssertionLifetimeSec: params.maxAssertionLifetimeSec,
+    isSessionRevoked: params.isSessionRevoked,
     work: async (rawTxClient, authContext) => {
       const pinnedClient = wrapAsPinnedTenantClient(
         rawTxClient,
@@ -161,13 +165,47 @@ export async function withPinnedTenantTransaction<T>(params: {
 
 ## 3. Guardrail 2: Authenticated Next.js Server Action / RPC Mutation Wrapper (`AI-MISTAKE-03` & `DEVIL-08` Remediated)
 
-AI agents frequently mark a file `'use server'` and trust closure variables or client-passed `tenantId`/`userId` without re-authenticating or wrapping the mutation in `withPinnedTenantTransaction`. `createAuthenticatedServerMutation` enforces server-side session verification, strict input schema validation (rejecting unknown keys and prototype pollution), and `withPinnedTenantTransaction` on every invocation:
+AI agents frequently mark a file `'use server'` and trust closure variables or client-passed `tenantId`/`userId` without re-authenticating or wrapping the mutation in `withPinnedTenantTransaction`. `createAuthenticatedServerMutation` enforces server-side session verification **first** (with revocation forwarding and NO caller-controllable clock parameter!), recursive prototype-pollution defense, strict allow-listed input validation, and `withPinnedTenantTransaction` on every invocation:
 
 ```typescript
 export interface ServerMutationRequestEnvelope<TInput extends Record<string, unknown>> {
   readonly identityAssertionToken: string | undefined | null;
   readonly requestedTenantId: string;
   readonly input: TInput;
+}
+
+const FORBIDDEN_PROTO_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+function assertNoNestedPrototypePollution(
+  value: unknown,
+  depth = 0,
+  budget: { nodes: number } = { nodes: 0 }
+): void {
+  if (depth > 16) {
+    throw new Error('SERVER_MUTATION_INPUT_DEPTH_EXCEEDED');
+  }
+  budget.nodes += 1;
+  if (budget.nodes > 2_000) {
+    throw new Error('SERVER_MUTATION_INPUT_NODE_BUDGET_EXCEEDED');
+  }
+  if (value === null || typeof value !== 'object') return;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      assertNoNestedPrototypePollution(item, depth + 1, budget);
+    }
+    return;
+  }
+  const proto = Object.getPrototypeOf(value);
+  if (proto !== Object.prototype && proto !== null) {
+    throw new Error('SERVER_MUTATION_NON_PLAIN_OBJECT_REJECTED');
+  }
+  for (const key of Object.keys(value)) {
+    const normalizedKey = key.normalize('NFKC');
+    if (FORBIDDEN_PROTO_KEYS.has(key) || FORBIDDEN_PROTO_KEYS.has(normalizedKey) || key.includes('\0')) {
+      throw new Error(`SERVER_MUTATION_PROTOTYPE_POLLUTION_REJECTED:${key}`);
+    }
+    assertNoNestedPrototypePollution((value as Record<string, unknown>)[key], depth + 1, budget);
+  }
 }
 
 export function createAuthenticatedServerMutation<
@@ -179,13 +217,17 @@ export function createAuthenticatedServerMutation<
   gucHmacSecret: string;
   requiredPermission: TenantPermission;
   allowedInputKeys: readonly (keyof TInput & string)[];
+  maxAssertionLifetimeSec?: number;
+  isSessionRevoked?: (sessionId: string, userId: string) => boolean | Promise<boolean>;
+  /** Server-internal clock provider (e.g. for deterministic tests) — NEVER exposed as a public Server Action parameter! */
+  getNowSec?: () => number;
   validateInput: (raw: Record<string, unknown>) => TInput;
   handler: (params: {
     txClient: PinnedTenantDbClient;
     authContext: AuthorizedTenantTxContext;
     validatedInput: TInput;
   }) => Promise<TOutput>;
-}): (envelope: ServerMutationRequestEnvelope<TInput>, nowSec?: number) => Promise<TOutput> {
+}): (envelope: ServerMutationRequestEnvelope<TInput>) => Promise<TOutput> {
   if (!config.identitySigningSecret || config.identitySigningSecret.trim().length < 32) {
     throw new Error('SERVER_MUTATION_CONFIG_ERROR: identitySigningSecret must be at least 32 chars');
   }
@@ -194,28 +236,13 @@ export function createAuthenticatedServerMutation<
   }
   const allowedKeySet = new Set<string>(config.allowedInputKeys);
 
-  return async (envelope: ServerMutationRequestEnvelope<TInput>, nowSec?: number): Promise<TOutput> => {
+  return async (envelope: ServerMutationRequestEnvelope<TInput>): Promise<TOutput> => {
     if (!envelope || typeof envelope !== 'object') {
       throw new Error('SERVER_MUTATION_INVALID_ENVELOPE');
     }
-    const rawInput = envelope.input;
-    if (
-      !rawInput ||
-      typeof rawInput !== 'object' ||
-      Array.isArray(rawInput) ||
-      (Object.getPrototypeOf(rawInput) !== Object.prototype && Object.getPrototypeOf(rawInput) !== null)
-    ) {
-      throw new Error('SERVER_MUTATION_INVALID_INPUT_OBJECT');
-    }
 
-    for (const key of Object.keys(rawInput)) {
-      if (key === '__proto__' || key === 'constructor' || key === 'prototype' || !allowedKeySet.has(key)) {
-        throw new Error(`SERVER_MUTATION_UNEXPECTED_FIELD_REJECTED:${key}`);
-      }
-    }
-
-    const validatedInput = config.validateInput(rawInput);
-
+    // Authenticate & authorize FIRST inside withPinnedTenantTransaction before executing input validators or domain logic!
+    // Server clock comes strictly from server-side config.getNowSec / Date.now() — never from caller arguments.
     return withPinnedTenantTransaction({
       pool: config.pool,
       identityAssertionToken: envelope.identityAssertionToken,
@@ -223,9 +250,30 @@ export function createAuthenticatedServerMutation<
       requestedTenantId: envelope.requestedTenantId,
       requiredPermission: config.requiredPermission,
       gucHmacSecret: config.gucHmacSecret,
-      nowSec,
+      nowSec: config.getNowSec ? config.getNowSec() : Math.floor(Date.now() / 1000),
+      maxAssertionLifetimeSec: config.maxAssertionLifetimeSec,
+      isSessionRevoked: config.isSessionRevoked,
       work: async (txClient, authContext) => {
         assertPinnedTenantTransactionClient(txClient, authContext.tenantId);
+
+        const rawInput = envelope.input;
+        if (
+          !rawInput ||
+          typeof rawInput !== 'object' ||
+          Array.isArray(rawInput) ||
+          (Object.getPrototypeOf(rawInput) !== Object.prototype && Object.getPrototypeOf(rawInput) !== null)
+        ) {
+          throw new Error('SERVER_MUTATION_INVALID_INPUT_OBJECT');
+        }
+
+        for (const key of Object.keys(rawInput)) {
+          if (FORBIDDEN_PROTO_KEYS.has(key) || FORBIDDEN_PROTO_KEYS.has(key.normalize('NFKC')) || !allowedKeySet.has(key)) {
+            throw new Error(`SERVER_MUTATION_UNEXPECTED_FIELD_REJECTED:${key}`);
+          }
+        }
+        assertNoNestedPrototypePollution(rawInput);
+
+        const validatedInput = config.validateInput(rawInput);
         return config.handler({
           txClient,
           authContext,
@@ -241,23 +289,82 @@ export function createAuthenticatedServerMutation<
 
 ## 4. Guardrail 3: Byte-Exact Bounded Raw Body Reader for Webhooks (`AI-MISTAKE-02`)
 
-Never allow an AI agent to write `Buffer.from(JSON.stringify(await req.json()))` before calling `verifyAndProcessWebhookIdempotently`. Read the raw byte stream directly with a hard size ceiling (`maxBytes = 1_048_576`):
+Never allow an AI agent to write `Buffer.from(JSON.stringify(await req.json()))` before calling `verifyAndProcessWebhookIdempotently`. Read the raw byte stream directly with a hard size ceiling (`maxBytes = 1_048_576`) and strict read timeout (`timeoutMs = 10_000`) to defeat slowloris body-drip attacks:
 
 ```typescript
 export async function readRawWebhookBodyBounded(
   stream: AsyncIterable<Uint8Array | Buffer>,
-  maxBytes = 1_048_576 // 1 MB hard cap
+  maxBytes = 1_048_576, // 1 MB hard cap
+  options?: { timeoutMs?: number; signal?: AbortSignal }
 ): Promise<Buffer> {
+  if (!Number.isInteger(maxBytes) || maxBytes < 1 || maxBytes > 10_485_760) {
+    throw new Error('WEBHOOK_INVALID_MAX_BYTES: maxBytes must be an integer between 1 and 10485760');
+  }
+  const timeoutMs = options?.timeoutMs ?? 10_000;
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 1 || timeoutMs > 60_000) {
+    throw new Error('WEBHOOK_INVALID_TIMEOUT_MS');
+  }
+
   const chunks: Buffer[] = [];
   let totalBytes = 0;
+  const iterator = stream[Symbol.asyncIterator]();
+  const deadlineMs = Date.now() + timeoutMs;
+  let completedCleanly = false;
 
-  for await (const chunk of stream) {
-    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    totalBytes += buf.byteLength;
-    if (totalBytes > maxBytes) {
-      throw new Error(`WEBHOOK_PAYLOAD_TOO_LARGE: Raw body exceeded ${maxBytes} bytes`);
+  try {
+    while (true) {
+      if (options?.signal?.aborted) {
+        throw new Error('WEBHOOK_READ_ABORTED');
+      }
+      const remainingMs = deadlineMs - Date.now();
+      if (remainingMs <= 0) {
+        throw new Error(`WEBHOOK_BODY_READ_TIMEOUT: Stream did not complete within ${timeoutMs}ms`);
+      }
+
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let onAbort: (() => void) | undefined;
+      const step = await Promise.race([
+        iterator.next(),
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(
+            () => reject(new Error(`WEBHOOK_BODY_READ_TIMEOUT: Stream did not complete within ${timeoutMs}ms`)),
+            remainingMs
+          );
+          if (options?.signal) {
+            onAbort = () => reject(new Error('WEBHOOK_READ_ABORTED'));
+            options.signal.addEventListener('abort', onAbort, { once: true });
+          }
+        }),
+      ]).finally(() => {
+        if (timer) clearTimeout(timer);
+        if (onAbort && options?.signal) {
+          options.signal.removeEventListener('abort', onAbort);
+        }
+      });
+
+      if (step.done) {
+        completedCleanly = true;
+        break;
+      }
+      const chunk = step.value;
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      totalBytes += buf.byteLength;
+      if (totalBytes > maxBytes) {
+        throw new Error(`WEBHOOK_PAYLOAD_TOO_LARGE: Raw body exceeded ${maxBytes} bytes`);
+      }
+      chunks.push(buf);
     }
-    chunks.push(buf);
+  } finally {
+    if (!completedCleanly) {
+      const destroyable = stream as { destroy?: (err?: Error) => void };
+      if (typeof destroyable.destroy === 'function') {
+        destroyable.destroy();
+      }
+    }
+    if (typeof iterator.return === 'function') {
+      // Do not await indefinitely on a stalled stream's queued iterator.return()
+      void Promise.resolve(iterator.return()).catch(() => undefined);
+    }
   }
 
   if (totalBytes === 0) {
@@ -428,12 +535,23 @@ export async function verifyRealtimeStreamStillAuthorized(params: {
   closeStreamWithReason: (code: number, reason: string) => void;
 }): Promise<boolean> {
   const nowSec = params.nowSec ?? Math.floor(Date.now() / 1000);
-  if (nowSec >= params.tokenExpiresAtSec) {
+  if (
+    !Number.isFinite(nowSec) ||
+    typeof params.tokenExpiresAtSec !== 'number' ||
+    !Number.isFinite(params.tokenExpiresAtSec) ||
+    nowSec >= params.tokenExpiresAtSec
+  ) {
     params.closeStreamWithReason(4401, 'REALTIME_SESSION_TOKEN_EXPIRED');
     return false;
   }
 
-  const status = await params.loadCurrentMembershipStatus(params.tenantId, params.userId);
+  let status: 'ACTIVE' | 'SUSPENDED' | 'REVOKED' | null;
+  try {
+    status = await params.loadCurrentMembershipStatus(params.tenantId, params.userId);
+  } catch {
+    params.closeStreamWithReason(4500, 'REALTIME_MEMBERSHIP_CHECK_FAILED');
+    return false;
+  }
   if (status !== 'ACTIVE') {
     params.closeStreamWithReason(4403, 'REALTIME_TENANT_MEMBERSHIP_REVOKED');
     return false;
@@ -444,14 +562,15 @@ export async function verifyRealtimeStreamStillAuthorized(params: {
 
 /**
  * Active Realtime Stream Controller (`DEVIL-16` & `DEVIL-65` Remediation):
- * Enforces serialized continuous revalidation before delivering any outbound or queued frame,
- * and permanently seals the stream once token expiry, membership revocation, or explicit close() occurs
- * so concurrent in-flight sends or buffered messages can NEVER be emitted after closure!
+ * Enforces serialized continuous revalidation with bounded queue backpressure (`maxQueuedOperations`)
+ * before delivering any outbound or queued frame, and permanently seals the stream fail-closed on
+ * token expiry, invalid/NaN expiry, membership revocation, backend lookup errors, or explicit close().
  */
 export function createRevocationSafeRealtimeStreamController<TFrame>(config: {
   userId: string;
   tenantId: string;
   tokenExpiresAtSec: number;
+  maxQueuedOperations?: number;
   loadCurrentMembershipStatus: (
     tenantId: string,
     userId: string
@@ -460,6 +579,8 @@ export function createRevocationSafeRealtimeStreamController<TFrame>(config: {
   closeSocketWithReason: (code: number, reason: string) => void;
 }) {
   let closed = false;
+  let pendingQueueCount = 0;
+  const maxQueuedOperations = config.maxQueuedOperations ?? 128;
   let operationQueue: Promise<unknown> = Promise.resolve();
 
   const terminate = (code: number, reason: string): void => {
@@ -470,7 +591,20 @@ export function createRevocationSafeRealtimeStreamController<TFrame>(config: {
   };
 
   const enqueueSerialized = <T>(fn: () => Promise<T>): Promise<T> => {
-    const next = operationQueue.then(fn, fn);
+    if (pendingQueueCount >= maxQueuedOperations) {
+      return Promise.reject(
+        new Error(`REALTIME_STREAM_QUEUE_OVERFLOW: Pending operations exceeded ${maxQueuedOperations}`)
+      );
+    }
+    pendingQueueCount += 1;
+    const wrapped = async (): Promise<T> => {
+      try {
+        return await fn();
+      } finally {
+        pendingQueueCount = Math.max(0, pendingQueueCount - 1);
+      }
+    };
+    const next = operationQueue.then(wrapped, wrapped);
     operationQueue = next.then(
       () => undefined,
       () => undefined
@@ -522,22 +656,24 @@ export function createRevocationSafeRealtimeStreamController<TFrame>(config: {
 
 ```typescript
 export const HARD_MAX_BATCH_SIZE = 50;
+export const HARD_MAX_BATCH_TOTAL_COST = 500;
 
 /**
  * Bounded, Cost-Weighted & Transactionally Authorized Batch Executor (`DEVIL-09` & `DEVIL-64` Hardened):
- * 1. Enforces an un-overridable ceiling `HARD_MAX_BATCH_SIZE = 50` (rejects caller overrides > 50).
+ * 1. Enforces an un-overridable ceiling `HARD_MAX_BATCH_SIZE = 50` and `HARD_MAX_BATCH_TOTAL_COST = 500`.
  * 2. Charges rate-limit tokens proportional to total batch item cost (`calculateItemCost`), not just request count.
- * 3. Unconditionally requires `runInTransaction` (no non-transactional fallback — `DEVIL-64`) and executes per-item
- *    authorization AND mutation inside a single atomic transaction, preventing partial batch mutations and TOCTOU races.
+ * 3. Unconditionally requires `runInTransaction` (passing any pinned `txClient` directly into `authorizeItem` and `processItem`)
+ *    and executes per-item authorization AND mutation inside a single atomic transaction, preventing partial mutations & TOCTOU races.
  */
-export async function executeBoundedAuthorizedBatch<TItem, TResult>(params: {
+export async function executeBoundedAuthorizedBatch<TItem, TResult, TTxClient = unknown>(params: {
   items: readonly TItem[];
   maxBatchSize?: number;
+  maxTotalCostUnits?: number;
   calculateItemCost?: (item: TItem) => number;
   consumeRateLimitTokens: (totalCostUnits: number) => Promise<boolean>;
-  authorizeItem: (item: TItem) => Promise<boolean>;
-  processItem: (item: TItem) => Promise<TResult>;
-  runInTransaction: <T>(fn: () => Promise<T>) => Promise<T>;
+  authorizeItem: (item: TItem, txClient?: TTxClient) => Promise<boolean>;
+  processItem: (item: TItem, txClient?: TTxClient) => Promise<TResult>;
+  runInTransaction: <T>(fn: (txClient?: TTxClient) => Promise<T>) => Promise<T>;
 }): Promise<TResult[]> {
   if (typeof params.runInTransaction !== 'function') {
     throw new Error(
@@ -548,6 +684,12 @@ export async function executeBoundedAuthorizedBatch<TItem, TResult>(params: {
   if (!Number.isInteger(requestedMax) || requestedMax < 1 || requestedMax > HARD_MAX_BATCH_SIZE) {
     throw new Error(
       `BATCH_MAX_LIMIT_OVERRIDE_FORBIDDEN: maxBatchSize (${String(requestedMax)}) cannot exceed HARD_MAX_BATCH_SIZE (${HARD_MAX_BATCH_SIZE})`
+    );
+  }
+  const requestedMaxCost = params.maxTotalCostUnits ?? HARD_MAX_BATCH_TOTAL_COST;
+  if (!Number.isInteger(requestedMaxCost) || requestedMaxCost < 1 || requestedMaxCost > HARD_MAX_BATCH_TOTAL_COST) {
+    throw new Error(
+      `BATCH_MAX_COST_OVERRIDE_FORBIDDEN: maxTotalCostUnits (${String(requestedMaxCost)}) cannot exceed ${HARD_MAX_BATCH_TOTAL_COST}`
     );
   }
   if (params.items.length === 0 || params.items.length > requestedMax) {
@@ -563,6 +705,11 @@ export async function executeBoundedAuthorizedBatch<TItem, TResult>(params: {
       throw new Error(`BATCH_INVALID_ITEM_COST: Item cost must be a positive integer (got ${String(itemCost)})`);
     }
     totalCostUnits += itemCost;
+    if (totalCostUnits > requestedMaxCost) {
+      throw new Error(
+        `BATCH_TOTAL_COST_EXCEEDED: Cumulative batch cost (${totalCostUnits}) exceeded ceiling (${requestedMaxCost})`
+      );
+    }
   }
 
   // Deduct rate-limit tokens proportional to total item cost across the batch!
@@ -571,23 +718,23 @@ export async function executeBoundedAuthorizedBatch<TItem, TResult>(params: {
     throw new Error('BATCH_RATE_LIMIT_EXCEEDED: Insufficient token bucket capacity for batch cost');
   }
 
-  const executeBatchAtomically = async (): Promise<TResult[]> => {
-    // 1. Pre-flight authorize EVERY item in the batch before any mutation
+  const executeBatchAtomically = async (txClient?: TTxClient): Promise<TResult[]> => {
+    // 1. Pre-flight authorize EVERY item in the batch inside the pinned transaction before any mutation
     for (const item of params.items) {
-      const allowed = await params.authorizeItem(item);
+      const allowed = await params.authorizeItem(item, txClient);
       if (!allowed) {
         throw new Error('BATCH_ITEM_BOLA_DENIED: One or more items in the batch failed authorization');
       }
     }
 
-    // 2. Re-verify authorization at mutation time for each item and execute inside the transaction
+    // 2. Re-verify authorization at mutation time for each item and execute inside the pinned transaction
     const results: TResult[] = [];
     for (const item of params.items) {
-      const stillAllowed = await params.authorizeItem(item);
+      const stillAllowed = await params.authorizeItem(item, txClient);
       if (!stillAllowed) {
         throw new Error('BATCH_ITEM_TOCTOU_AUTHZ_DENIED: Authorization revoked before item mutation');
       }
-      results.push(await params.processItem(item));
+      results.push(await params.processItem(item, txClient));
     }
     return results;
   };

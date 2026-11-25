@@ -31,7 +31,7 @@ Never mandate `SERIALIZABLE` indiscriminately across all transactions. Select th
 ## 3. Committed Transactional Outbox & Transactionally Bound Consumer Inbox
 
 ```sql
-CREATE TABLE outbox_events (
+CREATE TABLE IF NOT EXISTS public.outbox_events (
     event_id UUID PRIMARY KEY,
     tenant_id UUID NOT NULL,
     aggregate_type VARCHAR(64) NOT NULL,
@@ -42,17 +42,19 @@ CREATE TABLE outbox_events (
     traceparent VARCHAR(128) NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     leased_until TIMESTAMPTZ NULL,
+    lock_owner VARCHAR(128) NULL,
+    fencing_token BIGINT NOT NULL DEFAULT 0,
     processed_at TIMESTAMPTZ NULL,
     dead_lettered_at TIMESTAMPTZ NULL,
     relay_attempts INT NOT NULL DEFAULT 0,
     last_error TEXT NULL
 );
 
-CREATE INDEX idx_outbox_committed_unprocessed
-ON outbox_events (created_at ASC)
+CREATE INDEX IF NOT EXISTS idx_outbox_committed_unprocessed
+ON public.outbox_events (created_at ASC)
 WHERE processed_at IS NULL AND dead_lettered_at IS NULL;
 
-CREATE TABLE inbox_processed_events (
+CREATE TABLE IF NOT EXISTS public.inbox_processed_events (
     consumer_group VARCHAR(64) NOT NULL,
     event_id UUID NOT NULL,
     tenant_id UUID NOT NULL,
@@ -60,6 +62,29 @@ CREATE TABLE inbox_processed_events (
     processed_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     PRIMARY KEY (consumer_group, event_id)
 );
+
+-- Multi-tenant Row Level Security (FORCE RLS) on both outbox & inbox tables
+ALTER TABLE public.outbox_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.outbox_events FORCE ROW LEVEL SECURITY;
+CREATE POLICY outbox_events_tenant_isolation ON public.outbox_events
+  AS PERMISSIVE FOR ALL TO app_runtime
+  USING (security.verify_active_tenant_context(tenant_id))
+  WITH CHECK (security.verify_active_tenant_context(tenant_id));
+CREATE POLICY outbox_events_tenant_restrictive ON public.outbox_events
+  AS RESTRICTIVE FOR ALL TO PUBLIC
+  USING (security.verify_active_tenant_context(tenant_id))
+  WITH CHECK (security.verify_active_tenant_context(tenant_id));
+
+ALTER TABLE public.inbox_processed_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.inbox_processed_events FORCE ROW LEVEL SECURITY;
+CREATE POLICY inbox_processed_events_tenant_isolation ON public.inbox_processed_events
+  AS PERMISSIVE FOR ALL TO app_runtime
+  USING (security.verify_active_tenant_context(tenant_id))
+  WITH CHECK (security.verify_active_tenant_context(tenant_id));
+CREATE POLICY inbox_processed_events_tenant_restrictive ON public.inbox_processed_events
+  AS RESTRICTIVE FOR ALL TO PUBLIC
+  USING (security.verify_active_tenant_context(tenant_id))
+  WITH CHECK (security.verify_active_tenant_context(tenant_id));
 ```
 
 ### Committed Outbox Relay & Transactionally Consistent Consumer Inbox
@@ -77,6 +102,7 @@ export interface OutboxRecord {
   payload: Record<string, unknown>;
   traceparent: string | null;
   event_hmac: string; // Mandatory HMAC-SHA256 authenticity tag
+  fencing_token?: string | number;
 }
 
 export interface TransactionalDbClient {
@@ -120,23 +146,27 @@ export async function runCommittedOutboxRelayBatch(
   dbClient: { query: (sql: string, params?: unknown[]) => Promise<{ rows: OutboxRecord[]; rowCount: number }> },
   brokerPublish: (record: OutboxRecord) => Promise<void>,
   batchSize = 100,
-  maxRelayAttempts = 10
+  maxRelayAttempts = 10,
+  workerId = `relay-${crypto.randomUUID()}`
 ): Promise<{ publishedCount: number; quarantinedCount: number }> {
   // Phase 0: Quarantine poison-pill rows that have exhausted maxRelayAttempts
   const quarantineRes = await dbClient.query(
     `UPDATE outbox_events
      SET dead_lettered_at = clock_timestamp(),
-         leased_until = NULL
+         leased_until = NULL,
+         lock_owner = NULL
      WHERE processed_at IS NULL
        AND dead_lettered_at IS NULL
        AND relay_attempts >= $1`,
     [maxRelayAttempts]
   );
 
-  // Phase 1: Claim committed rows atomically with a short 30s lease and release DB locks immediately
+  // Phase 1: Claim committed rows atomically with a short 30s lease, lock_owner, and monotonic fencing_token
   const { rows } = await dbClient.query(
     `UPDATE outbox_events
      SET leased_until = clock_timestamp() + interval '30 seconds',
+         lock_owner = $3,
+         fencing_token = fencing_token + 1,
          relay_attempts = relay_attempts + 1
      WHERE event_id IN (
        SELECT event_id
@@ -149,8 +179,8 @@ export async function runCommittedOutboxRelayBatch(
        LIMIT $1
        FOR UPDATE SKIP LOCKED
      )
-     RETURNING event_id, tenant_id, aggregate_type, aggregate_id, event_type, payload, event_hmac, traceparent`,
-    [batchSize, maxRelayAttempts]
+     RETURNING event_id, tenant_id, aggregate_type, aggregate_id, event_type, payload, event_hmac, traceparent, fencing_token`,
+    [batchSize, maxRelayAttempts, workerId]
   );
 
   if (rows.length === 0) {
@@ -158,31 +188,47 @@ export async function runCommittedOutboxRelayBatch(
   }
 
   // Phase 2: Publish outside the DB transaction so network latency never holds DB locks
-  const publishedIds: string[] = [];
+  const publishedEntries: Array<{ eventId: string; fencingToken: string | number | null }> = [];
   for (const record of rows) {
     try {
       await brokerPublish(record);
-      publishedIds.push(record.event_id);
+      publishedEntries.push({
+        eventId: record.event_id,
+        fencingToken: record.fencing_token ?? null,
+      });
     } catch (err) {
       const errMsg = err instanceof Error ? err.message.slice(0, 500) : 'BROKER_PUBLISH_ERROR';
       await dbClient
-        .query(`UPDATE outbox_events SET last_error = $2 WHERE event_id = $1`, [record.event_id, errMsg])
+        .query(
+          `UPDATE outbox_events
+           SET last_error = $2
+           WHERE event_id = $1 AND lock_owner = $3 AND ($4::bigint IS NULL OR fencing_token = $4::bigint)`,
+          [record.event_id, errMsg, workerId, record.fencing_token ?? null]
+        )
         .catch(() => undefined);
     }
   }
 
-  // Phase 3: Mark only the successfully published events as processed
-  if (publishedIds.length > 0) {
-    await dbClient.query(
+  // Phase 3: Mark only rows still owned by this worker + fencing_token as processed (prevents stale relay overwrite!)
+  let confirmedPublishedCount = 0;
+  for (const entry of publishedEntries) {
+    const res = await dbClient.query(
       `UPDATE outbox_events
        SET processed_at = clock_timestamp(),
-           leased_until = NULL
-       WHERE event_id = ANY($1::uuid[])`,
-      [publishedIds]
+           leased_until = NULL,
+           lock_owner = NULL
+       WHERE event_id = $1
+         AND lock_owner = $2
+         AND ($3::bigint IS NULL OR fencing_token = $3::bigint)
+         AND processed_at IS NULL`,
+      [entry.eventId, workerId, entry.fencingToken]
     );
+    if (res.rowCount > 0) {
+      confirmedPublishedCount += 1;
+    }
   }
 
-  return { publishedCount: publishedIds.length, quarantinedCount: quarantineRes.rowCount };
+  return { publishedCount: confirmedPublishedCount, quarantinedCount: quarantineRes.rowCount };
 }
 
 /**
@@ -231,32 +277,14 @@ export async function consumeEventIdempotently(params: {
   try {
     await txClient.query('BEGIN ISOLATION LEVEL READ COMMITTED');
 
-    const insertInbox = await txClient.query<{ payload_sha256: string }>(
-      `INSERT INTO inbox_processed_events (consumer_group, event_id, tenant_id, payload_sha256)
-       VALUES ($1, $2, $3, $4)
-       ON CONFLICT (consumer_group, event_id) DO NOTHING
-       RETURNING payload_sha256`,
-      [params.consumerGroup, params.event.event_id, params.event.tenant_id, payloadSha256]
-    );
-
-    if (insertInbox.rowCount === 0) {
-      const existingRes = await txClient.query<{ payload_sha256: string }>(
-        `SELECT payload_sha256 FROM inbox_processed_events WHERE consumer_group = $1 AND event_id = $2`,
-        [params.consumerGroup, params.event.event_id]
-      );
-      if (existingRes.rows[0] && existingRes.rows[0].payload_sha256 !== payloadSha256) {
-        throw new Error('INBOX_EVENT_TAMPERED: Duplicate event_id received with different payload hash');
-      }
-      await txClient.query('COMMIT');
-      return 'DUPLICATE_SKIPPED';
-    }
-
-    // Bind tenant + user context and transaction-local HMACs to current PostgreSQL txid_current()
-    // strictly matching Module 07 security.verify_active_user_context / verify_active_tenant_context
-    // and Module 13 withTenantTransaction (DEVIL-49 Remediation)
+    // Bind tenant + user context and transaction-local HMACs BEFORE any RLS-protected table queries!
+    // Fail closed if txid_current() is unavailable (never fall back to '0'!).
     const SYSTEM_INBOX_USER_UUID = '00000000-0000-7000-8000-000000000000';
     const txidRes = await txClient.query<{ txid: string }>(`SELECT txid_current()::text AS txid`);
-    const txid = txidRes.rows[0]?.txid ?? '0';
+    const txid = txidRes.rows[0]?.txid;
+    if (!txid || !/^\d+$/.test(txid)) {
+      throw new Error('INBOX_TXID_UNAVAILABLE: PostgreSQL txid_current() returned no valid transaction ID');
+    }
     const userMac = crypto
       .createHmac('sha256', params.gucHmacSecret)
       .update(`user:${SYSTEM_INBOX_USER_UUID}:${txid}`, 'utf8')
@@ -274,6 +302,33 @@ export async function consumeEventIdempotently(params: {
       params.event.tenant_id,
     ]);
     await txClient.query(`SELECT set_config('app.current_tenant_mac', $1, true)`, [tenantMac]);
+
+    const insertInbox = await txClient.query<{ payload_sha256: string }>(
+      `INSERT INTO inbox_processed_events (consumer_group, event_id, tenant_id, payload_sha256)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (consumer_group, event_id) DO NOTHING
+       RETURNING payload_sha256`,
+      [params.consumerGroup, params.event.event_id, params.event.tenant_id, payloadSha256]
+    );
+
+    if (insertInbox.rowCount === 0) {
+      const existingRes = await txClient.query<{ tenant_id: string; payload_sha256: string }>(
+        `SELECT tenant_id, payload_sha256 FROM inbox_processed_events WHERE consumer_group = $1 AND event_id = $2`,
+        [params.consumerGroup, params.event.event_id]
+      );
+      const existingRow = existingRes.rows[0];
+      if (!existingRow) {
+        throw new Error('INBOX_EVENT_CROSS_TENANT_COLLISION: Duplicate event_id belongs to another tenant');
+      }
+      if (existingRow.tenant_id !== params.event.tenant_id) {
+        throw new Error('INBOX_EVENT_CROSS_TENANT_COLLISION: Duplicate event_id tenant_id mismatch');
+      }
+      if (existingRow.payload_sha256 !== payloadSha256) {
+        throw new Error('INBOX_EVENT_TAMPERED: Duplicate event_id received with different payload hash');
+      }
+      await txClient.query('COMMIT');
+      return 'DUPLICATE_SKIPPED';
+    }
 
     // Execute business side effects on the EXACT SAME txClient connection!
     await params.applySideEffectInTx(txClient);
@@ -300,6 +355,7 @@ Constructing `tenant:${tenantId}:${resourceKey}` prevents Tenant B from reading 
 
 ```typescript
 const inFlightLocalPromises = new Map<string, Promise<string | null>>();
+const MAX_INFLIGHT_LOCAL_KEYS = 4096;
 
 export function serializeCacheValueBigIntSafe(value: unknown): string {
   return JSON.stringify(value, (_key, val) =>
@@ -312,10 +368,18 @@ export function deserializeCacheValueBigIntSafe<T>(raw: string): T {
     if (
       val !== null &&
       typeof val === 'object' &&
-      '__bigint_val__' in val &&
-      typeof (val as { __bigint_val__: unknown }).__bigint_val__ === 'string'
+      !Array.isArray(val) &&
+      Object.prototype.hasOwnProperty.call(val, '__bigint_val__')
     ) {
-      return BigInt((val as { __bigint_val__: string }).__bigint_val__);
+      const keys = Object.keys(val);
+      // Only revive exact single-key BigInt wrapper envelopes; leave multi-key user objects intact
+      if (keys.length === 1) {
+        const rawBigInt = (val as { __bigint_val__: unknown }).__bigint_val__;
+        if (typeof rawBigInt !== 'string' || !/^-?\d{1,40}$/.test(rawBigInt)) {
+          throw new Error('CACHE_DESERIALIZE_INVALID_BIGINT: Corrupt __bigint_val__ envelope in cache payload');
+        }
+        return BigInt(rawBigInt);
+      }
     }
     return val;
   }) as T;
@@ -333,6 +397,7 @@ export async function getOrComputeAuthorizedCachedSingleFlight<T>(
     visibilityScope: 'TENANT_SHARED' | 'USER_PRIVATE';
     resourceKey: string;
     ttlSeconds: number;
+    maxInFlightKeys?: number;
     authorizeBeforeFetch?: (ctx: {
       tenantId: string;
       actorUserId: string;
@@ -350,6 +415,9 @@ export async function getOrComputeAuthorizedCachedSingleFlight<T>(
   }
   if (!/^[a-zA-Z0-9_.:-]{1,128}$/.test(params.resourceKey)) {
     throw new Error('CACHE_REJECTED: Invalid resourceKey format');
+  }
+  if (!Number.isFinite(params.ttlSeconds) || params.ttlSeconds < 1 || params.ttlSeconds > 86_400) {
+    throw new Error('CACHE_REJECTED: ttlSeconds must be a finite number between 1 and 86400');
   }
 
   if (params.authorizeBeforeFetch) {
@@ -385,6 +453,10 @@ export async function getOrComputeAuthorizedCachedSingleFlight<T>(
 
   let computePromise = inFlightLocalPromises.get(scopedCacheKey);
   if (!computePromise) {
+    const capacityLimit = params.maxInFlightKeys ?? MAX_INFLIGHT_LOCAL_KEYS;
+    if (inFlightLocalPromises.size >= capacityLimit) {
+      throw new Error('CACHE_INFLIGHT_CAPACITY_EXCEEDED: Single-flight coalescing map reached safety limit');
+    }
     computePromise = (async (): Promise<string | null> => {
       try {
         const fresh = await fetcher();
@@ -411,7 +483,10 @@ export async function getOrComputeAuthorizedCachedSingleFlight<T>(
   }
 
   const serializedValue = await computePromise;
-  if (serializedValue === null) return null;
+  if (serializedValue === null) {
+    // Prevent existence oracle when authorizeBeforeFetch was omitted by returning uniform denial/null
+    return null;
+  }
 
   // Deserialize a fresh copy per caller so concurrent single-flight callers never share mutable references
   const value = deserializeCacheValueBigIntSafe<T>(serializedValue);

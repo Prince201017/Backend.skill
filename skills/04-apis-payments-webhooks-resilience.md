@@ -127,6 +127,16 @@ CREATE TABLE idempotency_keys (
     PRIMARY KEY (tenant_id, idempotency_key)
 );
 
+ALTER TABLE idempotency_keys ENABLE ROW LEVEL SECURITY;
+ALTER TABLE idempotency_keys FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY idempotency_keys_tenant_isolation_policy ON idempotency_keys
+  AS RESTRICTIVE
+  FOR ALL
+  TO PUBLIC
+  USING (security.verify_active_tenant_context(tenant_id))
+  WITH CHECK (security.verify_active_tenant_context(tenant_id));
+
 -- Atomic Lock Acquisition & Stale-Lease Takeover Query (Increments fencing_token monotonically):
 -- INSERT INTO idempotency_keys (tenant_id, idempotency_key, endpoint, request_hash, provider_idempotency_key, status, lock_owner, fencing_token, locked_until)
 -- VALUES ($1, $2, $3, $4, $5, 'PENDING', $6, 1, clock_timestamp() + ($7::int * interval '1 second'))
@@ -345,8 +355,11 @@ export async function executeWithIdempotencyLock(params: {
   const { fencingToken, currentStatus } = lockRes;
   const abortController = new AbortController();
   const heartbeatIntervalMs = Math.max(250, Math.floor((ttlSeconds * 1000) / 3));
+  let heartbeatInFlight = false;
 
   const heartbeatTimer = setInterval(async () => {
+    if (heartbeatInFlight || abortController.signal.aborted) return;
+    heartbeatInFlight = true;
     try {
       const renewed = await params.db.renewLockLease({
         tenantId: params.tenantId,
@@ -360,8 +373,14 @@ export async function executeWithIdempotencyLock(params: {
       }
     } catch {
       abortController.abort(new Error('IDEMPOTENCY_LEASE_RENEWAL_ERROR'));
+    } finally {
+      heartbeatInFlight = false;
     }
   }, heartbeatIntervalMs);
+
+  // CRITICAL: Once a key is in UNKNOWN_RECONCILIATION_REQUIRED, NEVER transition it to
+  // FAILED_TERMINAL until reconcileAmbiguousPayment explicitly confirms NOT_FOUND_SAFE_TO_EXECUTE.
+  let lockPreservedAsUnknown = currentStatus === 'UNKNOWN_RECONCILIATION_REQUIRED';
 
   try {
     // If recovering an UNKNOWN_RECONCILIATION_REQUIRED lock after lease expiry, reconcile FIRST!
@@ -414,6 +433,7 @@ export async function executeWithIdempotencyLock(params: {
         );
       }
       // resolved === 'NOT_FOUND_SAFE_TO_EXECUTE': provider confirmed prior call never arrived; safe to execute below
+      lockPreservedAsUnknown = false;
     }
 
     const result = await params.handler({
@@ -456,6 +476,21 @@ export async function executeWithIdempotencyLock(params: {
       throw err;
     }
 
+    if (lockPreservedAsUnknown) {
+      // Preserve UNKNOWN_RECONCILIATION_REQUIRED state so subsequent retries cannot bypass reconciliation
+      if (!(err instanceof Error && err.message === 'IDEMPOTENCY_FENCING_TOKEN_REJECTED_STALE_OWNER')) {
+        await params.db
+          .markUnknownReconciliationRequiredConditionally({
+            tenantId: params.tenantId,
+            key: params.idempotencyKey,
+            lockOwnerToken,
+            fencingToken,
+          })
+          .catch(() => undefined);
+      }
+      throw err;
+    }
+
     if (!(err instanceof Error && err.message === 'IDEMPOTENCY_FENCING_TOKEN_REJECTED_STALE_OWNER')) {
       await params.db.releaseTerminalFailedLockConditionally({
         tenantId: params.tenantId,
@@ -495,6 +530,16 @@ CREATE TABLE webhook_events (
     processed_at TIMESTAMPTZ NULL,
     PRIMARY KEY (provider, provider_event_id)
 );
+
+ALTER TABLE webhook_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE webhook_events FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY webhook_events_tenant_isolation_policy ON webhook_events
+  AS RESTRICTIVE
+  FOR ALL
+  TO PUBLIC
+  USING (security.verify_active_tenant_context(tenant_id))
+  WITH CHECK (security.verify_active_tenant_context(tenant_id));
 ```
 
 ```typescript
@@ -522,7 +567,12 @@ export function verifyWebhookSignature(params: {
     if (eqIdx <= 0) continue;
     const k = token.slice(0, eqIdx).trim();
     const v = token.slice(eqIdx + 1).trim();
-    if (k === 't' && v) timestampStr = v;
+    if (k === 't' && v) {
+      if (timestampStr !== undefined) {
+        return { valid: false, reason: 'DUPLICATE_TIMESTAMP_HEADER' };
+      }
+      timestampStr = v;
+    }
     if (k === 'v1' && v && /^[0-9a-fA-F]{64}$/.test(v)) {
       if (v1Signatures.length >= 5) {
         return { valid: false, reason: 'TOO_MANY_V1_SIGNATURES_IN_HEADER' };
@@ -619,12 +669,21 @@ export interface PersistentWebhookStore {
     lockOwner: string;
     fencingToken: bigint;
     resolvedProviderIdempotencyKey?: string;
+    signal?: AbortSignal;
     applyEffect: () => Promise<void>;
   }): Promise<
     | 'APPLIED_AND_PROCESSED'
     | 'OUT_OF_ORDER_STALE_EVENT_IGNORED'
     | 'FENCING_TOKEN_REJECTED_STALE_WORKER'
   >;
+
+  renewWebhookLease?(params: {
+    provider: string;
+    providerEventId: string;
+    lockOwner: string;
+    fencingToken: bigint;
+    leaseSeconds: number;
+  }): Promise<boolean>;
 
   markWebhookFailedRetryable(params: {
     provider: string;
@@ -684,13 +743,35 @@ export async function verifyAndProcessWebhookIdempotently(params: {
     );
   }
 
-  const envelope = params.parseEventEnvelope(params.rawBodyBuffer.toString('utf8'));
-  if (!envelope.providerEventId || !envelope.entityId) {
+  let envelope: {
+    providerEventId: string;
+    eventType: string;
+    entityId: string;
+    claimedTenantId?: string;
+    providerCreatedAtSec: number;
+  };
+  try {
+    envelope = params.parseEventEnvelope(params.rawBodyBuffer.toString('utf8'));
+  } catch {
+    throw new OperationalAppError(
+      400,
+      'webhook-malformed-json',
+      'Malformed Webhook Payload',
+      'Webhook body could not be parsed as a valid event envelope.'
+    );
+  }
+  if (
+    !envelope ||
+    !envelope.providerEventId ||
+    !envelope.entityId ||
+    !Number.isInteger(envelope.providerCreatedAtSec) ||
+    envelope.providerCreatedAtSec <= 0
+  ) {
     throw new OperationalAppError(
       400,
       'webhook-malformed-envelope',
       'Malformed Webhook Envelope',
-      'Webhook payload is missing required id or entity identifier.'
+      'Webhook payload is missing required id, entity identifier, or valid positive integer timestamp.'
     );
   }
 
@@ -749,6 +830,32 @@ export async function verifyAndProcessWebhookIdempotently(params: {
   }
 
   const { fencingToken } = claim;
+  const leaseSeconds = 30;
+  const leaseAbortController = new AbortController();
+  let webhookHeartbeatInFlight = false;
+  const webhookHeartbeatTimer =
+    typeof params.store.renewWebhookLease === 'function'
+      ? setInterval(async () => {
+          if (webhookHeartbeatInFlight || leaseAbortController.signal.aborted) return;
+          webhookHeartbeatInFlight = true;
+          try {
+            const renewed = await params.store.renewWebhookLease!({
+              provider: params.provider,
+              providerEventId: envelope.providerEventId,
+              lockOwner,
+              fencingToken,
+              leaseSeconds,
+            });
+            if (!renewed) {
+              leaseAbortController.abort(new Error('WEBHOOK_FENCING_TOKEN_REJECTED_STALE_WORKER'));
+            }
+          } catch {
+            leaseAbortController.abort(new Error('WEBHOOK_FENCING_TOKEN_REJECTED_STALE_WORKER'));
+          } finally {
+            webhookHeartbeatInFlight = false;
+          }
+        }, Math.max(250, Math.floor((leaseSeconds * 1000) / 3)))
+      : undefined;
 
   // 4. Apply domain mutation with out-of-order protection, fencing token verification, and atomic mark PROCESSED
   try {
@@ -761,10 +868,11 @@ export async function verifyAndProcessWebhookIdempotently(params: {
       lockOwner,
       fencingToken,
       resolvedProviderIdempotencyKey,
+      signal: leaseAbortController.signal,
       applyEffect: params.applyDomainEffect,
     });
 
-    if (res === 'FENCING_TOKEN_REJECTED_STALE_WORKER') {
+    if (leaseAbortController.signal.aborted || res === 'FENCING_TOKEN_REJECTED_STALE_WORKER') {
       throw new Error('WEBHOOK_FENCING_TOKEN_REJECTED_STALE_WORKER');
     }
     if (res === 'OUT_OF_ORDER_STALE_EVENT_IGNORED') {
@@ -781,6 +889,8 @@ export async function verifyAndProcessWebhookIdempotently(params: {
       });
     }
     throw err;
+  } finally {
+    if (webhookHeartbeatTimer) clearInterval(webhookHeartbeatTimer);
   }
 }
 ```
@@ -796,21 +906,25 @@ local refill_rate = tonumber(ARGV[2])
 local now_ms = tonumber(ARGV[3])
 local requested = tonumber(ARGV[4])
 
-if not capacity or capacity <= 0 or not refill_rate or refill_rate <= 0 or not requested or requested <= 0 then
+if not capacity or capacity <= 0 or not refill_rate or refill_rate <= 0 or not requested or requested <= 0 or not now_ms or now_ms < 0 then
   return redis.error_reply("ERR_INVALID_RATE_LIMIT_ARGUMENTS")
+end
+
+if requested > capacity then
+  return redis.error_reply("ERR_REQUESTED_EXCEEDS_CAPACITY")
 end
 
 local data = redis.call("HMGET", key, "tokens", "last_refill")
 local tokens = tonumber(data[1])
 local last_refill = tonumber(data[2])
 
-if tokens == nil then
+if tokens == nil or last_refill == nil then
   tokens = capacity
   last_refill = now_ms
 else
   local elapsed = math.max(0, now_ms - last_refill)
   tokens = math.min(capacity, tokens + (elapsed * refill_rate))
-  last_refill = now_ms
+  last_refill = math.max(last_refill, now_ms)
 end
 
 local allowed = 0
@@ -886,18 +1000,24 @@ export class CircuitBreaker {
     }
 
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.opts.requestTimeoutMs);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        const timeoutErr = new Error(`CIRCUIT_REQUEST_TIMEOUT:${this.opts.name}`);
+        controller.abort(timeoutErr);
+        reject(timeoutErr);
+      }, this.opts.requestTimeoutMs);
+    });
 
     try {
-      const result = await operation(controller.signal);
-      clearTimeout(timer);
+      const result = await Promise.race([operation(controller.signal), timeoutPromise]);
       this.onSuccess();
       return result;
     } catch (error) {
-      clearTimeout(timer);
       this.onFailure();
       throw error;
     } finally {
+      if (timer) clearTimeout(timer);
       if (isHalfOpenProbe) {
         this.halfOpenInFlightProbes = Math.max(0, this.halfOpenInFlightProbes - 1);
       }

@@ -42,10 +42,31 @@ const ROLE_PERMISSION_MATRIX: Readonly<Record<TenantRole, readonly TenantPermiss
   READ_ONLY: ['project:read'],
 };
 
+const CANONICAL_DB_ROLE_MAP: Readonly<Record<string, TenantRole>> = {
+  OWNER: 'OWNER',
+  ADMIN: 'ADMIN',
+  TENANT_ADMIN: 'ADMIN',
+  BILLING_ADMIN: 'BILLING_ADMIN',
+  FINANCE: 'BILLING_ADMIN',
+  MEMBER: 'MEMBER',
+  EDITOR: 'MEMBER',
+  READ_ONLY: 'READ_ONLY',
+  READONLY: 'READ_ONLY',
+  VIEWER: 'READ_ONLY',
+};
+
+export function normalizeTenantTxRole(rawRole: string): TenantRole | null {
+  const key = rawRole.trim().toUpperCase();
+  return Object.prototype.hasOwnProperty.call(CANONICAL_DB_ROLE_MAP, key)
+    ? CANONICAL_DB_ROLE_MAP[key]
+    : null;
+}
+
 export interface VerifiedServerIdentity {
   readonly userId: string;
   readonly sessionId: string;
   readonly issuedAtSec: number;
+  readonly notBeforeSec?: number;
   readonly expiresAtSec: number;
 }
 
@@ -56,27 +77,35 @@ export interface VerifyServerIdentityOptions {
   readonly isSessionRevoked?: (sessionId: string, userId: string) => boolean;
 }
 
-/**
- * Verifies an HMAC-SHA256 signed server session assertion (`DEVIL-19` Hardened).
- * Enforces signing secret strength (>= 32 chars), constant-time HMAC verification,
- * non-empty `userId` and `sessionId`, `issuedAtSec` clock-skew bounds, `expiresAtSec` expiry,
- * maximum assertion lifetime (`maxAssertionLifetimeSec`, default 3600s), and session revocation checks.
- */
-export function verifyServerIdentityAssertion(
+export interface VerifyServerIdentityAsyncOptions {
+  readonly nowSec?: number;
+  readonly maxClockSkewSec?: number;
+  readonly maxAssertionLifetimeSec?: number;
+  readonly isSessionRevoked?: (sessionId: string, userId: string) => boolean | Promise<boolean>;
+}
+
+const STRICT_IDENTITY_B64URL_REGEX = /^[A-Za-z0-9_-]+$/;
+
+function verifyServerIdentityCore(
   assertionToken: string | undefined | null,
   signingSecret: string,
-  nowSecOrOptions: number | VerifyServerIdentityOptions = Math.floor(Date.now() / 1000)
+  opts: {
+    readonly nowSec?: number;
+    readonly maxClockSkewSec?: number;
+    readonly maxAssertionLifetimeSec?: number;
+  }
 ): VerifiedServerIdentity {
   if (!signingSecret || typeof signingSecret !== 'string' || signingSecret.trim().length < 32) {
     throw new Error('AUTH_SIGNING_SECRET_WEAK_OR_MISSING: signingSecret must be at least 32 characters');
   }
-  const opts: VerifyServerIdentityOptions =
-    typeof nowSecOrOptions === 'number' ? { nowSec: nowSecOrOptions } : nowSecOrOptions;
   const nowSec = opts.nowSec ?? Math.floor(Date.now() / 1000);
+  if (!Number.isFinite(nowSec)) {
+    throw new Error('AUTH_IDENTITY_INVALID_CLOCK');
+  }
   const maxClockSkewSec = opts.maxClockSkewSec ?? 60;
   const maxAssertionLifetimeSec = opts.maxAssertionLifetimeSec ?? 3600;
 
-  if (!assertionToken || typeof assertionToken !== 'string') {
+  if (!assertionToken || typeof assertionToken !== 'string' || assertionToken.length > 8192) {
     throw new Error('AUTH_IDENTITY_MISSING');
   }
   const parts = assertionToken.split('.');
@@ -84,7 +113,10 @@ export function verifyServerIdentityAssertion(
     throw new Error('AUTH_IDENTITY_MALFORMED');
   }
   const [payloadB64, sigB64] = parts;
-  if (!payloadB64 || !sigB64) {
+  if (
+    !STRICT_IDENTITY_B64URL_REGEX.test(payloadB64) ||
+    !STRICT_IDENTITY_B64URL_REGEX.test(sigB64)
+  ) {
     throw new Error('AUTH_IDENTITY_MALFORMED');
   }
   const expectedSig = createHmac('sha256', signingSecret).update(payloadB64, 'utf8').digest();
@@ -103,14 +135,15 @@ export function verifyServerIdentityAssertion(
 
   let parsed: VerifiedServerIdentity;
   try {
-    parsed = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8')) as VerifiedServerIdentity;
+    const rawParsed: unknown = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
+    if (!rawParsed || typeof rawParsed !== 'object' || Array.isArray(rawParsed)) {
+      throw new Error('Payload must be a JSON object');
+    }
+    parsed = rawParsed as VerifiedServerIdentity;
   } catch {
     throw new Error('AUTH_IDENTITY_PAYLOAD_INVALID');
   }
 
-  if (!parsed || typeof parsed !== 'object') {
-    throw new Error('AUTH_IDENTITY_PAYLOAD_INVALID');
-  }
   if (!parsed.userId || typeof parsed.userId !== 'string' || parsed.userId.trim().length === 0) {
     throw new Error('AUTH_IDENTITY_USER_MISSING');
   }
@@ -123,6 +156,15 @@ export function verifyServerIdentityAssertion(
     parsed.issuedAtSec > nowSec + maxClockSkewSec
   ) {
     throw new Error('AUTH_IDENTITY_ISSUED_IN_FUTURE_OR_INVALID');
+  }
+  if (parsed.notBeforeSec !== undefined) {
+    if (
+      typeof parsed.notBeforeSec !== 'number' ||
+      !Number.isFinite(parsed.notBeforeSec) ||
+      nowSec + maxClockSkewSec < parsed.notBeforeSec
+    ) {
+      throw new Error('AUTH_IDENTITY_NOT_YET_VALID');
+    }
   }
   if (
     typeof parsed.expiresAtSec !== 'number' ||
@@ -137,8 +179,48 @@ export function verifyServerIdentityAssertion(
   if (parsed.expiresAtSec - parsed.issuedAtSec > maxAssertionLifetimeSec) {
     throw new Error('AUTH_IDENTITY_LIFETIME_EXCEEDED');
   }
-  if (opts.isSessionRevoked && opts.isSessionRevoked(parsed.sessionId, parsed.userId)) {
-    throw new Error('AUTH_IDENTITY_SESSION_REVOKED');
+  return parsed;
+}
+
+/**
+ * Verifies an HMAC-SHA256 signed server session assertion (`DEVIL-19` & `DEVIL-58` Hardened).
+ * Enforces signing secret strength (>= 32 chars), strict base64url, constant-time HMAC verification,
+ * non-empty `userId` and `sessionId`, `issuedAtSec`, `notBeforeSec` (`nbf`), `expiresAtSec`,
+ * maximum assertion lifetime (`maxAssertionLifetimeSec`, default 3600s), and session revocation checks.
+ */
+export function verifyServerIdentityAssertion(
+  assertionToken: string | undefined | null,
+  signingSecret: string,
+  nowSecOrOptions: number | VerifyServerIdentityOptions = Math.floor(Date.now() / 1000)
+): VerifiedServerIdentity {
+  const opts: VerifyServerIdentityOptions =
+    typeof nowSecOrOptions === 'number' ? { nowSec: nowSecOrOptions } : nowSecOrOptions;
+  const parsed = verifyServerIdentityCore(assertionToken, signingSecret, opts);
+  if (opts.isSessionRevoked) {
+    const revokedRes: unknown = opts.isSessionRevoked(parsed.sessionId, parsed.userId);
+    if (typeof revokedRes !== 'boolean') {
+      throw new Error('AUTH_ASYNC_REVOCATION_REQUIRES_ASYNC_VERIFIER');
+    }
+    if (revokedRes) {
+      throw new Error('AUTH_IDENTITY_SESSION_REVOKED');
+    }
+  }
+  return parsed;
+}
+
+export async function verifyServerIdentityAssertionAsync(
+  assertionToken: string | undefined | null,
+  signingSecret: string,
+  nowSecOrOptions: number | VerifyServerIdentityAsyncOptions = Math.floor(Date.now() / 1000)
+): Promise<VerifiedServerIdentity> {
+  const opts: VerifyServerIdentityAsyncOptions =
+    typeof nowSecOrOptions === 'number' ? { nowSec: nowSecOrOptions } : nowSecOrOptions;
+  const parsed = verifyServerIdentityCore(assertionToken, signingSecret, opts);
+  if (opts.isSessionRevoked) {
+    const revoked = await opts.isSessionRevoked(parsed.sessionId, parsed.userId);
+    if (revoked) {
+      throw new Error('AUTH_IDENTITY_SESSION_REVOKED');
+    }
   }
   return parsed;
 }
@@ -207,15 +289,15 @@ export async function withTenantTransaction<T>(params: {
   gucHmacSecret: string;
   nowSec?: number;
   maxAssertionLifetimeSec?: number;
-  isSessionRevoked?: (sessionId: string, userId: string) => boolean;
+  isSessionRevoked?: (sessionId: string, userId: string) => boolean | Promise<boolean>;
   work: (txClient: PooledDbClient, authContext: AuthorizedTenantTxContext) => Promise<T>;
 }): Promise<T> {
   if (!params.gucHmacSecret || typeof params.gucHmacSecret !== 'string' || params.gucHmacSecret.trim().length < 32) {
     throw new Error('GUC_HMAC_SECRET_MISSING_OR_WEAK: gucHmacSecret (>= 32 chars) is mandatory for tenant transactions');
   }
 
-  // Step 1: Authenticate user from verified server-side identity assertion
-  const verifiedIdentity = verifyServerIdentityAssertion(
+  // Step 1: Authenticate user from verified server-side identity assertion (supports async Redis/DB revocation!)
+  const verifiedIdentity = await verifyServerIdentityAssertionAsync(
     params.identityAssertionToken,
     params.identitySigningSecret,
     {
@@ -234,9 +316,12 @@ export async function withTenantTransaction<T>(params: {
   try {
     await client.query('BEGIN');
 
-    // Step 3a (DEVIL-01 & DEVIL-02): Bind context MACs to PostgreSQL's current transaction ID (txid_current()::text)
+    // Step 3a (DEVIL-01 & DEVIL-02): Bind context MACs to PostgreSQL's current transaction ID (fail-closed if unavailable!)
     const txidRes = await client.query<{ txid: string }>(`SELECT txid_current()::text AS txid`);
-    const currentTxId = txidRes.rows[0]?.txid ?? '0';
+    const currentTxId = txidRes.rows[0]?.txid;
+    if (!currentTxId || !/^\d+$/.test(currentTxId)) {
+      throw new Error('TENANT_TX_TXID_UNAVAILABLE: PostgreSQL txid_current() did not return a valid transaction ID');
+    }
     const userGucMac = createHmac('sha256', params.gucHmacSecret)
       .update(`user:${verifiedIdentity.userId}:${currentTxId}`, 'utf8')
       .digest('hex');
@@ -257,7 +342,7 @@ export async function withTenantTransaction<T>(params: {
       tenant_id: string;
       tenant_status: TenantStatus;
       member_status: MembershipStatus;
-      role: TenantRole;
+      role: string;
     }>(
       `SELECT t.id AS tenant_id,
               t.status AS tenant_status,
@@ -284,10 +369,15 @@ export async function withTenantTransaction<T>(params: {
       throw new Error(`TENANT_MEMBERSHIP_NOT_ACTIVE:${row.member_status}`);
     }
 
-    const grantedPermissions = ROLE_PERMISSION_MATRIX[row.role] ?? [];
+    // Normalize DB role strings (e.g. Module 07 SQL 'READONLY' -> canonical 'READ_ONLY')
+    const normalizedRole = normalizeTenantTxRole(row.role);
+    if (!normalizedRole) {
+      throw new Error(`TENANT_ROLE_UNRECOGNIZED:role=${row.role}`);
+    }
+    const grantedPermissions = ROLE_PERMISSION_MATRIX[normalizedRole];
     if (!grantedPermissions.includes(params.requiredPermission)) {
       throw new Error(
-        `TENANT_PERMISSION_DENIED:role=${row.role}:required=${params.requiredPermission}`
+        `TENANT_PERMISSION_DENIED:role=${normalizedRole}:required=${params.requiredPermission}`
       );
     }
 
@@ -304,7 +394,7 @@ export async function withTenantTransaction<T>(params: {
       userId: verifiedIdentity.userId,
       sessionId: verifiedIdentity.sessionId,
       tenantId: row.tenant_id,
-      role: row.role,
+      role: normalizedRole,
       permissions: grantedPermissions,
     };
 
@@ -330,6 +420,7 @@ export async function withTenantTransaction<T>(params: {
 - Because `set_config(setting_name, new_value, true)` sets `is_local = true`, PostgreSQL automatically resets `app.current_tenant_id` and `app.current_user_id` at the instant `COMMIT` or `ROLLBACK` completes.
 - When using PgBouncer in `transaction` pooling mode, every call to `withTenantTransaction()` checks out a server connection for the entire `BEGIN ... COMMIT/ROLLBACK` block, preventing transaction multiplexing or GUC leakage between concurrent requests.
 - **Defense-in-Depth RLS Policy**: PostgreSQL RLS policies must use `NULLIF(current_setting('app.current_tenant_id', true), '')::uuid` so that if any query is accidentally executed outside `withTenantTransaction()`, `current_setting(..., true)` returns `''` -> `NULL`, and `tenant_id = NULL` evaluates to `FALSE` (fail-closed, zero rows returned).
+- **Operational Note — Read-Only XID Consumption**: Calling `txid_current()` allocates a 32-bit PostgreSQL transaction ID (XID) even for read-only transactions. For high-QPS read-only endpoints (or streaming read replicas where `txid_current()` is forbidden), route read traffic through an authorized Redis cache (Module 03) or bind read-only transaction MACs to a transaction-local CSPRNG nonce (`app.current_tx_nonce` + `pg_backend_pid()`) alongside strict per-tenant rate limits (Module 04) and autovacuum freeze monitoring (`age(datfrozenxid)` alerting).
 
 ---
 
@@ -473,6 +564,7 @@ export interface ShutdownSubsystemHooks {
 export interface GracefulShutdownReport {
   readonly completedWithinGraceBudget: boolean;
   readonly stepsExecuted: string[];
+  readonly errors: string[];
   readonly remainingHttpConnections: number;
   readonly webSocketsClosed: number;
   readonly sseStreamsClosed: number;
@@ -484,44 +576,63 @@ export async function executeCoordinatedGracefulShutdown(
   totalGraceBudgetMs = 25_000
 ): Promise<GracefulShutdownReport> {
   const stepsExecuted: string[] = [];
+  const errors: string[] = [];
   const halfBudgetMs = Math.max(1_000, Math.floor(totalGraceBudgetMs * 0.45));
 
+  const runIsolated = async <T>(stepName: string, fn: () => Promise<T> | T, fallback: T): Promise<T> => {
+    try {
+      return await fn();
+    } catch (err) {
+      errors.push(`${stepName}:${err instanceof Error ? err.message : String(err)}`);
+      return fallback;
+    }
+  };
+
   // 1. Flip /health/ready to 503 so load balancers stop routing new traffic
-  await hooks.markReadinessUnhealthy();
+  await runIsolated('READINESS_MARKED_UNHEALTHY', () => hooks.markReadinessUnhealthy(), undefined);
   stepsExecuted.push('READINESS_MARKED_UNHEALTHY');
 
   // 2. Pause background queue worker polling immediately so no new jobs start
-  await hooks.pauseQueueWorkerAcquisition();
+  await runIsolated('QUEUE_WORKER_ACQUISITION_PAUSED', () => hooks.pauseQueueWorkerAcquisition(), undefined);
   stepsExecuted.push('QUEUE_WORKER_ACQUISITION_PAUSED');
 
   // 3. Notify WebSocket clients with 1001 Going Away and close SSE streams
   const [webSocketsClosed, sseStreamsClosed] = await Promise.all([
-    hooks.closeActiveWebSocketsGoingAway(),
-    hooks.closeActiveSseStreams(),
+    runIsolated('CLOSE_WEBSOCKETS', () => hooks.closeActiveWebSocketsGoingAway(), 0),
+    runIsolated('CLOSE_SSE', () => hooks.closeActiveSseStreams(), 0),
   ]);
   stepsExecuted.push('WEBSOCKETS_AND_SSE_CLOSED');
 
   // 4. Drain in-flight HTTP requests and active queue workers in parallel within budget
   const [httpDrain, workerDrain] = await Promise.all([
-    hooks.stopAcceptingNewHttpRequestsAndDrain(halfBudgetMs),
-    hooks.drainOrCancelInFlightWorkersAndTasks(halfBudgetMs),
+    runIsolated(
+      'DRAIN_HTTP',
+      () => hooks.stopAcceptingNewHttpRequestsAndDrain(halfBudgetMs),
+      { drainedCleanly: false, remainingConnections: -1 }
+    ),
+    runIsolated(
+      'DRAIN_WORKERS',
+      () => hooks.drainOrCancelInFlightWorkersAndTasks(halfBudgetMs),
+      { completedCount: 0, forceAbortedCount: -1 }
+    ),
   ]);
   stepsExecuted.push('HTTP_AND_WORKERS_DRAINED_OR_CANCELLED');
 
   // 5. Flush buffered OpenTelemetry spans and structured logs before closing pools
-  await hooks.flushTelemetryAndLogs();
+  await runIsolated('TELEMETRY_FLUSHED', () => hooks.flushTelemetryAndLogs(), undefined);
   stepsExecuted.push('TELEMETRY_FLUSHED');
 
-  // 6. Close PostgreSQL and Redis connection pools last (after all workers & HTTP handlers finish)
-  await hooks.closeDatabaseAndCachePools();
+  // 6. Close PostgreSQL and Redis connection pools last (ALWAYS executes even if prior steps threw!)
+  await runIsolated('DB_AND_CACHE_POOLS_CLOSED', () => hooks.closeDatabaseAndCachePools(), undefined);
   stepsExecuted.push('DB_AND_CACHE_POOLS_CLOSED');
 
   const completedWithinGraceBudget =
-    httpDrain.drainedCleanly && workerDrain.forceAbortedCount === 0;
+    errors.length === 0 && httpDrain.drainedCleanly && workerDrain.forceAbortedCount === 0;
 
   return {
     completedWithinGraceBudget,
     stepsExecuted,
+    errors,
     remainingHttpConnections: httpDrain.remainingConnections,
     webSocketsClosed,
     sseStreamsClosed,

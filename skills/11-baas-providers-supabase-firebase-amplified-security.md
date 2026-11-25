@@ -47,7 +47,7 @@ service cloud.firestore {
     function isActiveTenantMember(tenantId) {
       return isSignedIn()
         && tenantId is string
-        && tenantId.size() > 0
+        && tenantId.matches('^[a-zA-Z0-9_-]{3,64}$')
         && exists(memberDocPath(tenantId))
         && get(memberDocPath(tenantId)).data.status == 'ACTIVE';
     }
@@ -78,7 +78,7 @@ service cloud.firestore {
             ['tenantId', 'ownerId', 'name', 'status', 'budgetCents', 'createdAt', 'updatedAt'],
             ['description']
           )
-          && data.tenantId is string && data.tenantId.size() >= 3 && data.tenantId.size() <= 64
+          && data.tenantId is string && data.tenantId.matches('^[a-zA-Z0-9_-]{3,64}$')
           && data.ownerId is string && data.ownerId.size() > 0
           && data.name is string && data.name.size() >= 1 && data.name.size() <= 120
           && data.budgetCents is int && data.budgetCents >= 0 && data.budgetCents <= 1000000000
@@ -99,12 +99,12 @@ service cloud.firestore {
         && request.resource.data.createdAt == request.time
         && request.resource.data.updatedAt == request.time;
 
-      // Update: Caller must be an ACTIVE member of the existing project's tenant,
-      // immutable fields (tenantId, ownerId, createdAt) must not change,
+      // Update: Caller must hold ACTIVE ADMIN or EDITOR role (a demoted VIEWER who previously owned a
+      // project can NO LONGER mutate budgetCents or status), immutable fields must not change,
       // and client-driven status transitions are strictly limited to 'DRAFT' -> 'DRAFT' or 'DRAFT' -> 'ACTIVE'.
       // Transitioning to 'COMPLETED' is FORBIDDEN from client SDKs and must be executed by the backend Admin SDK.
       allow update: if isValidProjectShape(request.resource.data)
-        && isActiveTenantMember(resource.data.tenantId)
+        && hasActiveTenantRole(resource.data.tenantId, ['ADMIN', 'EDITOR'])
         && (resource.data.ownerId == request.auth.uid || hasActiveTenantRole(resource.data.tenantId, ['ADMIN']))
         && request.resource.data.tenantId == resource.data.tenantId
         && request.resource.data.ownerId == resource.data.ownerId
@@ -164,9 +164,12 @@ export function evaluateFirestoreProjectRule(params: {
     return { allowed: false, denialReason: 'UNAUTHENTICATED_OR_UNVERIFIED_EMAIL' };
   }
 
+  const SAFE_TENANT_ID_REGEX = /^[a-zA-Z0-9_-]{3,64}$/;
+
   const isActiveMemberOf = (tenantId: string): boolean =>
     Boolean(
-      membership &&
+      SAFE_TENANT_ID_REGEX.test(tenantId) &&
+        membership &&
         membership.uid === auth.uid &&
         membership.tenantId === tenantId &&
         membership.status === 'ACTIVE'
@@ -185,7 +188,7 @@ export function evaluateFirestoreProjectRule(params: {
 
   const isValidShape = (doc: ProjectDoc | null): doc is ProjectDoc => {
     if (!doc) return false;
-    if (typeof doc.tenantId !== 'string' || doc.tenantId.length < 3 || doc.tenantId.length > 64) return false;
+    if (typeof doc.tenantId !== 'string' || !SAFE_TENANT_ID_REGEX.test(doc.tenantId)) return false;
     if (typeof doc.ownerId !== 'string' || doc.ownerId.length === 0) return false;
     if (typeof doc.name !== 'string' || doc.name.length < 1 || doc.name.length > 120) return false;
     if (!Number.isInteger(doc.budgetCents) || doc.budgetCents < 0 || doc.budgetCents > 1_000_000_000) return false;
@@ -221,8 +224,11 @@ export function evaluateFirestoreProjectRule(params: {
   if (!isActiveMemberOf(existingDoc.tenantId)) {
     return { allowed: false, denialReason: 'CROSS_TENANT_OR_INACTIVE_MEMBER_UPDATE_DENIED' };
   }
+  if (!membership || !['ADMIN', 'EDITOR'].includes(membership.role)) {
+    return { allowed: false, denialReason: 'INSUFFICIENT_TENANT_ROLE_FOR_UPDATE' };
+  }
   const isOwnerOrAdmin =
-    existingDoc.ownerId === auth.uid || (membership !== null && membership.role === 'ADMIN');
+    existingDoc.ownerId === auth.uid || membership.role === 'ADMIN';
   if (!isOwnerOrAdmin) {
     return { allowed: false, denialReason: 'NOT_OWNER_OR_TENANT_ADMIN' };
   }
@@ -323,6 +329,38 @@ CREATE TABLE IF NOT EXISTS public.uploads (
   created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
 
+-- 0b. Lock Down public.tenant_members and public.uploads (Never leave PostgREST-exposed tables without RLS!)
+ALTER TABLE public.tenant_members ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.tenant_members FORCE ROW LEVEL SECURITY;
+REVOKE ALL ON TABLE public.tenant_members FROM anon;
+REVOKE INSERT, UPDATE, DELETE ON TABLE public.tenant_members FROM authenticated;
+
+CREATE POLICY tenant_members_self_select_only
+  ON public.tenant_members
+  FOR SELECT
+  TO authenticated
+  USING (user_id = auth.uid());
+
+ALTER TABLE public.uploads ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.uploads FORCE ROW LEVEL SECURITY;
+REVOKE ALL ON TABLE public.uploads FROM anon;
+REVOKE INSERT, UPDATE, DELETE ON TABLE public.uploads FROM authenticated;
+
+CREATE POLICY uploads_approved_member_select_only
+  ON public.uploads
+  FOR SELECT
+  TO authenticated
+  USING (
+    EXISTS (
+      SELECT 1
+      FROM public.tenant_members tm
+      WHERE tm.tenant_id = uploads.tenant_id
+        AND tm.user_id = auth.uid()
+        AND tm.status = 'ACTIVE'
+        AND (uploads.owner_user_id = auth.uid() OR tm.role = 'ADMIN')
+    )
+  );
+
 -- 1. Authoritative Supabase RLS Policies & Immutability Trigger on public.projects (DEVIL-15 Remediation)
 ALTER TABLE public.projects ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.projects FORCE ROW LEVEL SECURITY;
@@ -374,11 +412,13 @@ CREATE POLICY tenant_active_editor_update_projects
       WHERE tm.tenant_id = projects.tenant_id
         AND tm.user_id = auth.uid()
         AND tm.status = 'ACTIVE'
+        AND tm.role IN ('ADMIN', 'EDITOR')
         AND (projects.owner_id = auth.uid() OR tm.role = 'ADMIN')
     )
   )
   WITH CHECK (
-    -- Clients can never transition a project directly to 'COMPLETED' via PostgREST
+    -- Clients can never transition a project directly to 'COMPLETED' via PostgREST,
+    -- and demoted VIEWERs can never mutate previously owned projects.
     projects.status IN ('DRAFT', 'ACTIVE')
     AND EXISTS (
       SELECT 1
@@ -386,6 +426,7 @@ CREATE POLICY tenant_active_editor_update_projects
       WHERE tm.tenant_id = projects.tenant_id
         AND tm.user_id = auth.uid()
         AND tm.status = 'ACTIVE'
+        AND tm.role IN ('ADMIN', 'EDITOR')
         AND (projects.owner_id = auth.uid() OR tm.role = 'ADMIN')
     )
   );
@@ -398,7 +439,7 @@ CREATE POLICY tenant_projects_deny_client_delete
   USING (false);
 
 -- PostgreSQL RLS WITH CHECK only sees the NEW row and cannot compare NEW vs. OLD columns by itself!
--- Enforce column immutability (tenant_id, owner_id, created_at) and forbid ACTIVE -> DRAFT downgrade via trigger:
+-- Enforce column immutability (id, tenant_id, owner_id, created_at), terminal COMPLETED lock, and forbid ACTIVE -> DRAFT downgrade:
 CREATE OR REPLACE FUNCTION public.enforce_project_immutable_columns_and_state()
 RETURNS TRIGGER
 LANGUAGE plpgsql
@@ -406,6 +447,9 @@ SECURITY DEFINER
 SET search_path = pg_catalog, public
 AS $$
 BEGIN
+  IF NEW.id <> OLD.id THEN
+    RAISE EXCEPTION 'IMMUTABLE_COLUMN_VIOLATION: project.id is immutable';
+  END IF;
   IF NEW.tenant_id <> OLD.tenant_id THEN
     RAISE EXCEPTION 'IMMUTABLE_COLUMN_VIOLATION: project.tenant_id cannot be reassigned across tenants';
   END IF;
@@ -414,6 +458,9 @@ BEGIN
   END IF;
   IF NEW.created_at <> OLD.created_at THEN
     RAISE EXCEPTION 'IMMUTABLE_COLUMN_VIOLATION: project.created_at is immutable';
+  END IF;
+  IF OLD.status = 'COMPLETED' THEN
+    RAISE EXCEPTION 'IMMUTABLE_TERMINAL_STATE: COMPLETED projects cannot be modified';
   END IF;
   IF OLD.status = 'ACTIVE' AND NEW.status = 'DRAFT' THEN
     RAISE EXCEPTION 'INVALID_STATE_TRANSITION: Cannot downgrade project from ACTIVE to DRAFT';
@@ -429,20 +476,43 @@ CREATE TRIGGER trg_enforce_project_immutable_columns
   EXECUTE FUNCTION public.enforce_project_immutable_columns_and_state();
 
 -- 2. Supabase Realtime Channel Authorization (realtime.messages) — Both Subscribe (SELECT) & Publish (INSERT)
--- Blocks cross-tenant WebSocket channel snooping AND unauthorized message injection on Broadcast/Presence topics ("tenant:<uuid>:events")
+-- Blocks cross-tenant WebSocket channel snooping, topic-spoofing mismatch, invalid UUID DoS (planner-safe), AND unauthorized message injection
+CREATE OR REPLACE FUNCTION public.safe_parse_uuid(raw_text TEXT)
+RETURNS UUID
+LANGUAGE plpgsql
+IMMUTABLE
+PARALLEL SAFE
+SET search_path = pg_catalog
+AS $$
+BEGIN
+  IF raw_text IS NULL OR raw_text !~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' THEN
+    RETURN NULL;
+  END IF;
+  RETURN raw_text::uuid;
+EXCEPTION
+  WHEN invalid_text_representation THEN
+    RETURN NULL;
+END;
+$$;
+REVOKE ALL ON FUNCTION public.safe_parse_uuid(TEXT) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.safe_parse_uuid(TEXT) TO authenticated;
+
 ALTER TABLE realtime.messages ENABLE ROW LEVEL SECURITY;
 ALTER TABLE realtime.messages FORCE ROW LEVEL SECURITY;
+REVOKE ALL ON TABLE realtime.messages FROM anon;
 
 CREATE POLICY tenant_realtime_channel_subscribe_isolation
   ON realtime.messages
   FOR SELECT
   TO authenticated
   USING (
-    realtime.topic() LIKE 'tenant:%'
+    realtime.messages.topic = realtime.topic()
+    AND realtime.topic() LIKE 'tenant:%'
+    AND public.safe_parse_uuid(split_part(realtime.topic(), ':', 2)) IS NOT NULL
     AND EXISTS (
       SELECT 1
       FROM public.tenant_members tm
-      WHERE tm.tenant_id = NULLIF(split_part(realtime.topic(), ':', 2), '')::uuid
+      WHERE tm.tenant_id = public.safe_parse_uuid(split_part(realtime.topic(), ':', 2))
         AND tm.user_id = auth.uid()
         AND tm.status = 'ACTIVE'
     )
@@ -453,11 +523,13 @@ CREATE POLICY tenant_realtime_channel_publish_isolation
   FOR INSERT
   TO authenticated
   WITH CHECK (
-    realtime.topic() LIKE 'tenant:%'
+    realtime.messages.topic = realtime.topic()
+    AND realtime.topic() LIKE 'tenant:%'
+    AND public.safe_parse_uuid(split_part(realtime.topic(), ':', 2)) IS NOT NULL
     AND EXISTS (
       SELECT 1
       FROM public.tenant_members tm
-      WHERE tm.tenant_id = NULLIF(split_part(realtime.topic(), ':', 2), '')::uuid
+      WHERE tm.tenant_id = public.safe_parse_uuid(split_part(realtime.topic(), ':', 2))
         AND tm.user_id = auth.uid()
         AND tm.status = 'ACTIVE'
         AND tm.role IN ('ADMIN', 'EDITOR')
@@ -465,9 +537,12 @@ CREATE POLICY tenant_realtime_channel_publish_isolation
   );
 
 -- 3. Supabase Storage RLS (storage.objects)
--- Never allow direct client downloads from the 'quarantine' bucket; only allow reading 'production' bucket objects
--- when the corresponding public.uploads record is in 'APPROVED' state, caller is an ACTIVE tenant member,
--- AND caller is either the file owner or a tenant ADMIN (preventing Intra-Tenant Storage BOLA!).
+-- Enable/Force RLS, revoke anon access, deny direct client writes, and never allow direct client downloads from 'quarantine'
+ALTER TABLE storage.objects ENABLE ROW LEVEL SECURITY;
+ALTER TABLE storage.objects FORCE ROW LEVEL SECURITY;
+REVOKE ALL ON TABLE storage.objects FROM anon;
+REVOKE INSERT, UPDATE, DELETE ON TABLE storage.objects FROM authenticated;
+
 CREATE POLICY storage_approved_objects_only
   ON storage.objects
   FOR SELECT
@@ -486,4 +561,11 @@ CREATE POLICY storage_approved_objects_only
         AND (u.owner_user_id = auth.uid() OR tm.role = 'ADMIN')
     )
   );
+
+CREATE POLICY storage_deny_client_insert ON storage.objects
+  FOR INSERT TO authenticated WITH CHECK (false);
+CREATE POLICY storage_deny_client_update ON storage.objects
+  FOR UPDATE TO authenticated USING (false) WITH CHECK (false);
+CREATE POLICY storage_deny_client_delete ON storage.objects
+  FOR DELETE TO authenticated USING (false);
 ```

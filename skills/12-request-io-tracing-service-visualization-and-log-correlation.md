@@ -26,6 +26,7 @@ import { randomBytes } from 'node:crypto';
 
 export const MAX_HOP_PAYLOAD_BYTES = 8_192;   // 8 KB max per individual hop preview
 export const MAX_TRACE_ENVELOPE_BYTES = 32_768; // Hard 32 KB limit on full exported trace envelope
+export const MAX_IN_MEMORY_TRACE_HOPS = 256;    // Bounded in-memory hop ring cap per request trace
 
 export interface TraceHopSpan {
   spanId: string;
@@ -105,13 +106,30 @@ export function isSensitiveTraceKey(key: string): boolean {
 }
 
 const SECRET_STRING_PATTERNS: readonly RegExp[] = [
+  /\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|rediss|amqp|amqps):\/\/[^/\s:@]+:[^/\s@]+@/gi,
   /Bearer\s+[A-Za-z0-9\-._~+/]+=*/gi,
   /Basic\s+[A-Za-z0-9+/=]+/gi,
   /eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g,
   /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
-  /\b(?:sk_live_|sk_test_|rk_live_|whsec_|ghp_|xoxb-|xoxp-)[A-Za-z0-9_]+\b/g,
+  /\b(?:sk_live_|sk_test_|rk_live_|whsec_|sk-proj-|sk-ant-|ghp_|xoxb-|xoxp-)[A-Za-z0-9_\-]+\b/g,
+  /\b(?:AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z\-_]{35})\b/g,
   /\b(?:\d[ -]*?){13,19}\b/g,
 ];
+
+export function truncateUtf8ToMaxBytes(str: string, maxBytes: number): string {
+  if (maxBytes <= 0) return '';
+  const buf = Buffer.from(str, 'utf8');
+  if (buf.length <= maxBytes) return str;
+  // Decode byte slice and drop any trailing replacement char from a split multi-byte codepoint
+  let sliced = buf.subarray(0, maxBytes).toString('utf8');
+  while (sliced.endsWith('\uFFFD') && Buffer.byteLength(sliced, 'utf8') > 0) {
+    sliced = sliced.slice(0, -1);
+  }
+  while (Buffer.byteLength(sliced, 'utf8') > maxBytes && sliced.length > 0) {
+    sliced = sliced.slice(0, -1);
+  }
+  return sliced;
+}
 
 export function redactTraceEnvelopeSecrets(
   input: unknown,
@@ -123,7 +141,10 @@ export function redactTraceEnvelopeSecrets(
   if (typeof input === 'bigint') return input.toString();
 
   if (typeof input === 'string') {
-    let scrubbed = input;
+    let scrubbed = input
+      .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
+      .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
+      .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '');
     for (const pattern of SECRET_STRING_PATTERNS) {
       scrubbed = scrubbed.replace(pattern, '[REDACTED_SECRET]');
     }
@@ -133,6 +154,14 @@ export function redactTraceEnvelopeSecrets(
   if (typeof input !== 'object') return input;
   if (seen.has(input)) return '[CIRCULAR_REF]';
   seen.add(input);
+
+  if (input instanceof Error) {
+    return {
+      name: redactTraceEnvelopeSecrets(input.name, depth + 1, seen),
+      message: redactTraceEnvelopeSecrets(input.message, depth + 1, seen),
+      ...(input.stack ? { stack: redactTraceEnvelopeSecrets(input.stack, depth + 1, seen) } : {}),
+    };
+  }
 
   if (Array.isArray(input)) {
     return input.slice(0, 100).map((item) => redactTraceEnvelopeSecrets(item, depth + 1, seen));
@@ -162,7 +191,7 @@ function boundPreviewPayload(value: unknown, maxBytes: number): unknown {
   return {
     _truncated: true,
     _originalBytes: byteLen,
-    preview: serialized.slice(0, Math.max(128, maxBytes - 128)),
+    preview: truncateUtf8ToMaxBytes(serialized, Math.max(64, maxBytes - 128)),
   };
 }
 
@@ -175,7 +204,16 @@ export async function runInRootTraceContext<T>(
   },
   fn: () => Promise<T>
 ): Promise<{ result: T; envelope: CorrelatedTraceEnvelope }> {
-  const traceId = params.traceId ?? randomBytes(16).toString('hex');
+  let traceId: string;
+  if (params.traceId !== undefined) {
+    // Enforce W3C Trace Context 16-byte lowercase hex trace-id (blocks CRLF/header injection into traceparent)
+    if (!/^[0-9a-fA-F]{32}$/.test(params.traceId) || /^0{32}$/.test(params.traceId)) {
+      throw new Error('TRACE_INVALID_TRACE_ID: traceId must be a non-zero 32-character hexadecimal W3C trace-id');
+    }
+    traceId = params.traceId.toLowerCase();
+  } else {
+    traceId = randomBytes(16).toString('hex');
+  }
   const rootSpanId = randomBytes(8).toString('hex');
   const shared: SharedTraceBuffer = {
     traceId,
@@ -264,6 +302,9 @@ export async function executeTracedHop<T>(
         parentSpanId,
       });
       if (currentStore) {
+        if (currentStore.shared.hops.length >= MAX_IN_MEMORY_TRACE_HOPS) {
+          currentStore.shared.hops.shift();
+        }
         currentStore.shared.hops.push({
           spanId,
           parentSpanId,
@@ -280,6 +321,9 @@ export async function executeTracedHop<T>(
       return result;
     } catch (err) {
       if (currentStore) {
+        if (currentStore.shared.hops.length >= MAX_IN_MEMORY_TRACE_HOPS) {
+          currentStore.shared.hops.shift();
+        }
         currentStore.shared.hops.push({
           spanId,
           parentSpanId,
@@ -323,21 +367,25 @@ export function exportCorrelatedTraceEnvelope(shared: SharedTraceBuffer): Correl
   const sanitizedHops: TraceHopSpan[] = shared.hops.map((hop) => ({
     ...hop,
     operationName:
-      hop.operationName.length > 256 ? `${hop.operationName.slice(0, 256)}...[TRUNCATED]` : hop.operationName,
+      Buffer.byteLength(hop.operationName, 'utf8') > 256
+        ? `${truncateUtf8ToMaxBytes(hop.operationName, 240)}...[TRUNCATED]`
+        : hop.operationName,
     serviceName:
-      hop.serviceName.length > 128 ? `${hop.serviceName.slice(0, 128)}...[TRUNCATED]` : hop.serviceName,
+      Buffer.byteLength(hop.serviceName, 'utf8') > 128
+        ? `${truncateUtf8ToMaxBytes(hop.serviceName, 112)}...[TRUNCATED]`
+        : hop.serviceName,
     errorMessage:
       hop.errorMessage && Buffer.byteLength(hop.errorMessage, 'utf8') > 2048
-        ? `${hop.errorMessage.slice(0, 1024)}...[TRUNCATED]`
+        ? `${truncateUtf8ToMaxBytes(hop.errorMessage, 1024)}...[TRUNCATED]`
         : hop.errorMessage,
     redactedRequestPreview: boundPreviewPayload(hop.redactedRequestPreview, MAX_HOP_PAYLOAD_BYTES),
     redactedResponsePreview: boundPreviewPayload(hop.redactedResponsePreview, MAX_HOP_PAYLOAD_BYTES),
   }));
 
   const candidate: CorrelatedTraceEnvelope = {
-    traceId: shared.traceId.slice(0, 128),
-    tenantId: shared.tenantId.slice(0, 128),
-    requestId: shared.requestId.slice(0, 128),
+    traceId: truncateUtf8ToMaxBytes(shared.traceId, 128),
+    tenantId: truncateUtf8ToMaxBytes(shared.tenantId, 128),
+    requestId: truncateUtf8ToMaxBytes(shared.requestId, 128),
     hopCount: sanitizedHops.length,
     envelopeTruncated: false,
     byteLength: 0,
@@ -377,20 +425,22 @@ export function exportCorrelatedTraceEnvelope(shared: SharedTraceBuffer): Correl
     byteLength = Buffer.byteLength(serialized, 'utf8');
   }
 
-  // Step 3 (DEVIL-21 Fix): Guarantee <= 32,768 bytes even when only a single oversized root hop remains
+  // Step 3 (DEVIL-21 Fix): Guarantee <= 32,768 UTF-8 bytes even when only a single oversized root hop remains
   if (byteLength > MAX_TRACE_ENVELOPE_BYTES && candidate.hops.length === 1) {
     const rootHop = candidate.hops[0];
     candidate.hops = [
       {
-        spanId: rootHop.spanId.slice(0, 32),
+        spanId: truncateUtf8ToMaxBytes(rootHop.spanId, 32),
         parentSpanId: null,
-        serviceName: rootHop.serviceName.slice(0, 64),
-        operationName: rootHop.operationName.slice(0, 128),
+        serviceName: truncateUtf8ToMaxBytes(rootHop.serviceName, 64),
+        operationName: truncateUtf8ToMaxBytes(rootHop.operationName, 128),
         direction: rootHop.direction,
         startedAtMs: rootHop.startedAtMs,
         durationMs: rootHop.durationMs,
         statusCode: rootHop.statusCode,
-        errorMessage: rootHop.errorMessage ? `${rootHop.errorMessage.slice(0, 512)}...[TRUNCATED]` : undefined,
+        errorMessage: rootHop.errorMessage
+          ? `${truncateUtf8ToMaxBytes(rootHop.errorMessage, 512)}...[TRUNCATED]`
+          : undefined,
       },
     ];
     serialized = JSON.stringify(candidate);

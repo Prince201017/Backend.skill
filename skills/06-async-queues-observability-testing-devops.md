@@ -40,8 +40,19 @@ CREATE INDEX idx_jobs_runnable
 ON background_jobs (next_run_at ASC)
 WHERE status IN ('QUEUED', 'FAILED_RETRYABLE', 'IN_PROGRESS');
 
+ALTER TABLE background_jobs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE background_jobs FORCE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS background_jobs_tenant_isolation_policy ON background_jobs;
+CREATE POLICY background_jobs_tenant_isolation_policy
+ON background_jobs
+FOR ALL
+TO app_runtime
+USING (security.verify_active_tenant_context(tenant_id))
+WITH CHECK (security.verify_active_tenant_context(tenant_id));
+
 -- Atomic Lease Acquisition Query:
--- Enforces due time (next_run_at <= clock_timestamp()), attempt ceiling (attempt < max_attempts),
+-- Enforces tenant isolation, due time (next_run_at <= clock_timestamp()), attempt ceiling (attempt < max_attempts),
 -- and expired-lease crash recovery, incrementing fencing_token monotonically.
 UPDATE background_jobs
 SET status = 'IN_PROGRESS',
@@ -50,6 +61,7 @@ SET status = 'IN_PROGRESS',
     fencing_token = fencing_token + 1,
     attempt = attempt + 1
 WHERE job_id = $1
+  AND tenant_id = $4
   AND attempt < max_attempts
   AND (
     (status IN ('QUEUED', 'FAILED_RETRYABLE') AND next_run_at <= clock_timestamp())
@@ -93,7 +105,8 @@ export interface JobLeaseManager {
     jobId: string,
     workerInstanceId: string,
     leaseDurationMs: number,
-    nowMs?: number
+    nowMs?: number,
+    tenantId?: string
   ): Promise<JobAcquisitionResult>;
 
   renewJobLease(
@@ -101,11 +114,13 @@ export interface JobLeaseManager {
     workerInstanceId: string,
     fencingToken: bigint,
     leaseDurationMs: number,
-    nowMs?: number
+    nowMs?: number,
+    tenantId?: string
   ): Promise<{ renewed: boolean; newLeaseDeadlineMs?: number }>;
 
   markJobCompleted(params: {
     jobId: string;
+    tenantId?: string;
     workerInstanceId: string;
     fencingToken: bigint;
     durationMs: number;
@@ -113,6 +128,7 @@ export interface JobLeaseManager {
 
   markJobFailedOrDeadLetter(params: {
     jobId: string;
+    tenantId?: string;
     workerInstanceId: string;
     fencingToken: bigint;
     attempt: number;
@@ -121,7 +137,7 @@ export interface JobLeaseManager {
     nextRunDelayMs: number;
   }): Promise<'SCHEDULED_RETRY' | 'MOVED_TO_DLQ' | 'STALE_WORKER_IGNORED'>;
 
-  replayDeadLetterJob(jobId: string, operatorUserId: string): Promise<void>;
+  replayDeadLetterJob(jobId: string, operatorUserId: string, tenantId?: string): Promise<void>;
 }
 
 export async function executeQueueWorkerJob<TPayload>(
@@ -147,7 +163,9 @@ export async function executeQueueWorkerJob<TPayload>(
   const acquisition = await deps.leaseManager.acquireJobLease(
     envelope.jobId,
     workerInstanceId,
-    leaseDurationMs
+    leaseDurationMs,
+    undefined,
+    envelope.tenantId
   );
 
   if (acquisition.status === 'ALREADY_COMPLETED') {
@@ -166,6 +184,7 @@ export async function executeQueueWorkerJob<TPayload>(
   const { fencingToken, attempt, maxAttempts } = acquisition;
   let currentLeaseDeadlineMs = acquisition.leaseDeadlineMs;
   let consecutiveHeartbeatFailures = 0;
+  let heartbeatInFlight = false;
 
   const abortController = new AbortController();
   const heartbeatIntervalMs = Math.max(100, Math.floor(leaseDurationMs / 3));
@@ -184,17 +203,22 @@ export async function executeQueueWorkerJob<TPayload>(
   };
 
   const heartbeatTimer = setInterval(async () => {
+    if (heartbeatInFlight || abortController.signal.aborted) return;
+    heartbeatInFlight = true;
     try {
       const res = await deps.leaseManager.renewJobLease(
         envelope.jobId,
         workerInstanceId,
         fencingToken,
-        leaseDurationMs
+        leaseDurationMs,
+        undefined,
+        envelope.tenantId
       );
       if (!res.renewed) {
         const lostErr = new Error('JOB_LEASE_LOST_FENCING_REJECTED');
         deps.logger.error('Worker lost job lease ownership; aborting handler', {
           jobId: envelope.jobId,
+          tenantId: envelope.tenantId,
           workerInstanceId,
           fencingToken: fencingToken.toString(),
         });
@@ -217,12 +241,15 @@ export async function executeQueueWorkerJob<TPayload>(
         );
         deps.logger.error('Worker heartbeat renewal failed past safety threshold; aborting handler', {
           jobId: envelope.jobId,
+          tenantId: envelope.tenantId,
           workerInstanceId,
           fencingToken: fencingToken.toString(),
           consecutiveHeartbeatFailures,
         });
         abortController.abort(failErr);
       }
+    } finally {
+      heartbeatInFlight = false;
     }
   }, heartbeatIntervalMs);
 
@@ -239,6 +266,7 @@ export async function executeQueueWorkerJob<TPayload>(
     const durationMs = Number((process.hrtime.bigint() - startNs) / 1_000_000n);
     const committed = await deps.leaseManager.markJobCompleted({
       jobId: envelope.jobId,
+      tenantId: envelope.tenantId,
       workerInstanceId,
       fencingToken,
       durationMs,
@@ -270,6 +298,7 @@ export async function executeQueueWorkerJob<TPayload>(
 
     await deps.leaseManager.markJobFailedOrDeadLetter({
       jobId: envelope.jobId,
+      tenantId: envelope.tenantId,
       workerInstanceId,
       fencingToken,
       attempt,
@@ -321,25 +350,66 @@ export function isSensitiveFieldName(rawKey: string): boolean {
   return sensitiveSubstrings.some((sub) => normalized.includes(sub));
 }
 
+export function passesLuhnCheck(digitsOnly: string): boolean {
+  if (!/^\d{13,19}$/.test(digitsOnly)) return false;
+  let sum = 0;
+  let shouldDouble = false;
+  for (let i = digitsOnly.length - 1; i >= 0; i--) {
+    let digit = digitsOnly.charCodeAt(i) - 48;
+    if (shouldDouble) {
+      digit *= 2;
+      if (digit > 9) digit -= 9;
+    }
+    sum += digit;
+    shouldDouble = !shouldDouble;
+  }
+  return sum % 10 === 0;
+}
+
 export function redactSensitiveFields(
   obj: unknown,
   depth = 0,
   seen: WeakSet<object> = new WeakSet()
 ): unknown {
-  if (depth > 8 || obj === null || obj === undefined) return obj;
+  // Fail-closed depth ceiling: NEVER return unredacted deep objects past max depth!
+  if (depth > 8) return '[MAX_DEPTH_TRUNCATED]';
+  if (obj === null || obj === undefined) return obj;
+  if (typeof obj === 'bigint') return obj.toString();
   if (typeof obj === 'string') {
     return obj
-      // Strip ANSI terminal escape sequences and control chars to block log/terminal injection (DEVIL-11)
+      // Strip ANSI CSI & OSC terminal escape sequences and control chars to block log/terminal injection
+      .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
       .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
       .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '')
+      .replace(
+        /\b((?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|rediss|amqp|amqps):\/\/)[^/\s:@]+:[^/\s@]+@/gi,
+        '$1[REDACTED_URI_CREDENTIALS]@'
+      )
       .replace(/Bearer\s+[A-Za-z0-9\-._~+/]+=*/gi, 'Bearer [REDACTED_JWT]')
       .replace(/Basic\s+[A-Za-z0-9+/=]{8,}/gi, 'Basic [REDACTED_BASIC_AUTH]')
-      .replace(/\b(sk_live_|sk_test_|rk_live_|whsec_)[A-Za-z0-9_]+/g, '[REDACTED_KEY]')
-      .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, '[REDACTED_PEM_KEY]');
+      .replace(/\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, '[REDACTED_JWT]')
+      .replace(
+        /\b(?:sk_live_|sk_test_|rk_live_|whsec_|sk-proj-|sk-ant-|ghp_|xoxb-|xoxp-)[A-Za-z0-9_\-]+\b/g,
+        '[REDACTED_KEY]'
+      )
+      .replace(/\b(?:AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z\-_]{35})\b/g, '[REDACTED_KEY]')
+      .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, '[REDACTED_PEM_KEY]')
+      .replace(/\b(?:\d[ -]?){13,19}\b/g, (candidate) => {
+        const digitsOnly = candidate.replace(/\D/g, '');
+        return passesLuhnCheck(digitsOnly) ? '[REDACTED_PAN]' : candidate;
+      });
   }
   if (typeof obj !== 'object') return obj;
   if (seen.has(obj)) return '[CIRCULAR_REF]';
   seen.add(obj);
+
+  if (obj instanceof Error) {
+    return {
+      name: redactSensitiveFields(obj.name, depth + 1, seen),
+      message: redactSensitiveFields(obj.message, depth + 1, seen),
+      ...(obj.stack ? { stack: redactSensitiveFields(obj.stack, depth + 1, seen) } : {}),
+    };
+  }
 
   if (Array.isArray(obj)) {
     return obj.slice(0, 100).map((item) => redactSensitiveFields(item, depth + 1, seen));
@@ -373,7 +443,8 @@ export class StructuredLogger {
       message: cleanMessage,
       ...(redactSensitiveFields(context) as Record<string, unknown>),
     };
-    process.stdout.write(JSON.stringify(entry) + '\n');
+    const serialized = JSON.stringify(entry, (_k, v) => (typeof v === 'bigint' ? v.toString() : v));
+    process.stdout.write(serialized + '\n');
   }
 
   public info(message: string, context: Record<string, unknown> = {}) {
